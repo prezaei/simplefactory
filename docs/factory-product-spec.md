@@ -1,6 +1,6 @@
 # Factory — Product Spec
 
-*What Factory is, how it works for the people who use it, and what a good version must do — in plain English. It makes no technology choices; those are decided separately.*
+*What Factory is, how it works for the people who use it, and what a good version must do — in plain English. It makes no binding technology choices; those are decided separately. Where it names a concrete thing (a `factory` label, a to-do list, a config file in the repo), that is an illustrative example to keep the description vivid, not a committed implementation.*
 
 We are building an **autonomous software team that runs itself**. Instead of human engineers picking up tickets, writing code, reviewing each other's work, and merging it, a fleet of AI workers does that work — and a central **coordinator** decides who works on what, keeps track of everything, and makes sure nothing falls through the cracks.
 
@@ -77,13 +77,14 @@ These are the requirements a good version must satisfy — the qualities to hit,
 
 **Being transparent**
 
-- **A full, debuggable play-by-play.** Everything a worker does is observable live (a running summary streams to the dashboard, which reflects real state) and after the fact: the *complete* transcript of each run — including the assistant's own session log — is written into your own repository, organized by the issue or change request it belongs to, so you can read exactly what happened straight from the repo. (Workers making a change write it alongside that change; the coordinator and scheduled runs, which have no change in progress, commit it straight to your main branch.) There's also an audit trail of who and what did each thing.
+- **A full, debuggable play-by-play.** Everything a worker does is observable live (a running summary streams to the dashboard, an eventually-consistent live view — see "Fresh view") and after the fact: the *complete* transcript of each run — including the assistant's own session log — is written into your own repository, organized by the issue or change request it belongs to, so you can read exactly what happened straight from the repo. (Workers making a change write it alongside that change; the coordinator and scheduled runs, which have no change in progress, commit it straight to your main branch.) There's also an audit trail of who and what did each thing.
 
 **How well and how fast (directional targets, not exact numbers)**
 
 - **Prompt pickup.** Once work is handed over, a worker should start on it within minutes, not hours.
 - **Always on.** The coordinator should stay available continuously; one machine failing shouldn't stop the factory.
 - **Comfortable scale.** It should handle many repositories and dozens of workers at once, and grow by adding machines.
+- **Fresh view.** The dashboard reflects the system's recorded state within seconds, not minutes — close enough to live to act on. It is an eventually-consistent view of the record book, not a guarantee of instant, to-the-millisecond state.
 
 ## What we are deliberately NOT building (first version)
 
@@ -101,7 +102,7 @@ The flow, rendered inline:
 flowchart LR
     T["Triggers<br/>tickets · timers · manager"] --> I["Intake / Matcher"]
     I --> Q[("To-Do List<br/>durable queue")]
-    Q --> D["Dispatcher<br/>capacity caps · FIFO"]
+    Q --> D["Dispatcher<br/>capacity caps · arrival order"]
     D --> A
     subgraph Workroom["Isolated Workroom (throwaway)"]
       A["AI Worker"]
