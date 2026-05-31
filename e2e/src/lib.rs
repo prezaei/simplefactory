@@ -561,17 +561,27 @@ mod acceptance {
     /// begins, so its own `FakeGitHub` only ever records effects for its own repo.
     static P4_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    /// React to (and discard the side effects of) every currently-unreacted terminal
-    /// item, so a subsequent scoped tick sees only freshly-created ones. Uses a
-    /// throwaway `FakeGitHub` so the test's own client stays clean.
+    /// Quarantine every currently-unreacted terminal item so a subsequent P4 tick sees
+    /// only items THIS test creates. `coordinator_tick` scans the WHOLE record book, so
+    /// without this a terminal item left by another test — a `failed` item past the
+    /// retry cap (→ an escalation comment on this test's `FakeGitHub`), the crash-safe
+    /// test's deliberately-unreactable `issue#<huge>` manager item (which errors on
+    /// every tick forever), or any concurrently-created terminal item — would be reacted
+    /// during this test's tick and corrupt its exact-count assertions.
+    ///
+    /// We mark them `reacted` directly (a bulk DB write) rather than re-running them
+    /// through `coordinator_tick`: running them would (a) re-trigger their human-facing
+    /// side effects and (b) never settle the crash-safe poison item (its decision errors
+    /// before the claim commits, so a tick never marks it reacted). A direct claim
+    /// retires every one of them in a single statement, with no side effects.
     async fn drain_terminal(pool: &record::Pool) {
-        let sink = FakeGitHub::new();
-        // A couple of passes settle any items a drain itself enqueues-then-terminates.
-        for _ in 0..3 {
-            if coordinator_tick(pool, &sink).await.unwrap() == 0 {
-                break;
-            }
-        }
+        sqlx::query(
+            "UPDATE work_items SET reacted = true
+              WHERE NOT reacted AND state IN ('succeeded', 'failed', 'escalated')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     /// Three-role config (manager + coder + reviewer) stored on a fresh repo.
@@ -800,7 +810,8 @@ mod acceptance {
         coordinator_tick(&pool, gh.as_ref()).await.unwrap();
 
         // The CR is marked ready, exactly one handoff comment + one assignment ran,
-        // and the issue reached its closed end state.
+        // and the issue stays OPEN (in_progress) awaiting the human's merge — P4 hands
+        // off for merge; it does not close the issue (that needs merge-webhook ingestion).
         let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
             .await
             .unwrap()
@@ -818,8 +829,8 @@ mod acceptance {
         );
         assert_eq!(
             issue_state(&pool, repo, 1).await.as_deref(),
-            Some("done"),
-            "the issue reaches its closed end state"
+            Some("in_progress"),
+            "the issue stays open (in_progress) awaiting the human's merge; NOT closed at handoff"
         );
     }
 
@@ -1049,6 +1060,465 @@ mod acceptance {
             calls_with_prefix(&gh, "assign_issue").len(),
             1,
             "exactly one escalation assignment"
+        );
+    }
+
+    /// Like the happy/gating tests, but the gating prefix is a CUSTOM, non-default
+    /// path (`ci/`) declared via `settings.gating_paths`. A CR touching `ci/…` must be
+    /// escalated as a conflict and NEVER marked ready — proving gating is config-driven,
+    /// not hardcoded to `.github/workflows/`. (F3)
+    #[tokio::test]
+    async fn custom_gating_path_weaken_is_escalated() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let serial = P4_SERIAL.lock().await;
+        drain_terminal(&pool).await;
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-p4-customgate"), 1)
+            .await
+            .unwrap();
+
+        // A three-role config whose gating_paths is a CUSTOM directory ("ci/"), NOT the
+        // default. A CR touching `ci/…` must trip the can't-weaken guard.
+        let (manager, coder, reviewer) = ("manager", "bug-fixer", "reviewer");
+        let yaml = format!(
+            "version: 1\n\
+             settings:\n  label: factory\n  gating_paths:\n    - \"ci/\"\n\
+             limits:\n  max_concurrent_workers: 5\n\
+             workers:\n\
+             \x20 - name: {manager}\n    role: manager\n    on: [issue_labeled]\n\
+             \x20 - name: {coder}\n    role: coder\n    on: [manager, cr_changes_requested]\n\
+             \x20 - name: {reviewer}\n    role: reviewer\n    on: [cr_opened]\n"
+        );
+        let cfg = factory_config::parse(&yaml).expect("valid custom-gating config");
+        assert_eq!(
+            cfg.settings.gating_paths,
+            vec!["ci/".to_owned()],
+            "the custom gating prefix is in effect for this repo"
+        );
+        let cfg_json = serde_json::to_value(&cfg).unwrap();
+        record::set_repo_config(&pool, repo, &cfg_json, "p4-sha")
+            .await
+            .unwrap();
+
+        // Open the CR on a throwaway client to learn its number.
+        let setup_gh = Arc::new(FakeGitHub::new());
+        let setup_state = tools_state(&pool, setup_gh.clone());
+        let (cr_number, _cr_row) =
+            open_cr(&pool, repo, coder, &setup_state, "tweaks the ci dir").await;
+        let cr_subject = format!("cr#{cr_number}");
+
+        // The assertion client: the CR touches a CUSTOM gating path (`ci/deploy.sh`),
+        // with green checks (proving the GUARD, not the checks, blocks it).
+        let gh = Arc::new(
+            FakeGitHub::new()
+                .with_cr_files(cr_number, vec!["ci/deploy.sh".into()])
+                .with_checks(
+                    &format!("sha-{cr_number}"),
+                    CheckSummary {
+                        overall: CheckConclusion::Success,
+                        checks: vec![("ci".into(), CheckConclusion::Success)],
+                    },
+                ),
+        );
+        let state = tools_state(&pool, gh.clone());
+
+        let reviewer_id =
+            enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, &cr_subject).await;
+        let reviewer_auth = task_auth(reviewer_id, repo, record::Kind::Reviewer);
+        factory_tools::submit_review(
+            &state,
+            &reviewer_auth,
+            cr_number,
+            "approve",
+            "ship it",
+            Some("rev-1"),
+        )
+        .await
+        .unwrap();
+        mark_succeeded(&pool, reviewer_id).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        // Never ready; exactly one conflict escalation with one comment + one assignment.
+        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            cr_row.factory_state, "ready",
+            "a CR weakening a CUSTOM gating path must never be ready"
+        );
+        assert_eq!(cr_row.factory_state, "approved", "CR stays approved");
+        let conflicts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'conflict' AND work_item_id = $1",
+        )
+        .bind(reviewer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(conflicts, 1, "exactly one conflict escalation");
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one escalation assignment"
+        );
+        drop(serial);
+    }
+
+    /// F5 + F7: a Failed reviewer item (subject `cr#N`) with attempts exhausted escalates
+    /// `retries_exhausted` — exactly one escalation, one comment, AND one assignment. The
+    /// assignment proves the escalation resolves the human from the CR's linked issue even
+    /// though the failed item's own subject (`cr#N`) carries no issue (F7).
+    #[tokio::test]
+    async fn retries_exhausted_failed_reviewer_escalates_and_assigns() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (_manager, coder, reviewer), gh, state) =
+            p4_fixture(&pool, "e2e-p4-retries").await;
+
+        // A CR on issue#1 (open_cr links the CR to issue 1).
+        let (cr_number, _cr_row) = open_cr(&pool, repo, coder, &state, "attempt").await;
+        let cr_subject = format!("cr#{cr_number}");
+
+        // A reviewer item for that CR that FAILED with attempts at the cap.
+        let reviewer_id =
+            enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, &cr_subject).await;
+        force_failed(&pool, reviewer_id, 3).await; // RETRY_CAP = 3 → escalate
+
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+        assert!(
+            is_reacted(&pool, reviewer_id).await,
+            "the failed reviewer item is reacted"
+        );
+
+        // Exactly one retries_exhausted escalation, with a comment AND an assignment
+        // (the linked issue #1 resolved from the CR, not from the cr# subject).
+        let retries: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'retries_exhausted' AND work_item_id = $1",
+        )
+        .bind(reviewer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retries, 1, "exactly one retries_exhausted escalation");
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "the failed reviewer escalation assigns the CR's linked issue to a human"
+        );
+    }
+
+    /// F5: an already-`escalated` terminal item is a pure no-op react — the coordinator
+    /// marks it reacted but creates NO new escalation and enqueues NO new work.
+    #[tokio::test]
+    async fn escalated_terminal_item_is_noop_react() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (_manager, coder, _reviewer), gh, _state) =
+            p4_fixture(&pool, "e2e-p4-escalated").await;
+
+        // A coder item for issue#1 already in the terminal `escalated` state.
+        let item = enqueue_item(&pool, repo, record::Kind::Coder, coder, "issue#1").await;
+        sqlx::query("UPDATE work_items SET state = 'escalated', updated_at = now() WHERE id = $1")
+            .bind(item)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            coordinator_tick(&pool, gh.as_ref()).await.unwrap(),
+            1,
+            "the escalated item is reacted exactly once"
+        );
+        assert!(is_reacted(&pool, item).await, "the item is marked reacted");
+
+        // No new escalation row for the item, and no new work item was enqueued.
+        assert_eq!(
+            record::count_escalations_for_item(&pool, item)
+                .await
+                .unwrap(),
+            0,
+            "a no-op react creates no escalation"
+        );
+        assert!(
+            find_item(&pool, repo, record::Kind::Coder, "issue#1")
+                .await
+                .is_none(),
+            "a no-op react enqueues no new work"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            0,
+            "a no-op react posts no comment"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            0,
+            "a no-op react assigns nobody"
+        );
+    }
+
+    /// F5: an approved CR whose checks are NOT green (Pending, then Failure) is neither
+    /// marked ready NOR escalated — it is left `approved` to be re-evaluated next tick.
+    #[tokio::test]
+    async fn approved_cr_with_non_green_checks_is_left_approved() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (_manager, coder, reviewer), _setup_gh, setup_state) =
+            p4_fixture(&pool, "e2e-p4-notgreen").await;
+        let (cr_number, _cr_row) = open_cr(&pool, repo, coder, &setup_state, "wip").await;
+        let cr_subject = format!("cr#{cr_number}");
+
+        // Approve the CR once (factory_state → approved); the reviewer item is re-used
+        // across the two non-green check scenarios by clearing its react flag.
+        let reviewer_id =
+            enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, &cr_subject).await;
+        let reviewer_auth = task_auth(reviewer_id, repo, record::Kind::Reviewer);
+        factory_tools::submit_review(
+            &state_for(&pool),
+            &reviewer_auth,
+            cr_number,
+            "approve",
+            "looks good",
+            Some("rev-1"),
+        )
+        .await
+        .unwrap();
+        mark_succeeded(&pool, reviewer_id).await;
+
+        for overall in [CheckConclusion::Pending, CheckConclusion::Failure] {
+            // Reset the react claim so this tick re-reacts to the same reviewer item.
+            sqlx::query("UPDATE work_items SET reacted = false WHERE id = $1")
+                .bind(reviewer_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let gh = Arc::new(FakeGitHub::new().with_checks(
+                &format!("sha-{cr_number}"),
+                CheckSummary {
+                    overall,
+                    checks: vec![("ci".into(), overall)],
+                },
+            ));
+            coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+            let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                cr_row.factory_state,
+                "approved",
+                "a CR with {} checks stays approved (not ready)",
+                overall.as_str()
+            );
+            assert_eq!(
+                record::count_escalations_for_item(&pool, reviewer_id)
+                    .await
+                    .unwrap(),
+                0,
+                "non-green checks do not escalate ({})",
+                overall.as_str()
+            );
+            assert_eq!(
+                calls_with_prefix(&gh, "post_comment").len(),
+                0,
+                "no handoff comment when checks are not green ({})",
+                overall.as_str()
+            );
+        }
+    }
+
+    /// Build a `ToolsState` over a throwaway `FakeGitHub` for a tool call whose GitHub
+    /// effect the test does not assert on (e.g. recording an approval verdict).
+    fn state_for(pool: &record::Pool) -> ToolsState {
+        tools_state(pool, Arc::new(FakeGitHub::new()))
+    }
+
+    /// Whether a work item's `reacted` flag is set (the coordinator's per-item claim).
+    async fn is_reacted(pool: &record::Pool, id: Uuid) -> bool {
+        sqlx::query_scalar("SELECT reacted FROM work_items WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Force a work item to a Failed terminal state with `attempt_count` so the
+    /// coordinator's retries-exhausted escalation path is exercised deterministically.
+    async fn force_failed(pool: &record::Pool, id: Uuid, attempts: i32) {
+        sqlx::query(
+            "UPDATE work_items SET state = 'failed', attempt_count = $2, updated_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .bind(attempts)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// F1 crash-safety: the per-item claim (`mark_reacted`) and the DB decision commit
+    /// **atomically**. A successful react leaves the item reacted AND its next step
+    /// present together; a decision that ERRORS after the claim rolls the claim back, so
+    /// the item stays terminal-but-unreacted and the NEXT tick retries it (rather than
+    /// being lost forever — the F1 bug). We can't kill a process mid-transaction, so we
+    /// assert both ends of the atomic boundary directly.
+    #[tokio::test]
+    async fn coordinator_react_is_crash_safe_decision_atomic() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (manager, _coder, _reviewer), gh, _state) =
+            p4_fixture(&pool, "e2e-p4-atomic").await;
+
+        // (A) Success: a manager-succeeded react both marks the item reacted AND
+        // enqueues the coder + sets the issue in_progress — all committed together.
+        let manager_item =
+            enqueue_item(&pool, repo, record::Kind::Manager, manager, "issue#1").await;
+        mark_succeeded(&pool, manager_item).await;
+        assert_eq!(coordinator_tick(&pool, gh.as_ref()).await.unwrap(), 1);
+        assert!(
+            is_reacted(&pool, manager_item).await,
+            "claim committed on success"
+        );
+        assert!(
+            find_item(&pool, repo, record::Kind::Coder, "issue#1")
+                .await
+                .is_some(),
+            "the decision (coder enqueue) committed atomically with the claim"
+        );
+        assert_eq!(
+            issue_state(&pool, repo, 1).await.as_deref(),
+            Some("in_progress"),
+            "the issue-state write committed atomically with the claim"
+        );
+
+        // (B) Rollback on decision error: a manager whose subject issue number is out
+        // of the issues table's i32 range makes the in-tx decision error AFTER the
+        // claim. The whole transaction rolls back, so the item stays unreacted and a
+        // later tick will retry it (no silent drop).
+        let bad_issue = "issue#3000000000"; // > i32::MAX → in-tx decision error
+        let bad_item = enqueue_item(&pool, repo, record::Kind::Manager, manager, bad_issue).await;
+        mark_succeeded(&pool, bad_item).await;
+        // The tick does not abort (per-item error isolation): it returns 0 reacted and
+        // logs the failure, leaving the claim rolled back.
+        assert_eq!(
+            coordinator_tick(&pool, gh.as_ref()).await.unwrap(),
+            0,
+            "a decision error reacts to nothing this tick"
+        );
+        assert!(
+            !is_reacted(&pool, bad_item).await,
+            "the claim rolled back with the failed decision — the item is retryable"
+        );
+        assert!(
+            find_item(&pool, repo, record::Kind::Coder, bad_issue)
+                .await
+                .is_none(),
+            "no partial next-step was written when the decision errored"
+        );
+    }
+
+    /// F4 per-issue serialization: two terminal items that both resolve to the SAME
+    /// issue, processed by two coordinator ticks running concurrently, must not corrupt
+    /// the per-issue decision. The advisory lock serializes the two reacts on the issue;
+    /// combined with the atomic per-item claim, each item is reacted exactly once, the
+    /// coder is enqueued exactly once, and exactly one escalation is recorded — no
+    /// double-enqueue, no double-escalation, consistent issue state.
+    #[tokio::test]
+    async fn coordinator_serializes_per_issue() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (manager, coder, _reviewer), gh, _state) =
+            p4_fixture(&pool, "e2e-p4-serial").await;
+
+        // Two terminal items, both resolving to issue#1: a succeeded manager (→ enqueue
+        // a coder + set in_progress) and a failed coder with retries exhausted
+        // (→ escalate retries_exhausted, assign issue#1). Distinct (kind, subject) so
+        // both rows coexist; both reacts contend for the issue#1 advisory lock.
+        let manager_item =
+            enqueue_item(&pool, repo, record::Kind::Manager, manager, "issue#1").await;
+        mark_succeeded(&pool, manager_item).await;
+        let failed_coder = enqueue_item(&pool, repo, record::Kind::Coder, coder, "issue#1").await;
+        force_failed(&pool, failed_coder, 3).await; // RETRY_CAP = 3 → escalate
+
+        // Run two ticks concurrently against the same DB state. They race over the same
+        // two terminal items; the per-item claim + per-issue lock keep every effect
+        // exactly-once across both.
+        let (gh_a, gh_b) = (gh.clone(), gh.clone());
+        let (pool_a, pool_b) = (pool.clone(), pool.clone());
+        let (a, b) = tokio::join!(
+            tokio::spawn(async move { coordinator_tick(&pool_a, gh_a.as_ref()).await.unwrap() }),
+            tokio::spawn(async move { coordinator_tick(&pool_b, gh_b.as_ref()).await.unwrap() }),
+        );
+        let total = a.unwrap() + b.unwrap();
+        assert_eq!(
+            total, 2,
+            "each of the two terminal items is reacted exactly once across both ticks"
+        );
+
+        // Both items are reacted; the per-issue decision is consistent and exactly-once.
+        assert!(is_reacted(&pool, manager_item).await);
+        assert!(is_reacted(&pool, failed_coder).await);
+
+        // Exactly one ACTIVE coder for issue#1 (the manager's enqueue, idempotent): the
+        // failed coder is terminal, so a single queued coder remains.
+        let active_coders: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM work_items
+              WHERE repo_id = $1 AND kind = 'coder' AND subject_ref = 'issue#1'
+                AND state IN ('queued', 'leased', 'running', 'blocked')",
+        )
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active_coders, 1, "the coder is enqueued exactly once");
+
+        assert_eq!(
+            issue_state(&pool, repo, 1).await.as_deref(),
+            Some("in_progress"),
+            "the issue reaches a single consistent state"
+        );
+
+        // Exactly one retries-exhausted escalation for the failed coder, with exactly
+        // one comment + one assignment (the lock + claim prevent a racing double-react
+        // from re-running the human-facing side effects).
+        assert_eq!(
+            record::count_escalations_for_item(&pool, failed_coder)
+                .await
+                .unwrap(),
+            1,
+            "exactly one escalation for the failed item"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment across both concurrent ticks"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one escalation assignment across both concurrent ticks"
         );
     }
 

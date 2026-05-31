@@ -554,6 +554,7 @@ dependencies = [
  "chrono",
  "cron",
  "serde",
+ "serde_json",
  "serde_yaml",
  "thiserror",
 ]
@@ -569,6 +570,7 @@ dependencies = [
  "factory-record",
  "factory-telemetry",
  "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
  "uuid",

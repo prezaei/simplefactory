@@ -36,6 +36,14 @@ pub struct Settings {
     pub default_model: Option<String>,
     /// Guidance appended to every worker's prompt.
     pub instructions: Option<String>,
+    /// Path prefixes whose changes alter the very checks that gate a merge. A CR
+    /// touching any of these "weakens its own gating" and can never be marked ready
+    /// (it is escalated as a conflict instead). Defaults to `[".github/workflows/"]`
+    /// (GitHub Actions workflow definitions); a repo can extend it (e.g. `"ci/"`).
+    /// `serde(default)` so a config jsonb stored before this field existed still
+    /// deserializes (back-compat for already-connected repos).
+    #[serde(default = "default_gating_paths")]
+    pub gating_paths: Vec<String>,
 }
 
 /// Global capacity limits.
@@ -177,6 +185,7 @@ pub fn parse(yaml: &str) -> Result<Config, ConfigError> {
             label: raw.settings.label,
             default_model: raw.settings.default_model,
             instructions: raw.settings.instructions,
+            gating_paths: raw.settings.gating_paths,
         },
         limits: Limits {
             max_concurrent_workers: raw.limits.max_concurrent_workers,
@@ -287,6 +296,8 @@ struct RawSettings {
     default_model: Option<String>,
     #[serde(default)]
     instructions: Option<String>,
+    #[serde(default = "default_gating_paths")]
+    gating_paths: Vec<String>,
 }
 
 impl Default for RawSettings {
@@ -295,6 +306,7 @@ impl Default for RawSettings {
             label: default_label(),
             default_model: None,
             instructions: None,
+            gating_paths: default_gating_paths(),
         }
     }
 }
@@ -349,6 +361,13 @@ fn default_label() -> String {
 
 fn default_global_cap() -> u32 {
     5
+}
+
+/// The default set of gating-check path prefixes: GitHub Actions workflow
+/// definitions. A CR touching any of these alters the checks that gate its own
+/// merge, so it can never be marked ready (see [`Settings::gating_paths`]).
+fn default_gating_paths() -> Vec<String> {
+    vec![".github/workflows/".to_owned()]
 }
 
 #[cfg(test)]
@@ -407,6 +426,24 @@ workers:
         assert_eq!(cfg.settings.label, "factory");
         assert_eq!(cfg.limits.max_concurrent_workers, 5);
         assert!(cfg.workers.is_empty());
+        // The gating-paths default applies when `settings.gating_paths` is omitted.
+        assert_eq!(
+            cfg.settings.gating_paths,
+            vec![".github/workflows/".to_owned()]
+        );
+    }
+
+    #[test]
+    fn reads_custom_gating_paths() {
+        let cfg = parse(
+            "version: 1\nsettings:\n  label: factory\n  gating_paths:\n    - \"ci/\"\n    - \".github/workflows/\"\n",
+        )
+        .expect("config with custom gating_paths should parse");
+        assert_eq!(
+            cfg.settings.gating_paths,
+            vec!["ci/".to_owned(), ".github/workflows/".to_owned()],
+            "a custom gating_paths list is read verbatim"
+        );
     }
 
     #[test]
@@ -503,6 +540,23 @@ workers:
             Err(ConfigError::NonManagerIssueLabeled { worker, role })
                 if worker == "c" && role == Role::Coder
         ));
+    }
+
+    #[test]
+    fn config_jsonb_without_gating_paths_still_deserializes() {
+        // Back-compat: a config stored as jsonb before `gating_paths` existed must
+        // still read back (the field defaults), so already-connected repos don't break.
+        let stored = serde_json::json!({
+            "version": 1,
+            "settings": { "label": "factory", "default_model": null, "instructions": null },
+            "limits": { "max_concurrent_workers": 5 },
+            "workers": []
+        });
+        let cfg: Config = serde_json::from_value(stored).expect("old jsonb deserializes");
+        assert_eq!(
+            cfg.settings.gating_paths,
+            vec![".github/workflows/".to_owned()]
+        );
     }
 
     #[test]

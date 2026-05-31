@@ -215,7 +215,13 @@ pub async fn upsert_repo(
 
 /// Enqueue a work item. Idempotent: if an active item for the same
 /// (repo, subject, kind) already exists, returns [`EnqueueOutcome::DuplicateActive`].
-pub async fn enqueue(pool: &Pool, item: &NewWorkItem) -> Result<EnqueueOutcome> {
+///
+/// Executor-generic (see [`mark_reacted`]) so the coordinator can enqueue the next
+/// step inside its per-react transaction; existing `&pool` callers are unaffected.
+pub async fn enqueue(
+    executor: impl sqlx::PgExecutor<'_>,
+    item: &NewWorkItem,
+) -> Result<EnqueueOutcome> {
     let row = sqlx::query(
         "INSERT INTO work_items
            (id, repo_id, kind, worker_name, config_sha, trigger, subject_ref, correlation_id,
@@ -236,7 +242,7 @@ pub async fn enqueue(pool: &Pool, item: &NewWorkItem) -> Result<EnqueueOutcome> 
     .bind(item.correlation_id)
     .bind(item.priority)
     .bind(item.available_at)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     let outcome = match row {
@@ -1215,20 +1221,64 @@ pub async fn list_unreacted_terminal(pool: &Pool) -> Result<Vec<WorkItem>> {
 
 /// Claim a terminal work item for coordination: set `reacted = true` if it wasn't
 /// already. Returns `true` for the single caller that wins (exactly-once react).
-pub async fn mark_reacted(pool: &Pool, work_item_id: Uuid) -> Result<bool> {
+///
+/// Executor-generic so the coordinator can run this as the claim INSIDE its
+/// per-react transaction (binding the claim and the decision writes atomically),
+/// while existing callers passing `&pool` still work (`&Pool: PgExecutor`).
+pub async fn mark_reacted(executor: impl sqlx::PgExecutor<'_>, work_item_id: Uuid) -> Result<bool> {
     let row = sqlx::query(
         "UPDATE work_items SET reacted = true, updated_at = now()
           WHERE id = $1 AND NOT reacted
          RETURNING id",
     )
     .bind(work_item_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     Ok(row.is_some())
 }
 
+/// Whether a work item has already been reacted to. Executor-generic for an in-tx
+/// re-check; `mark_reacted`'s `RETURNING` is the actual claim, so this is a
+/// diagnostic / convenience read.
+pub async fn is_reacted(executor: impl sqlx::PgExecutor<'_>, work_item_id: Uuid) -> Result<bool> {
+    let reacted: bool = sqlx::query_scalar("SELECT reacted FROM work_items WHERE id = $1")
+        .bind(work_item_id)
+        .fetch_one(executor)
+        .await?;
+    Ok(reacted)
+}
+
+/// Take the per-issue serialization lock for the lifetime of `tx`. Two coordinator
+/// replicas reacting to terminal items for the SAME issue serialize here, so the
+/// per-issue decision (enqueue next / set issue+CR state / escalate) is applied by
+/// one at a time — satisfying the spec's "per-issue decisions serialized with a row
+/// lock on the issue". The lock is a `pg_advisory_xact_lock` keyed on the
+/// `(repo_id, issue_number)` pair, released automatically when `tx` commits or rolls
+/// back.
+pub async fn issue_advisory_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo_id: Uuid,
+    issue_number: i64,
+) -> Result<()> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtext('factory:issue'), hashtext($1::text || ':' || $2::text))",
+    )
+    .bind(repo_id)
+    .bind(issue_number)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Set an issue's factory state (`open` | `in_progress` | `blocked` | `done`).
-pub async fn set_issue_state(pool: &Pool, repo_id: Uuid, number: i32, state: &str) -> Result<()> {
+/// Executor-generic (see [`mark_reacted`]) so it can run inside the coordinator's
+/// per-react transaction.
+pub async fn set_issue_state(
+    executor: impl sqlx::PgExecutor<'_>,
+    repo_id: Uuid,
+    number: i32,
+    state: &str,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO issues (id, repo_id, number, factory_state) VALUES ($1, $2, $3, $4)
          ON CONFLICT (repo_id, number) DO UPDATE SET factory_state = EXCLUDED.factory_state, updated_at = now()",
@@ -1237,18 +1287,22 @@ pub async fn set_issue_state(pool: &Pool, repo_id: Uuid, number: i32, state: &st
     .bind(repo_id)
     .bind(number)
     .bind(state)
-    .execute(pool)
+    .execute(executor)
     .await?;
     tracing::info!(%repo_id, issue = number, state, "set issue state");
     Ok(())
 }
 
-/// Set a change request's factory state.
-pub async fn set_change_request_state(pool: &Pool, cr_id: Uuid, factory_state: &str) -> Result<()> {
+/// Set a change request's factory state. Executor-generic (see [`mark_reacted`]).
+pub async fn set_change_request_state(
+    executor: impl sqlx::PgExecutor<'_>,
+    cr_id: Uuid,
+    factory_state: &str,
+) -> Result<()> {
     sqlx::query("UPDATE change_requests SET factory_state = $2, updated_at = now() WHERE id = $1")
         .bind(cr_id)
         .bind(factory_state)
-        .execute(pool)
+        .execute(executor)
         .await?;
     tracing::info!(cr = %cr_id, factory_state, "set CR state");
     Ok(())
@@ -1272,13 +1326,17 @@ pub async fn change_request_by_number(
 }
 
 /// Increment a CR's review-rework loop count; returns the new value.
-pub async fn increment_cr_loop_count(pool: &Pool, cr_id: Uuid) -> Result<i32> {
+/// Executor-generic (see [`mark_reacted`]).
+pub async fn increment_cr_loop_count(
+    executor: impl sqlx::PgExecutor<'_>,
+    cr_id: Uuid,
+) -> Result<i32> {
     let n: i32 = sqlx::query_scalar(
         "UPDATE change_requests SET loop_count = loop_count + 1, updated_at = now()
           WHERE id = $1 RETURNING loop_count",
     )
     .bind(cr_id)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(n)
 }
@@ -1296,8 +1354,15 @@ pub async fn cr_loop_count(pool: &Pool, cr_id: Uuid) -> Result<i32> {
 /// Record an escalation **exactly once** per `(work_item, reason)`. Returns the
 /// escalation id and whether this call created it (`true`) or it already existed
 /// (`false`) — so a re-dispatch / racing replica never double-escalates.
+///
+/// Takes a `&mut sqlx::PgConnection` rather than an `impl PgExecutor` because it
+/// runs two statements (INSERT…RETURNING, then a fallback SELECT) and a borrowed
+/// `PgExecutor` is consumed by the first `.execute`/`.fetch`. A `&mut PgConnection`
+/// can be reborrowed for both. The coordinator runs this INSIDE its per-react
+/// transaction via `&mut *tx` (which derefs to `&mut PgConnection`); other callers
+/// pass `&mut *pool.acquire().await?`.
 pub async fn create_escalation_idempotent(
-    pool: &Pool,
+    conn: &mut sqlx::PgConnection,
     work_item_id: Uuid,
     reason: &str,
     context: &str,
@@ -1314,7 +1379,7 @@ pub async fn create_escalation_idempotent(
     .bind(reason)
     .bind(context)
     .bind(delivered_to)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     match inserted {
         Some(r) => {
@@ -1328,7 +1393,7 @@ pub async fn create_escalation_idempotent(
             )
             .bind(work_item_id)
             .bind(reason)
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
             Ok((id, false))
         }
