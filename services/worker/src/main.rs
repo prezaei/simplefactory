@@ -166,6 +166,13 @@ impl ClaudeRunner for ClaudeCli {
         token: &str,
     ) -> anyhow::Result<RunOutcome> {
         tracing::info!(workdir = %workdir.display(), role, tools_url, "ClaudeCli: running claude headless");
+        // Ensure the working directory exists before we `current_dir(workdir)` the
+        // `claude` process. The Coder path creates it via `git clone`, but the Manager
+        // and Reviewer roles skip cloning (no repo needed — they read the issue/CR over
+        // MCP), so for them nothing has created `workdir` yet and the spawn would fail
+        // with "No such file or directory". `create_dir_all` is idempotent, so it is a
+        // no-op for the already-cloned Coder tree.
+        tokio::fs::create_dir_all(workdir).await?;
         // Register the Factory Tools service as a Streamable-HTTP MCP server so
         // Claude reaches Factory (open CRs, etc.) through the authenticated
         // endpoint. The config carries the token (an Authorization header), so it is
