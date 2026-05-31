@@ -259,28 +259,32 @@ async fn reclaim_also_recovers_expired_running_items() {
 }
 
 #[tokio::test]
-async fn set_state_cannot_resurrect_a_terminal_item() {
-    // Terminal states are final: set_state on a succeeded item is a no-op, so a
-    // terminal item can't be re-activated and re-occupy a cap slot.
+async fn set_state_cannot_resurrect_any_terminal_item() {
+    // Every terminal state (succeeded/failed/escalated) is final: set_state out of
+    // it is a no-op, so a terminal item can't be re-activated and re-occupy a slot.
     let Some(pool) = pool_or_skip().await else {
         return;
     };
     let repo = record::upsert_repo(&pool, "acme", &unique("terminal-guard"), 1)
         .await
         .unwrap();
-    let EnqueueOutcome::Inserted(id) = record::enqueue(&pool, &coder_item(repo, "issue#1"))
-        .await
-        .unwrap()
-    else {
-        panic!()
-    };
-    assert!(record::set_state(&pool, id, State::Succeeded)
-        .await
-        .unwrap());
-    // Attempt to resurrect → rejected (returns false), state stays terminal.
-    assert!(!record::set_state(&pool, id, State::Running).await.unwrap());
-    assert!(!record::set_state(&pool, id, State::Queued).await.unwrap());
-    // Nothing leasable (it stayed terminal, not queued).
+    for (i, terminal) in [State::Succeeded, State::Failed, State::Escalated]
+        .into_iter()
+        .enumerate()
+    {
+        let EnqueueOutcome::Inserted(id) =
+            record::enqueue(&pool, &coder_item(repo, &format!("issue#{i}")))
+                .await
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert!(record::set_state(&pool, id, terminal).await.unwrap());
+        // No transition out of a terminal state.
+        assert!(!record::set_state(&pool, id, State::Running).await.unwrap());
+        assert!(!record::set_state(&pool, id, State::Queued).await.unwrap());
+    }
+    // None of the now-terminal items are leasable.
     assert!(record::lease_next(&pool, &lease_req(repo, 10, 10))
         .await
         .unwrap()
@@ -368,4 +372,154 @@ async fn append_event_writes_the_audit_trail() {
     .unwrap();
 
     assert_eq!(record::count_events_for_item(&pool, id).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn blocked_state_frees_the_cap_slot() {
+    // "Ask, don't block": moving a leased item to `blocked` releases its cap slot
+    // (caps count only leased/running), so other work can proceed.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("blocked-slot"), 1)
+        .await
+        .unwrap();
+    record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap();
+    record::enqueue(&pool, &coder_item(repo, "issue#2"))
+        .await
+        .unwrap();
+
+    // Cap of 1: lease the first, the second is blocked by the cap.
+    let a = record::lease_next(&pool, &lease_req(repo, 1, 1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(record::lease_next(&pool, &lease_req(repo, 1, 1))
+        .await
+        .unwrap()
+        .is_none());
+
+    // Block A -> frees the slot -> the second item can now lease.
+    assert!(record::set_state(&pool, a.id, State::Blocked)
+        .await
+        .unwrap());
+    let b = record::lease_next(&pool, &lease_req(repo, 1, 1))
+        .await
+        .unwrap()
+        .expect("blocking the first should free the cap slot");
+    assert_eq!(b.subject_ref, "issue#2");
+}
+
+#[tokio::test]
+async fn blocked_item_is_not_reclaimed_and_can_be_requeued() {
+    // A blocked item is not lease-backed, so the sweeper must NOT reclaim it even
+    // with a stale lease_expires_at; and it can be returned to the queue (the
+    // substrate the P2/P5 resume-on-reply path builds on).
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("blocked-reclaim"), 1)
+        .await
+        .unwrap();
+    record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap();
+    let mut req = lease_req(repo, 10, 10);
+    req.ttl_secs = 0.0;
+    let leased = record::lease_next(&pool, &req).await.unwrap().unwrap();
+    assert!(record::set_state(&pool, leased.id, State::Blocked)
+        .await
+        .unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Sweeper does not touch blocked items -> still not leasable.
+    record::reclaim_expired(&pool).await.unwrap();
+    assert!(record::lease_next(&pool, &lease_req(repo, 10, 10))
+        .await
+        .unwrap()
+        .is_none());
+
+    // A human reply re-queues it; now it leases again.
+    assert!(record::set_state(&pool, leased.id, State::Queued)
+        .await
+        .unwrap());
+    let resumed = record::lease_next(&pool, &lease_req(repo, 10, 10))
+        .await
+        .unwrap()
+        .expect("requeued item should lease");
+    assert_eq!(resumed.id, leased.id);
+}
+
+#[tokio::test]
+async fn valid_lease_is_not_reclaimed() {
+    // The negative case for the sweeper: a live (future-expiry) lease must survive
+    // reclaim and keep heartbeating. Guards against a `<`-vs-`<=` / dropped-predicate
+    // regression that the ttl=0 reclaim tests wouldn't catch.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("valid-lease"), 1)
+        .await
+        .unwrap();
+    record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap();
+    let leased = record::lease_next(&pool, &lease_req(repo, 10, 10)) // ttl 60s (future)
+        .await
+        .unwrap()
+        .unwrap();
+
+    record::reclaim_expired(&pool).await.unwrap();
+
+    // Still leased (not requeued): nothing is leasable, and the owner can heartbeat.
+    assert!(record::lease_next(&pool, &lease_req(repo, 10, 10))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(record::heartbeat(&pool, leased.id, "test-leaser", 60.0)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn concurrent_enqueue_of_same_subject_is_idempotent() {
+    // The partial unique index exists to defend a race: many callers enqueueing
+    // the same (repo, subject, kind) at once must yield exactly one active item.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("concurrent-enqueue"), 1)
+        .await
+        .unwrap();
+
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..16 {
+        let pool = pool.clone();
+        let item = coder_item(repo, "issue#1");
+        set.spawn(async move { record::enqueue(&pool, &item).await.unwrap() });
+    }
+    let mut inserted = 0usize;
+    while let Some(res) = set.join_next().await {
+        if matches!(res.unwrap(), EnqueueOutcome::Inserted(_)) {
+            inserted += 1;
+        }
+    }
+    assert_eq!(inserted, 1, "exactly one concurrent enqueue wins");
+    assert_eq!(record::count_for_repo(&pool, repo).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn upsert_repo_is_idempotent_by_owner_name() {
+    // A second upsert of the same (owner, name) returns the SAME repo id (no
+    // duplicate repo), updating the installation id rather than inserting.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let name = unique("upsert-idem");
+    let first = record::upsert_repo(&pool, "acme", &name, 1).await.unwrap();
+    let second = record::upsert_repo(&pool, "acme", &name, 2).await.unwrap();
+    assert_eq!(first, second, "same (owner,name) must map to one repo id");
 }

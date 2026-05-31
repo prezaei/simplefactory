@@ -387,9 +387,7 @@ pub async fn reclaim_expired(pool: &Pool) -> Result<u64> {
     .execute(pool)
     .await?;
     let n = result.rows_affected();
-    if n > 0 {
-        tracing::info!(reclaimed = n, "reclaimed expired leases");
-    }
+    tracing::info!(reclaimed = n, "reclaim sweep");
     Ok(n)
 }
 
