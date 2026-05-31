@@ -115,7 +115,7 @@ Every role runs Claude Code over the same MCP/Tools channel, but the harness's t
 | --- | --- | --- | --- | --- |
 | **Manager** | the issue (`read_issue`) | triages: actionable vs not | actionable → `post_comment` + `record_outcome` **success** (only a *succeeded* Manager makes the Coordinator assign a Coder); non-actionable → `escalate` (terminal; no Coder) | **No** |
 | **Coder** | the issue / CR | writes code on a fresh clone | push branch → `open_or_update_change_request` → `record_outcome` | **Yes** (the only role that does) |
-| **Reviewer** | the CR (`read_change_request`) | reviews the diff + checks | `submit_review` verdict (approve / request changes) → `record_outcome` | **No** |
+| **Reviewer** | the CR (`read_change_request`) | reviews the diff + checks | `submit_review` verdict (e.g. approve / request changes) → `record_outcome` | **No** |
 
 A Manager or Reviewer therefore never pushes a branch or opens a CR. (The Coder→CR lifecycle ships in P3; the Manager-triage and Reviewer-verdict lifecycles are **P4.5** in the implementation plan.) This table defines the **manager / coder / reviewer** lifecycles only; the **`tester`** role is reserved (no shipped lifecycle yet — consistent with the config note below), so it has no terminal-action contract here.
 
@@ -237,7 +237,7 @@ CREATE TABLE events (                              -- append-only audit trail
     repo_id        uuid REFERENCES repos(id),
     work_item_id   uuid REFERENCES work_items(id),
     correlation_id uuid,
-    actor          text NOT NULL,    -- 'intake'|'dispatcher'|'manager'|'worker:<name>'|'tool:<name>'|'human:<login>'
+    actor          text NOT NULL,    -- 'intake'|'dispatcher'|'coordinator'|'worker:<name>'|'tool:<name>'|'human:<login>'
     action         text NOT NULL,    -- machine-readable verb
     detail         jsonb NOT NULL DEFAULT '{}',
     at             timestamptz NOT NULL DEFAULT now()
@@ -299,7 +299,7 @@ workers:
   - name: bug-fixer
     role: coder                  # manager | coder | reviewer | tester
     on:                          # declarative trigger list
-      - manager                  # the Manager assigns this coder (manager-first; see below)
+      - manager                  # on a succeeded Manager, the Coordinator enqueues this coder (manager-first; see below)
       - cr_changes_requested     # a reviewer asked for changes (the rework loop)
     max_concurrent: 3
     model: claude-opus-4-8       # optional per-worker model override
@@ -325,20 +325,20 @@ workers:
     max_concurrent: 1
 ```
 
-**Worker model.** `workers:` is a named list; each entry binds a `name` to a `role` (`manager` | `coder` | `reviewer` | `tester`), its triggers, and its caps. The named-list form (vs fixed role blocks) allows multiple workers of the same role (e.g. a `bug-fixer` and a `refactorer`, both coders) and future roles without a schema change. (The `tester` role and the `review_requested` trigger are reserved for future workflows — no shipped workflow drives them yet.) **Manager-first:** only the Manager subscribes to `issue_labeled`; coders/reviewers/testers are woken by the Manager (`manager` trigger) or by their own CR/comment triggers, never by `issue_labeled` directly — so the single labelled-issue event yields exactly one Manager work item.
+**Worker model.** `workers:` is a named list; each entry binds a `name` to a `role` (`manager` | `coder` | `reviewer` | `tester`), its triggers, and its caps. The named-list form (vs fixed role blocks) allows multiple workers of the same role (e.g. a `bug-fixer` and a `refactorer`, both coders) and future roles without a schema change. (The `tester` role and the `review_requested` trigger are reserved for future workflows — no shipped workflow drives them yet.) **Manager-first:** only the Manager subscribes to `issue_labeled`; coders/reviewers/testers are enqueued by the Coordinator as the manager-first next step (via the `manager` trigger) or fire on their own CR/comment triggers, never on `issue_labeled` directly — so the single labelled-issue event yields exactly one Manager work item.
 
 **Trigger vocabulary** (`on:`):
 
 | Trigger | Fires when |
 | --- | --- |
-| `issue_labeled` | an issue gains the opt-in label — **wakes the Manager only**; coders/reviewers are dispatched by the Manager via `manager` (manager-first) |
+| `issue_labeled` | an issue gains the opt-in label — **wakes the Manager only**; coders/reviewers are enqueued by the **Coordinator** as the manager-first next step (via the `manager` trigger) |
 | `cr_opened` | a change request is opened |
 | `cr_updated` | new commits pushed to a tracked CR |
 | `cr_changes_requested` | a reviewer requested changes (drives the rework loop) |
 | `review_requested` | review explicitly requested on a CR |
 | `issue_comment` | a human comments on / edits a tracked issue or CR — resumes a `blocked` item and carries human steering |
 | `schedule: "<cron>"` | a timer fires (UTC); enqueued by the in-app scheduler |
-| `manager` | the Manager dispatches this worker as a next step |
+| `manager` | the **Coordinator** enqueues this worker as the manager-first next step (on a succeeded Manager) |
 
 **Prompt overrides** (the key per-repo customization). Each worker's effective prompt is composed, in order:
 1. the **role default** prompt (shipped with Factory),
@@ -377,7 +377,7 @@ The worker's only channel to Factory, exposed by the Tools service as a **remote
 
 ## Key workflows
 
-**Issue → merged change (the worked example).** Webhook → Intake writes a Manager-role work item → Dispatcher leases it → the Manager worker triages; on its success the **Coordinator** assigns a Coder (enqueues a coder work item, comments via Tools) → Dispatcher starts a Container Apps Job → Worker clones, runs Claude Code (tests-first, then code), opens a CR via Tools, records success → the **Coordinator** (reacting to completion) + the new-CR webhook wake a Reviewer job → Reviewer verdict via Tools → on *changes requested*, the **Coordinator** re-enqueues a Coder against the same CR (counts toward the per-issue loop cap); on *approved* + required checks green, the **Coordinator** marks ready and hands to a human to merge → human merges → the **Coordinator** closes the issue.
+**Issue → merged change (the worked example).** Webhook → Intake writes a Manager-role work item → Dispatcher leases it → the Manager worker triages; on its success the **Coordinator** assigns a Coder (enqueues a coder work item, comments via Tools) → Dispatcher starts a Container Apps Job → Worker clones, runs Claude Code (tests-first, then code), opens a CR via Tools, records success → the **Coordinator** (reacting to completion) + the new-CR webhook wake a Reviewer job → Reviewer verdict via Tools → on *changes requested*, the **Coordinator** re-enqueues a Coder against the same CR (counts toward the per-issue loop cap); on *approved* + required checks green, the **Coordinator** marks ready and hands to a human to merge → human merges → the **Coordinator** closes the issue. *(Caveat: automatic issue-closure-on-merge is a **deferred** capability — it needs merge-webhook (`pull_request closed/merged`) ingestion so the Coordinator can observe the merge; until that lands the issue stays open after the ready-for-merge handoff.)*
 
 **No-double-starts.** Every pickup is a single `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)` transaction; the row's lease columns are set atomically. Two dispatcher replicas can never lease the same row.
 

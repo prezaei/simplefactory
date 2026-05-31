@@ -74,7 +74,7 @@
 **Tasks**
 - `libs/github` (**inbound**): webhook **HMAC verification** (constant-time) + typed events — issue labelled, CR opened/updated, `review_requested`, `pull_request_review` → changes-requested, **issue_comment**, push. *(Done.)*
 - `services/intake` (Axum): verify signature → reject requests missing the GitHub identity headers → dedupe on delivery id → filter by opt-in `label` → enqueue `work_item` (pinning current `config_sha`). Fast 2xx; all work async off the queue. **Lost-event-safe:** a delivery id is recorded only *after* successful processing, and "not ready" outcomes (repo not connected / no config) are left unrecorded so a GitHub redelivery re-drives them. Every ingest writes an `events` audit row. *(Done.)*
-- **Enqueue policy — manager-first.** On `issue_labeled`, Intake enqueues a single **Manager** work item; coders/reviewers/testers are woken downstream by the Manager (`manager` trigger) or by their own CR/comment triggers — never by `issue_labeled` directly. (This resolves the spec's config-vs-worked-example ambiguity; P0 config validation enforces it.) *(Done.)*
+- **Enqueue policy — manager-first.** On `issue_labeled`, Intake enqueues a single **Manager** work item; coders/reviewers/testers are enqueued downstream by the Coordinator as the manager-first next step (via the `manager` trigger) or fire on their own CR/comment triggers — never on `issue_labeled` directly. (The Manager worker doesn't dispatch; its success drives the Coordinator.) (This resolves the spec's config-vs-worked-example ambiguity; P0 config validation enforces it.) *(Done.)*
 - `services/intake` scheduler loop: full cron parsing (`libs/config`), read each repo's config timers, and fire due `schedule` work **exactly once across replicas** via a per-`(repo,worker)` advisory lock that re-checks `schedule_state.last_fired` (work-item idempotency is the backstop). *(Done.)*
 - **blocked→queued transition:** an `issue_comment` on a tracked blocked item flips it to `queued` (`available_at=now()`). *(Done.)*
 - Resolve only **active** repos (suspended/removed never produce work); `webhook_deliveries` retention purge helper (the dedupe table is load-bearing, so it must be prunable). *(Done.)*
@@ -106,7 +106,7 @@ The real subprocess seams are implemented too: `GitCli` (shallow clone + `--forc
 
 ## P4 — Coordinator + Reviewer (full loop)
 
-**Goal:** the manager decides/delegates and review closes the loop to a human merge.
+**Goal:** the **Coordinator** decides/delegates and review closes the loop to a human merge.
 
 **Tasks**
 - `services/coordinator` (the Coordinator): react to completions → assign Coder, wake Reviewer on new CR, hand approved+green CR to a human, close the loop, or escalate. Per-issue decisions serialized by an issue row-lock; enqueue next-steps idempotently.
@@ -128,7 +128,7 @@ The real subprocess seams are implemented too: `GitCli` (shallow clone + `--forc
 **Tasks**
 - `services/worker`: make `run_task` **role-aware** (branch on `task.role` from `get_task`) — the branch covers **manager / coder / reviewer**; **`tester` is reserved/unsupported for now**. `tester` is accepted as a valid role (`validate_role` in `services/worker` admits all four), but it has **no P4.5 lifecycle**, so reaching the run path with a `tester` (or any unknown) role is an explicit **unsupported/no-op rejected loudly at the seam** — never given a coder-style default:
   - **Coder** (unchanged): clone → Claude edits → push branch → `open_or_update_change_request` → `record_outcome`.
-  - **Reviewer**: read the CR (`read_change_request`) → Claude reviews → `submit_review` verdict (approve / request changes) → `record_outcome`. **No** branch push, **no** CR.
+  - **Reviewer**: read the CR (`read_change_request`) → Claude reviews → `submit_review` verdict (e.g. approve / request changes) → `record_outcome`. **No** branch push, **no** CR.
   - **Manager**: read the issue (`read_issue`) → Claude triages. On an **actionable** issue: optionally `post_comment` a triage note, then `record_outcome` **success** — and only a *succeeded* Manager item makes the Coordinator assign a Coder. On a **non-actionable** issue: `escalate` (a terminal escalated outcome; the Coordinator parks it and does **not** assign a Coder). Either way: **no** clone-edit-push, **no** CR. (No label-mutating Tool exists in the Tools surface, so triage acts via comments/escalation, not labels; a manager may not need a clone at all — keep it lean.)
 - Role-default prompts: the per-role base prompt and the composition order (role default → repo-wide → per-worker) **already exist** — `role_default_prompt` + `compose_prompt` in `services/tools` (shipped in P3). P4.5 just **reuses/verifies** them for the manager and reviewer roles (and confirms each role's default prompt fits its new no-CR lifecycle); it does NOT add new prompt-composition.
 - Keep all worker effects mediated by Tools (the existing trust boundary); no new direct Postgres/Blob access.

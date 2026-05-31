@@ -43,7 +43,7 @@ You've connected your repo and you want a bug fixed. You don't open a console or
 7. **The Reviewer wakes up in its own workroom**, reads the diff, checks the fix is correct and the tests are real, and leaves a verdict:
    - **Requests changes** → the Coordinator hands the change request back to a Coder to address the feedback, looping to step 4 on the same change request.
    - **Approves**, and once the repo's own automated checks are green → Factory marks the change ready and **hands it to a human to merge**. Factory never merges on its own — a person performs the final merge, keeping the one irreversible step under human control.
-8. **The Coordinator closes the loop** — comments the outcome and closes the issue.
+8. **The Coordinator closes the loop** — comments the outcome (a human merges; automatic issue-closure on merge is a later capability).
 
 Throughout, you can watch every step on the dashboard — which worker is doing what, the live play-by-play, the change request, the review — and you can leave a comment or edit the issue or change request to steer it. At most you wrote an issue and clicked merge; Factory did the rest.
 
