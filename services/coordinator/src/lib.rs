@@ -423,25 +423,16 @@ async fn load_approval_decision(
         return Ok(None);
     };
 
-    // Read the CR view FIRST (for the can't-weaken-gating guard) to resolve the head SHA,
-    // THEN the check rollup for THAT EXACT SHA. Resolving the SHA once and passing it as
-    // `CheckRef::Sha` (rather than letting `check_status` re-fetch the PR head itself):
-    //   1. dedupes the PR fetch — `check_status(ChangeRequest)` would otherwise do its own
-    //      `pulls().get` for the same number; and
-    //   2. closes a TOCTOU split — a concurrent `try_join` of the two reads could straddle
-    //      a force-push, so the guard's file list and the green gate would describe
-    //      DIFFERENT commits. Gating both on `view.head_sha` keeps them consistent.
-    // The lost read-concurrency is a negligible latency cost on this every-N-min path.
+    // Read the CR view FIRST — it carries the changed-file list (for the can't-weaken
+    // guard) AND the head SHA (for the check rollup).
     let view = gh.read_change_request(repo, number as i64).await?;
-    let checks = gh
-        .check_status(repo, CheckRef::Sha(view.head_sha.clone()))
-        .await?;
 
-    // Can't-weaken-own-checks guard: if any changed file touches a configured gating
-    // path, the change alters the very checks that gate it → never mark ready. The
-    // gating prefixes are repo-configurable (`settings.gating_paths`, default
-    // `[".github/workflows/"]`) so a repo's checks defined elsewhere are guarded too.
-    // This guard takes precedence over the green check regardless of check status.
+    // Can't-weaken-own-checks guard, evaluated BEFORE check_status: if any changed file
+    // touches a configured gating path, the change alters the very checks that gate it →
+    // never mark ready. The gating prefixes are repo-configurable (`settings.gating_paths`,
+    // default `[".github/workflows/"]`) so a repo's checks defined elsewhere are guarded
+    // too. This guard takes precedence over check status and only needs `view.files`, so it
+    // runs FIRST — a `check_status` error must NOT prevent escalating a weakening CR.
     if view
         .files
         .iter()
@@ -452,6 +443,15 @@ async fn load_approval_decision(
             ApprovalDecision::WeakensGating { cr },
         )));
     }
+
+    // Not weakening gating → read the check rollup for THAT EXACT head SHA. Passing
+    // `CheckRef::Sha(view.head_sha)` (rather than letting `check_status` re-fetch the PR
+    // head itself): (1) dedupes the PR fetch, and (2) closes a TOCTOU split — gating the
+    // guard's file list and the green gate on the SAME commit, so a force-push between two
+    // reads can't make them describe different commits.
+    let checks = gh
+        .check_status(repo, CheckRef::Sha(view.head_sha.clone()))
+        .await?;
 
     // Green (Success/Neutral, INCLUDING the empty-checks-is-green case per FIX 2) →
     // mark ready + hand to a human.

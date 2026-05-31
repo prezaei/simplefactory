@@ -2425,10 +2425,15 @@ mod acceptance {
             tokio::spawn(async move { coordinator_tick(&pool_a, gh_a.as_ref()).await.unwrap() }),
             tokio::spawn(async move { coordinator_tick(&pool_b, gh_b.as_ref()).await.unwrap() }),
         );
+        // `coordinator_tick` scans EVERY repo's unreacted terminal items (one coordinator
+        // serves all repos), so its global react count can include items from other tests
+        // sharing this DB under parallel execution — assert our two items were covered
+        // (>= 2), not an exact global total. The EXACTLY-once guarantee for THIS test's
+        // items is proven item-scoped below (each reacted once, one enqueue, one escalation).
         let total = a.unwrap() + b.unwrap();
-        assert_eq!(
-            total, 2,
-            "each of the two terminal items is reacted exactly once across both ticks"
+        assert!(
+            total >= 2,
+            "both of this test's terminal items were reacted across the two ticks (got {total})"
         );
 
         // Both items are reacted; the per-issue decision is consistent and exactly-once.
