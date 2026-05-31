@@ -507,16 +507,20 @@ async fn record_verdict_cr_state(
         // Don't clobber a CR the coordinator has already advanced past review: once a
         // CR is `ready`/`merged`/`closed` a late or duplicate verdict must not drag it
         // back to `approved`/`changes_requested` (that would re-open a settled handoff).
-        if matches!(cr.factory_state.as_str(), "ready" | "merged" | "closed") {
+        // The guard is an ATOMIC conditional UPDATE (`... WHERE factory_state NOT IN
+        // ('ready','merged','closed')`), NOT a read-then-write: the coordinator can move
+        // a CR `approved → ready` in the window between a read and the write, so a
+        // read-and-check would TOCTOU-clobber `ready`. The conditional write writes only
+        // when the CR is still in an overwritable state.
+        let wrote =
+            record::set_change_request_state_if_not_terminal(&state.pool, cr.id, new_state).await?;
+        if !wrote {
             tracing::info!(
                 work_item = %auth.work_item_id,
                 cr_number,
-                factory_state = %cr.factory_state,
                 "submit_review: CR already past review; not overwriting its factory state"
             );
-            return Ok(());
         }
-        record::set_change_request_state(&state.pool, cr.id, new_state).await?;
     }
     Ok(())
 }

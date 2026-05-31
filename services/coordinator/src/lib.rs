@@ -70,6 +70,49 @@ use uuid::Uuid;
 /// owner mapping is a later refinement. (Assignment is idempotent on GitHub.)
 const HANDOFF_ASSIGNEE: &str = "factory-human";
 
+/// Platform-default retry ceiling (mirrors `factory_config`'s `default_retry_cap`).
+/// Used as the floor when a stored config carries a `retry_cap < 1` (F2).
+const DEFAULT_RETRY_CAP: u32 = 3;
+/// Platform-default review-rework ceiling (mirrors `factory_config`'s
+/// `default_loop_cap`). Used as the floor when a stored config carries a
+/// `loop_cap < 1` (F2).
+const DEFAULT_LOOP_CAP: u32 = 5;
+
+/// Read an effective retry cap from config, defending against a `< 1` value (F2).
+/// `config::parse()` rejects a 0 cap, but a directly-written jsonb config could
+/// bypass that validation; a 0 cap would disable the retry bound entirely (every
+/// failure escalates, or — for the loop cap — never escalates). So a `< 1` cap is
+/// treated as the platform default with a `tracing::warn!`, never trusted as-is.
+fn effective_retry_cap(config: &Config) -> u32 {
+    let raw = config.settings.retry_cap;
+    if raw >= 1 {
+        raw
+    } else {
+        tracing::warn!(
+            raw,
+            default = DEFAULT_RETRY_CAP,
+            "config retry_cap < 1 bypassed validation; using platform default"
+        );
+        DEFAULT_RETRY_CAP
+    }
+}
+
+/// Read an effective loop cap from config, defending against a `< 1` value (F2).
+/// See [`effective_retry_cap`] for the rationale.
+fn effective_loop_cap(config: &Config) -> u32 {
+    let raw = config.settings.loop_cap;
+    if raw >= 1 {
+        raw
+    } else {
+        tracing::warn!(
+            raw,
+            default = DEFAULT_LOOP_CAP,
+            "config loop_cap < 1 bypassed validation; using platform default"
+        );
+        DEFAULT_LOOP_CAP
+    }
+}
+
 /// React to every un-reacted terminal work item once. Returns the number reacted to.
 ///
 /// Per-item error isolation (F6): a failure to load one repo's config OR to react to
@@ -563,7 +606,7 @@ async fn decide_changes_requested(
     config: &Config,
     cr: &ChangeRequest,
 ) -> anyhow::Result<PostCommit> {
-    let loop_cap = i64::from(config.settings.loop_cap);
+    let loop_cap = i64::from(effective_loop_cap(config));
     let count = record::increment_cr_loop_count(&mut **tx, cr.id).await?;
     tracing::info!(work_item = %item.id, cr = %cr.id, loop_count = count, cap = loop_cap, "changes requested: incremented loop count");
 
@@ -641,7 +684,7 @@ async fn decide_failed(
     config: &Config,
     cr: Option<ChangeRequest>,
 ) -> anyhow::Result<PostCommit> {
-    let retry_cap = i64::from(config.settings.retry_cap);
+    let retry_cap = i64::from(effective_retry_cap(config));
     if i64::from(item.attempt_count) < retry_cap {
         // Re-queue for a fresh attempt rather than dropping the failed worker. The
         // requeue resets `reacted` so the NEXT failure of this row is reacted to again.
@@ -1025,13 +1068,86 @@ mod tests {
         );
     }
 
+    /// Build a work item with an explicit repo id and subject, for the lock-key tests
+    /// that need to control which repo the fallback is derived from.
+    fn item_in_repo(repo_id: Uuid, subject_ref: &str) -> WorkItem {
+        let mut item = item_with_subject(subject_ref);
+        item.repo_id = repo_id;
+        item
+    }
+
     #[test]
-    fn issue_lock_key_falls_back_to_nonnegative_item_key() {
-        // The uuid-derived fallback key is always a non-negative i64 (advisory-lock
-        // keys are fine either way, but a stable, predictable value is clearer).
-        let item = item_with_subject("garbage");
-        let key = (item.id.as_u128() as i64) & 0x3fff_ffff_ffff_ffff;
-        assert!(key >= 0, "fallback lock key is non-negative");
+    fn issue_lock_key_uses_issue_then_repo_fallback() {
+        // F1: this exercises the ACTUAL C5 fix — `issue_lock_key` (and its
+        // `repo_level_lock_key` fallback) — not a recomputed item-id hash.
+
+        // (a) An `issue#N` subject derives the key FROM THE ISSUE, deterministically:
+        // the same issue always yields the same key regardless of repo or item id.
+        let repo_a = Uuid::now_v7();
+        let repo_b = Uuid::now_v7();
+        assert_eq!(issue_lock_key(&item_in_repo(repo_a, "issue#42"), None), 42);
+        assert_eq!(
+            issue_lock_key(&item_in_repo(repo_a, "issue#42"), None),
+            issue_lock_key(&item_in_repo(repo_b, "issue#42"), None),
+            "an issue#N key is the issue number, independent of repo/item"
+        );
+
+        // A `cr#N` whose CR has a linked issue derives the key from THAT issue.
+        let cr = cr_with(Some(9), Some(7));
+        assert_eq!(issue_lock_key(&item_in_repo(repo_a, "cr#9"), Some(&cr)), 7);
+
+        // (b) With NO resolvable issue, the fallback is REPO-LEVEL: two DIFFERENT work
+        // items in the SAME repo (different ids, different un-resolvable subjects) get
+        // the SAME key, so they serialize on the advisory lock.
+        let unresolvable_cr = cr_with(Some(5), None); // cr#N with no linked issue
+        let k1 = issue_lock_key(&item_in_repo(repo_a, "cr#5"), Some(&unresolvable_cr));
+        let k2 = issue_lock_key(&item_in_repo(repo_a, "garbage"), None);
+        assert_eq!(
+            k1, k2,
+            "same-repo items with no resolvable issue share one repo-level key"
+        );
+        assert_eq!(
+            k1,
+            repo_level_lock_key(repo_a),
+            "the fallback IS the repo-level key"
+        );
+
+        // Items in DIFFERENT repos with no resolvable issue get DIFFERENT keys (the
+        // fallback never collapses distinct repos onto one lock).
+        let k_other_repo = issue_lock_key(&item_in_repo(repo_b, "garbage"), None);
+        assert_ne!(
+            k1, k_other_repo,
+            "different repos' fallback keys are distinct"
+        );
+
+        // The repo-level fallback key is always non-negative (low 62 bits of the uuid).
+        assert!(repo_level_lock_key(repo_a) >= 0);
+        assert!(repo_level_lock_key(repo_b) >= 0);
+    }
+
+    #[test]
+    fn zero_retry_cap_falls_back_to_platform_default() {
+        // F2 defense-in-depth: `config::parse()` rejects a 0 retry_cap, but a
+        // directly-written jsonb config could carry one. A 0 cap would make EVERY
+        // failure escalate immediately (no retries). The coordinator must treat any
+        // `< 1` cap as the platform default (3), never trust the 0.
+        let mut cfg = factory_config::parse("version: 1\n").expect("minimal config parses");
+        cfg.settings.retry_cap = 0;
+        assert_eq!(effective_retry_cap(&cfg), DEFAULT_RETRY_CAP);
+        // A legitimate explicit value is honored unchanged.
+        cfg.settings.retry_cap = 7;
+        assert_eq!(effective_retry_cap(&cfg), 7);
+    }
+
+    #[test]
+    fn zero_loop_cap_falls_back_to_platform_default() {
+        // F2: a 0 loop_cap (bypassing validation) would mean the review-rework loop
+        // NEVER escalates at a cap. Treat any `< 1` cap as the platform default (5).
+        let mut cfg = factory_config::parse("version: 1\n").expect("minimal config parses");
+        cfg.settings.loop_cap = 0;
+        assert_eq!(effective_loop_cap(&cfg), DEFAULT_LOOP_CAP);
+        cfg.settings.loop_cap = 9;
+        assert_eq!(effective_loop_cap(&cfg), 9);
     }
 
     #[test]

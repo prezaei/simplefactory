@@ -1308,6 +1308,218 @@ mod acceptance {
         );
     }
 
+    /// Lease the next queued item for `worker`, asserting one becomes available and is
+    /// the expected row. Mirrors the dispatcher's lease leg of the real retry loop.
+    async fn lease_one(pool: &record::Pool, repo: Uuid, worker: &str, expect: Uuid) {
+        let req = record::LeaseRequest {
+            repo_id: repo,
+            worker_name: worker.into(),
+            lease_owner: "e2e-dispatcher".into(),
+            ttl_secs: 60.0,
+            per_worker_cap: 1000,
+            global_cap: 1000,
+        };
+        let leased = record::lease_next(pool, &req)
+            .await
+            .unwrap()
+            .expect("a re-queued item must be re-leasable");
+        assert_eq!(
+            leased.id, expect,
+            "the re-leased item is the same requeued row"
+        );
+    }
+
+    /// Fail a leased item the way `record_outcome(\"failed\")` does: set state Failed
+    /// WITHOUT bumping `attempt_count` (only lease-expiry reclaim bumps attempts). This
+    /// is the REAL failure the coordinator's retry path must observe — not `force_failed`.
+    async fn fail_via_outcome(pool: &record::Pool, id: Uuid) {
+        assert!(
+            record::set_state(pool, id, record::State::Failed)
+                .await
+                .unwrap(),
+            "a leased item transitions to failed"
+        );
+    }
+
+    /// F1: drive the REAL failure → requeue → re-lease → re-fail loop end to end (NOT
+    /// `force_failed`). A coder is leased, fails via the `record_outcome` path (state
+    /// Failed, no attempt bump), and the coordinator requeues it (state queued,
+    /// attempt_count++, reacted reset). The dispatcher then RE-LEASES the same row — the
+    /// re-lease leg that was previously untested — and the cycle repeats until the retry
+    /// cap, where exactly one `retries_exhausted` escalation is recorded. Verifies the
+    /// item was re-leased the expected number of times between failures.
+    #[tokio::test]
+    async fn failed_item_requeue_release_loop_until_cap() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (_manager, coder, _reviewer), gh, _state) =
+            p4_fixture(&pool, "e2e-p4-relooploop").await;
+
+        // RETRY_CAP is the default 3: a fresh item (attempt_count 0) is requeued at
+        // attempts 0, 1, 2 (3 retries, each followed by a real re-lease) and escalates
+        // once attempt_count reaches 3.
+        const CAP: i32 = 3;
+        let item = enqueue_item(&pool, repo, record::Kind::Coder, coder, "issue#1").await;
+
+        let mut releases = 0;
+        for attempt in 0..CAP {
+            // Lease the item (the FIRST iteration leases the freshly-enqueued row; every
+            // later iteration leases the REQUEUED row — the previously-untested leg).
+            lease_one(&pool, repo, coder, item).await;
+            releases += 1;
+            // The worker fails (real record_outcome path: Failed, no attempt bump).
+            fail_via_outcome(&pool, item).await;
+
+            // The coordinator reacts: under the cap → requeue (not escalate).
+            assert_eq!(
+                coordinator_tick(&pool, gh.as_ref()).await.unwrap(),
+                1,
+                "the failed item is reacted exactly once on attempt {attempt}"
+            );
+            let (state, attempts, reacted) = item_state_attempts_reacted(&pool, item).await;
+            assert_eq!(
+                state, "queued",
+                "under-cap failure is requeued (attempt {attempt})"
+            );
+            assert_eq!(
+                attempts,
+                attempt + 1,
+                "attempt_count is bumped on each requeue"
+            );
+            assert!(
+                !reacted,
+                "reacted is reset so the NEXT real failure is reacted to again"
+            );
+            assert_eq!(
+                record::count_escalations_for_item(&pool, item)
+                    .await
+                    .unwrap(),
+                0,
+                "no escalation while under the cap (attempt {attempt})"
+            );
+            assert_eq!(
+                calls_with_prefix(&gh, "post_comment").len(),
+                0,
+                "no escalation comment while under the cap"
+            );
+        }
+        assert_eq!(
+            releases, CAP,
+            "the item was re-leased once per under-cap retry"
+        );
+
+        // Now AT the cap (attempt_count == 3): lease, fail, tick → escalate exactly once.
+        lease_one(&pool, repo, coder, item).await;
+        fail_via_outcome(&pool, item).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        let (state, attempts, _reacted) = item_state_attempts_reacted(&pool, item).await;
+        assert_eq!(state, "failed", "an at-cap item is escalated, not requeued");
+        assert_eq!(
+            attempts, CAP,
+            "at-cap attempt_count is the cap (no further bump)"
+        );
+        let exhausted: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'retries_exhausted' AND work_item_id = $1",
+        )
+        .bind(item)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            exhausted, 1,
+            "exactly one retries_exhausted escalation at the cap"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment (only at the cap)"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one escalation assignment (only at the cap)"
+        );
+    }
+
+    /// F3 TOCTOU: a late or duplicate review verdict must NOT clobber a CR the
+    /// coordinator has already advanced to `ready`/`merged`/`closed`. The verdict write
+    /// is an atomic conditional UPDATE (`record_verdict_cr_state` →
+    /// `set_change_request_state_if_not_terminal`), so a `ready` CR is left untouched,
+    /// while an `approved`/`open` CR IS updated.
+    #[tokio::test]
+    async fn late_verdict_does_not_clobber_ready_cr() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (_manager, coder, reviewer), _gh, _state) =
+            p4_fixture(&pool, "e2e-p4-toctou").await;
+
+        // A CR that the coordinator has already handed off (factory_state = ready).
+        let (cr_number, cr_row) = open_cr(&pool, repo, coder, &state_for(&pool), "body").await;
+        record::set_change_request_state(&pool, cr_row.id, "ready")
+            .await
+            .unwrap();
+
+        // A reviewer submits a LATE approve verdict for the same CR. The verdict path
+        // must NOT drag `ready` back to `approved`.
+        let reviewer_item = enqueue_item(
+            &pool,
+            repo,
+            record::Kind::Reviewer,
+            reviewer,
+            &format!("cr#{cr_number}"),
+        )
+        .await;
+        let reviewer_auth = task_auth(reviewer_item, repo, record::Kind::Reviewer);
+        factory_tools::submit_review(
+            &state_for(&pool),
+            &reviewer_auth,
+            cr_number,
+            "approve",
+            "late lgtm",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let after = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.factory_state, "ready",
+            "a late verdict must not clobber a CR already marked ready"
+        );
+
+        // Contrast: an `approved`/`open` CR IS updated by a verdict. Drive the same CR
+        // from a non-terminal state and confirm the verdict writes through.
+        record::set_change_request_state(&pool, cr_row.id, "open")
+            .await
+            .unwrap();
+        factory_tools::submit_review(
+            &state_for(&pool),
+            &reviewer_auth,
+            cr_number,
+            "approve",
+            "lgtm",
+            None,
+        )
+        .await
+        .unwrap();
+        let updated = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.factory_state, "approved",
+            "a verdict on a non-terminal CR (open) updates its factory state"
+        );
+    }
+
     /// C2: a reviewer-requested-changes CR that is BELOW the loop cap but has NO linked
     /// issue cannot be reworked (there is no issue to re-dispatch a coder against).
     /// Rather than STRANDING the CR (no coder, no escalation — stuck forever), the

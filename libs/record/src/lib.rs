@@ -1324,6 +1324,33 @@ pub async fn set_change_request_state_if(
     Ok(did_transition)
 }
 
+/// Conditionally set a CR's factory state ONLY when it is not in a terminal-ish
+/// state (`ready`/`merged`/`closed`), returning whether the write happened. This
+/// closes the TOCTOU in the review-verdict path: a late or duplicate verdict must
+/// never drag a CR the coordinator has already advanced (e.g. `approved → ready`)
+/// back to `approved`/`changes_requested`. A single atomic UPDATE guarded by
+/// `factory_state NOT IN (...)` replaces a read-then-write, so a racing coordinator
+/// transition in the window between the read and the write can no longer be
+/// clobbered. Executor-generic (see [`mark_reacted`]).
+pub async fn set_change_request_state_if_not_terminal(
+    executor: impl sqlx::PgExecutor<'_>,
+    cr_id: Uuid,
+    to: &str,
+) -> Result<bool> {
+    let row = sqlx::query(
+        "UPDATE change_requests SET factory_state = $2, updated_at = now()
+          WHERE id = $1 AND factory_state NOT IN ('ready', 'merged', 'closed')
+         RETURNING id",
+    )
+    .bind(cr_id)
+    .bind(to)
+    .fetch_optional(executor)
+    .await?;
+    let wrote = row.is_some();
+    tracing::info!(cr = %cr_id, to, wrote, "set CR state (if not terminal)");
+    Ok(wrote)
+}
+
 /// Re-queue a work item for a fresh retry attempt: transition it back to `queued`,
 /// make it immediately available, bump `attempt_count`, clear any lease, and reset
 /// `reacted` so a SUBSEQUENT terminal occurrence of this same row is reacted to
