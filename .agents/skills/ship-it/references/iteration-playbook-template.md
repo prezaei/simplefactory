@@ -108,10 +108,20 @@ CRITICAL — PAGINATE: the REST review-comments endpoint returns at most 30 comm
 
 CRITICAL — COPILOT LOGIN: in the REST comments API, Copilot's inline review comments appear under author login "Copilot" (NOT the bot slug `copilot-pull-request-reviewer[bot]`, which is only the login on the reviews API). When detecting/triaging Copilot comments, match login "Copilot". Do NOT rely on the bot slug for comments.
 
-ALSO check review-thread resolution so no unresolved thread is left open at merge (GraphQL — the REST comments API does not expose resolution state):
-  gh api graphql -f query='query { repository(owner:\"<owner>\", name:\"<repo>\") { pullRequest(number: {{PR_NUMBER}}) { reviewThreads(first: 100) { pageInfo { hasNextPage endCursor } nodes { isResolved comments(first: 1) { nodes { databaseId author { login } } } } } } }'
+ALSO check review-thread resolution so no unresolved thread is left open at merge (GraphQL — the REST comments API does not expose resolution state). Pass owner/repo/PR as GraphQL **variables** via `-F` — do NOT string-interpolate them into the query, and do NOT escape quotes inside the single-quoted query (escaped quotes are sent literally and cause a GraphQL parse error; `gh` does NOT expand `{owner}/{repo}` inside a GraphQL query the way it does for REST paths):
+  OWNER=$(gh repo view --json owner -q .owner.login); REPO=$(gh repo view --json name -q .name)
+  gh api graphql -F owner="$OWNER" -F repo="$REPO" -F pr={{PR_NUMBER}} -f query='
+    query($owner:String!,$repo:String!,$pr:Int!){
+      repository(owner:$owner,name:$repo){ pullRequest(number:$pr){
+        reviewThreads(first:100){ pageInfo{ hasNextPage endCursor } nodes{ isResolved comments(first:1){ nodes{ databaseId author{ login } } } } } } } }'
 
-CRITICAL — PAGINATE reviewThreads: `reviewThreads(first: 100)` returns at most 100 threads. On a PR with >100 threads, later pages are SILENTLY DROPPED and an unresolved Copilot/human thread on a later page would be merged over. You MUST cover ALL threads: read `pageInfo { hasNextPage endCursor }` and, while `hasNextPage` is true, re-run the query with `reviewThreads(first: 100, after: \"<endCursor>\")`, accumulating `nodes` across every page until `hasNextPage` is false.
+(On GitHub Enterprise add `--hostname <ghe-host>` to the `gh api graphql` call too. The `gh repo view` calls auto-detect the host from the checked-out remote.)
+
+CRITICAL — PAGINATE reviewThreads: `reviewThreads(first:100)` returns at most 100 threads. On a PR with >100 threads, later pages are SILENTLY DROPPED and an unresolved Copilot/human thread on a later page would be merged over. You MUST cover ALL threads: read `pageInfo { hasNextPage endCursor }` and, while `hasNextPage` is true, re-run the query passing the cursor as another variable, accumulating `nodes` across every page until `hasNextPage` is false:
+  gh api graphql -F owner="$OWNER" -F repo="$REPO" -F pr={{PR_NUMBER}} -F cursor="<endCursor>" -f query='
+    query($owner:String!,$repo:String!,$pr:Int!,$cursor:String!){
+      repository(owner:$owner,name:$repo){ pullRequest(number:$pr){
+        reviewThreads(first:100,after:$cursor){ pageInfo{ hasNextPage endCursor } nodes{ isResolved comments(first:1){ nodes{ databaseId author{ login } } } } } } } }'
 
 Treat any thread with isResolved == false (especially one authored by "Copilot" or a human reviewer) as an unaddressed item — its root comment id should be surfaced as a NEW/untriaged comment so the decision gate routes it to triage. A still-open thread must NOT be merged over.
 
@@ -503,9 +513,9 @@ Exception — if the user wants specific checks enforced on a no-branch-protecti
 ### Gate 2 — Fresh comment re-check
 ```bash
 gh pr view {{PR_NUMBER}} --json reviews,comments,reviewDecision
-gh api repos/{{REPO}}/pulls/{{PR_NUMBER}}/comments
+gh api --paginate repos/{{REPO}}/pulls/{{PR_NUMBER}}/comments
 ```
-Re-fetch ALL comments right now. CI can take many minutes — reviewers often post during that window. If there are ANY comments whose IDs are not in `triaged_comment_ids`, do NOT merge. Go back to Step 3b to triage them first.
+Re-fetch ALL comments right now (the REST comments endpoint caps at 30/page — `--paginate` is REQUIRED so a reviewer comment past the first page is not silently merged over). CI can take many minutes — reviewers often post during that window. If there are ANY comments whose IDs are not in `triaged_comment_ids`, do NOT merge. Go back to Step 3b to triage them first.
 
 ### Gate 3 — All comments addressed
 Verify that every comment ID from the PR is present in `triaged_comment_ids`. If there are untriaged comments, go back to Step 3b. `reviewDecision: CHANGES_REQUESTED` is NOT a blocker — reviewers often don't re-review promptly, and the `--admin` merge bypasses this GitHub status. The real safety check is Gate 2 (fresh comment re-check).
@@ -534,7 +544,7 @@ COUNT=$(gh api --paginate [--hostname <host>] repos/{{REPO}}/pulls/{{PR_NUMBER}}
 
 (Add `--hostname` from `state.ghe_hostname` when non-null.)
 
-Additionally, every NEW inline comment from that HEAD review must already be triaged (its id present in `triaged_comment_ids`) AND no Copilot review thread may be left unresolved. Gate 2 (fresh comment re-check) enforces this — but ONLY if it paginated and matched the right login: re-fetch with `gh api --paginate` (comments cap at 30/page) and match Copilot comments by login "Copilot" (the reviews API uses the bot slug; the comments API uses "Copilot"). Also re-run the GraphQL `reviewThreads { isResolved }` check, looping the `pageInfo { hasNextPage, endCursor }` cursor until exhausted so ALL threads are covered (>100 threads spill onto later pages — see Step 1 / Agent B) — any unresolved thread routes back to Step 3b. If any comment from the qualifying review is untriaged or any thread is unresolved, do NOT merge; triage it first. A review on a SUPERSEDED commit does not satisfy this gate; a pushed fix resets it to the new HEAD.
+Additionally, every NEW inline comment from that HEAD review must already be triaged (its id present in `triaged_comment_ids`) AND no Copilot review thread may be left unresolved. Gate 2 (fresh comment re-check) enforces this — but ONLY if it paginated and matched the right login: re-fetch with `gh api --paginate` (comments cap at 30/page) and match Copilot comments by login "Copilot" (the reviews API uses the bot slug; the comments API uses "Copilot"). Also re-run the GraphQL `reviewThreads { isResolved }` check (the variable-based `-F owner/-F repo/-F pr` query from Step 1 / Agent B — never string-interpolated or quote-escaped), looping the `pageInfo { hasNextPage, endCursor }` cursor until exhausted so ALL threads are covered (>100 threads spill onto later pages) — any unresolved thread routes back to Step 3b. If any comment from the qualifying review is untriaged or any thread is unresolved, do NOT merge; triage it first. A review on a SUPERSEDED commit does not satisfy this gate; a pushed fix resets it to the new HEAD.
 
 ### Execute Merge
 
