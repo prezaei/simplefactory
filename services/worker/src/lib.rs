@@ -316,6 +316,7 @@ async fn run_manager(
     };
     tracing::info!(actionable, summary = %summary, "worker(manager): triage finished");
     tools.append_transcript(&summary).await?;
+    tracing::info!("worker(manager): transcript appended");
 
     if actionable {
         // Leave a triage note on the issue, then succeed — a *succeeded* Manager is
@@ -372,6 +373,7 @@ async fn run_reviewer(
     };
     tracing::info!(verdict = verdict.as_str(), summary = %summary, "worker(reviewer): review finished");
     tools.append_transcript(&summary).await?;
+    tracing::info!("worker(reviewer): transcript appended");
 
     // The reviewer task's subject is the CR under review (`cr#N`).
     let cr_number = task

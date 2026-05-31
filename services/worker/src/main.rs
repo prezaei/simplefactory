@@ -250,16 +250,45 @@ async fn run_claude_with_config(
 /// so this default is never exercised for an unsupported role in practice.
 fn outcome_for_role(role: &str, summary: String) -> RunOutcome {
     match role {
-        "manager" => RunOutcome::Triage {
-            actionable: parse_manager_actionable(&summary),
-            summary,
-        },
-        "reviewer" => RunOutcome::Review {
-            verdict: parse_reviewer_verdict(&summary),
-            summary,
-        },
+        "manager" => {
+            let actionable = parse_manager_actionable(&summary);
+            // Strip the control marker so it never leaks into the user-facing triage
+            // comment (run_manager posts `summary` as the issue comment).
+            RunOutcome::Triage {
+                actionable,
+                summary: strip_marker_lines(&summary, "ACTIONABLE:"),
+            }
+        }
+        "reviewer" => {
+            let verdict = parse_reviewer_verdict(&summary);
+            // Strip the control marker so it never leaks into the user-facing review
+            // body (run_reviewer submits `summary` as the review body).
+            RunOutcome::Review {
+                verdict,
+                summary: strip_marker_lines(&summary, "VERDICT:"),
+            }
+        }
         _ => RunOutcome::Code { summary },
     }
+}
+
+/// Remove any line whose trimmed text starts with `prefix` (case-insensitive) — the
+/// internal control marker (`ACTIONABLE:` / `VERDICT:`) — from the user-facing summary,
+/// trimming surrounding blank lines. The marker is a parsing contract, not content, so
+/// it must not appear in the posted comment / review body.
+fn strip_marker_lines(summary: &str, prefix: &str) -> String {
+    summary
+        .lines()
+        .filter(|line| {
+            line.trim()
+                .get(..prefix.len())
+                .map(|head| !head.eq_ignore_ascii_case(prefix))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 /// Parse the manager's triage decision from a trailing `ACTIONABLE: yes|no` marker.
@@ -753,6 +782,30 @@ mod tests {
                 ..
             }
         ));
+        // The control marker is parsed for the decision but STRIPPED from the
+        // user-facing summary (it must not appear in the posted comment / review body).
+        let RunOutcome::Triage {
+            actionable,
+            summary,
+        } = outcome_for_role("manager", "Out of scope.\nACTIONABLE: no".into())
+        else {
+            panic!("manager → Triage");
+        };
+        assert!(!actionable);
+        assert_eq!(
+            summary, "Out of scope.",
+            "marker stripped from triage summary"
+        );
+        let RunOutcome::Review { verdict, summary } =
+            outcome_for_role("reviewer", "Looks good.\nVERDICT: approve".into())
+        else {
+            panic!("reviewer → Review");
+        };
+        assert_eq!(verdict, ReviewVerdict::Approve);
+        assert_eq!(
+            summary, "Looks good.",
+            "marker stripped from review summary"
+        );
         // Unknown role defaults to Code (never reached for a real run — the harness
         // run-seam rejects unsupported roles before this).
         assert!(matches!(
@@ -810,6 +863,26 @@ mod tests {
             parse_reviewer_verdict("VERDICT: approve — ship it"),
             ReviewVerdict::Approve
         );
+    }
+
+    #[test]
+    fn strip_marker_lines_removes_the_control_marker_only() {
+        assert_eq!(
+            strip_marker_lines("Triaged it.\nACTIONABLE: no", "ACTIONABLE:"),
+            "Triaged it."
+        );
+        // Case-insensitive on the marker; only marker lines are removed.
+        assert_eq!(
+            strip_marker_lines("line one\nverdict: approve\nline two", "VERDICT:"),
+            "line one\nline two"
+        );
+        // No marker → unchanged (trimmed).
+        assert_eq!(
+            strip_marker_lines("just prose\n", "ACTIONABLE:"),
+            "just prose"
+        );
+        // A marker-only summary collapses to empty.
+        assert_eq!(strip_marker_lines("VERDICT: comment", "VERDICT:"), "");
     }
 
     #[test]
