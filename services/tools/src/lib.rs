@@ -419,20 +419,69 @@ pub async fn post_comment(
                 .await
                 .map_err(ToolError::Internal)?;
             tracing::info!(work_item = %auth.work_item_id, ?target, "post_comment");
-            Ok(json!({ "comment_id": comment_id }))
+            // Persist the posted body so a re-run can tell a genuine body change from
+            // an identical re-dispatch (see the redo closure).
+            Ok(json!({ "comment_id": comment_id, "body": body }))
         },
         |stored| async {
             // Spec: a re-run with the same dedupe_key UPDATES the same comment rather
-            // than suppressing the new body. Parse the stored comment id and update it
-            // in place; return the original (stable) result so the comment id is
-            // unchanged across re-runs.
-            if let Some(comment_id) = stored.get("comment_id").and_then(Value::as_i64) {
-                state.gh.update_comment(&repo, comment_id, body).await?;
-                tracing::info!(work_item = %auth.work_item_id, comment_id, "post_comment: updated existing comment on re-run");
-            } else {
+            // than suppressing the new body. But an *identical* re-dispatch (same body)
+            // must NOT re-PUT — that would overwrite a human's intervening edit of the
+            // comment (and waste a GitHub write). Only update when the body changed.
+            let Some(comment_id) = stored.get("comment_id").and_then(Value::as_i64) else {
                 tracing::warn!(work_item = %auth.work_item_id, dedupe_key = key, "post_comment: stored result has no comment_id; cannot update");
+                return Ok(stored);
+            };
+            let unchanged = stored.get("body").and_then(Value::as_str) == Some(body);
+            if unchanged {
+                tracing::info!(work_item = %auth.work_item_id, comment_id, "post_comment: identical re-dispatch; no update (preserves any human edit)");
+                return Ok(stored);
             }
-            Ok(stored)
+            state.gh.update_comment(&repo, comment_id, body).await?;
+            tracing::info!(work_item = %auth.work_item_id, comment_id, "post_comment: body changed on re-run; updated existing comment");
+            // Persist the body we just wrote so the equality check compares against the
+            // LAST-written body, not the first one forever. Without this, a later
+            // identical re-dispatch of this same body would re-PUT it — clobbering a
+            // human edit made after this update. (`idempotency_complete` is an UPDATE of
+            // the stored result; the Done branch of `idempotent` does not re-store on its
+            // own, so we do it here.)
+            //
+            // BEST-EFFORT with bounded retries (mirrors the main `idempotent` Won-branch
+            // pattern): the GitHub update already succeeded, so this re-persist must NOT
+            // propagate (a `?` here would return a tool error AFTER the write, prompting the
+            // caller to retry → re-run `update_comment` → the exact clobber we're preventing).
+            // We retry a few times with a yield to ride out a transient DB blip and shrink
+            // the staleness window, then give up. RESIDUAL RISK if every attempt fails: the
+            // stored body stays at its previous value, so a LATER identical re-dispatch sees
+            // a mismatch and re-PUTs once — which can overwrite a human edit made in between.
+            // That window is the irreducible cost of returning success after the GitHub write
+            // (the alternative — propagating — causes the immediate clobber-retry instead).
+            let updated = json!({ "comment_id": comment_id, "body": body });
+            let mut persisted = false;
+            for attempt in 1..=IDEMPOTENCY_COMPLETE_ATTEMPTS {
+                match record::idempotency_complete(
+                    &state.pool,
+                    auth.work_item_id,
+                    "comment",
+                    key,
+                    &updated,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        persisted = true;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(work_item = %auth.work_item_id, comment_id, attempt, error = %e, "post_comment: re-persist of updated body failed; retrying");
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+            if !persisted {
+                tracing::warn!(work_item = %auth.work_item_id, comment_id, attempts = IDEMPOTENCY_COMPLETE_ATTEMPTS, "post_comment: could not re-persist updated body after retries; stored body is stale, so a later identical re-dispatch may re-PUT and overwrite a human edit");
+            }
+            Ok(updated)
         },
     )
     .await
@@ -615,22 +664,23 @@ pub async fn heartbeat(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
     Ok(json!({ "lease_expires_at": expires }))
 }
 
-/// Escalate to a human — the single human channel. The spec invariant is ONE
-/// escalation per task: idempotent under scope `"escalate"` via the claim-first
-/// pattern, defaulting (when the caller passes NO `dedupe_key`) to a per-task
-/// constant key ([`ESCALATE_DEFAULT_KEY`]). The FIRST escalate to win the claim
-/// records the escalation, posts the question on the subject, and moves the work item
-/// to the state mapped from its `reason` (resumable `blocked` for needs-human-input,
-/// terminal `escalated` otherwise), then stores the result. Any LATER escalate with
-/// no key — regardless of reason — hits `Done` and is a no-op: no second escalation
-/// row, no second comment, and the state stays as the first escalation left it. A
-/// caller who genuinely needs to distinguish multiple escalations may pass an explicit
-/// `dedupe_key`, which is honored as the claim key instead of the default.
+/// Escalate to a human — the single human channel. The invariant is ONE escalation
+/// per `(task, reason)`: idempotent under scope `"escalate"` via the claim-first
+/// pattern, defaulting (when the caller passes NO `dedupe_key`) to a per-reason key
+/// (`escalate:<reason>`). The FIRST escalate of a given reason to win the claim records
+/// the escalation, posts the question on the subject, and moves the work item to the
+/// state mapped from its `reason` (resumable `blocked` for needs-human-input, terminal
+/// `escalated` otherwise), then stores the result. A LATER escalate of the SAME reason
+/// with no key hits `Done` and is a no-op (no second row, no second comment). A later
+/// escalate of a DIFFERENT reason (e.g. a task that was `blocked_input`, got unblocked,
+/// then legitimately hit `retries_exhausted`) gets its own claim and escalates — it is
+/// NOT swallowed. This matches the record layer's UNIQUE (work_item_id, reason) index.
+/// A caller may still pass an explicit `dedupe_key` to override the default.
 ///
 /// Escalation is ALSO idempotent at the record layer per `(work_item, reason)`: the
 /// DB holds a UNIQUE (work_item_id, reason) index, so even an explicit distinct
-/// `dedupe_key` that wins a fresh task claim cannot create a second escalation row for
-/// the same `(work_item, reason)`. In that case the write is a no-op success
+/// `dedupe_key` that wins a fresh claim cannot create a second escalation row for the
+/// same `(work_item, reason)`. In that case the write is a no-op success
 /// (`created = false`): the original row/context is preserved, no second comment is
 /// posted, and the work-item state is left as the first escalation set it.
 pub async fn escalate(
@@ -644,11 +694,13 @@ pub async fn escalate(
     // front with a clear message rather than surfacing a DB constraint error.
     validate_escalation_reason(reason)?;
 
-    // Spec: ONE escalation per task. When the caller omits a dedupe_key, default it to
-    // a per-task constant so that ANY later escalate (any reason) dedupes to the first.
-    // An explicit caller-supplied key is honored for callers that genuinely want to
-    // file distinct escalations.
-    let key = dedupe_key.unwrap_or(ESCALATE_DEFAULT_KEY);
+    // ONE escalation per (task, reason). When the caller omits a dedupe_key, default it
+    // to a per-reason key so a later escalate of the SAME reason dedupes to the first,
+    // while a DIFFERENT reason gets its own claim and is not silently swallowed (this
+    // mirrors the DB's UNIQUE (work_item_id, reason) index). An explicit caller-supplied
+    // key overrides the default.
+    let default_key = format!("{ESCALATE_DEFAULT_KEY_PREFIX}{reason}");
+    let key = dedupe_key.unwrap_or(&default_key);
 
     idempotent(
         state,
@@ -750,11 +802,11 @@ async fn escalate_won(
 /// Default heartbeat lease extension (15 minutes), per the spec.
 const HEARTBEAT_TTL_SECS: f64 = 900.0;
 
-/// The per-task default idempotency key for [`escalate`]. The spec requires ONE
-/// escalation per task, so when no explicit `dedupe_key` is supplied EVERY escalate
-/// for a task claims this same key — the first wins and files the single escalation;
-/// any later one (any reason) dedupes to it.
-const ESCALATE_DEFAULT_KEY: &str = "task";
+/// Prefix for the per-reason default idempotency key used by [`escalate`] when the
+/// caller supplies no explicit `dedupe_key`. The key is `escalate:<reason>`, so distinct
+/// reasons each escalate once (mirroring the DB UNIQUE (work_item_id, reason) index)
+/// while a repeated reason dedupes to the first.
+const ESCALATE_DEFAULT_KEY_PREFIX: &str = "escalate:";
 
 /// How many times [`idempotent`] retries `idempotency_complete` after a successful
 /// side effect before falling back to release+warn. Complete-failures are usually

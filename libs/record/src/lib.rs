@@ -405,10 +405,21 @@ pub async fn reclaim_expired(pool: &Pool) -> Result<u64> {
 
 /// Purge terminal work items (and their cascading children) older than the cutoff.
 /// Returns the number of work items removed.
+///
+/// A terminal work item that still *owns* a non-terminal change_request is spared:
+/// `change_requests.work_item_id` is `ON DELETE SET NULL`, so purging such an item
+/// would null the live CR's owner link and strand it (e.g. a coder succeeds, but the
+/// CR sits in review past the retention window). We only purge once the CR it owns has
+/// itself reached a terminal state (`merged`/`closed`) — or it never owned one.
 pub async fn purge_terminal(pool: &Pool, older_than: DateTime<Utc>) -> Result<u64> {
     let result = sqlx::query(
-        "DELETE FROM work_items
-          WHERE state IN ('succeeded', 'failed', 'escalated') AND updated_at < $1",
+        "DELETE FROM work_items w
+          WHERE w.state IN ('succeeded', 'failed', 'escalated') AND w.updated_at < $1
+            AND NOT EXISTS (
+              SELECT 1 FROM change_requests cr
+               WHERE cr.work_item_id = w.id
+                 AND cr.factory_state NOT IN ('merged', 'closed')
+            )",
     )
     .bind(older_than)
     .execute(pool)

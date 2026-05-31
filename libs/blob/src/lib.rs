@@ -138,7 +138,14 @@ mod tests {
         // Two sequential appends must accumulate; this is the regression guard for the
         // missing-flush bug (a dropped buffered write would yield only "one\n").
         assert_eq!(store.read("a/b.log").await.unwrap(), "one\ntwo\n");
+        // Both escape vectors are rejected: a `..` traversal AND an absolute path
+        // (which would otherwise ignore `root` entirely).
         assert!(store.append("../escape", "x").await.is_err());
+        assert!(
+            store.append("/etc/passwd", "x").await.is_err(),
+            "an absolute uri must be rejected, not resolved outside root"
+        );
+        assert!(store.read("/etc/passwd").await.is_err());
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

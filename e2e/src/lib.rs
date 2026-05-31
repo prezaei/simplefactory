@@ -855,6 +855,86 @@ mod acceptance {
         );
     }
 
+    /// The ready-for-merge handoff (approved + green CR) must be exactly-once under a
+    /// re-dispatch: if the approved reviewer item is re-reacted (its `reacted` flag
+    /// cleared, as a lease-expiry resurfacing would do), the second tick must NOT post a
+    /// second handoff comment or a second assignment — the `did_transition` guard on the
+    /// approved→ready UPDATE plus run-side-effects-only-when-transitioned make it
+    /// idempotent. This is the most important exactly-once path (the human handoff) and
+    /// the one the escalation re-dispatch test does NOT cover.
+    #[tokio::test]
+    async fn ready_handoff_is_exactly_once_under_redispatch() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (_manager, coder, reviewer), _gh, state) =
+            p4_fixture(&pool, "e2e-p4-handoff-once").await;
+
+        // Coder opens a CR for issue#1.
+        let (cr_number, _cr_row) = open_cr(&pool, repo, coder, &state, "attempt").await;
+        let cr_subject = format!("cr#{cr_number}");
+
+        // Reviewer approves; CR head checks are green; default file list is non-gating.
+        let reviewer_id =
+            enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, &cr_subject).await;
+        let reviewer_auth = task_auth(reviewer_id, repo, record::Kind::Reviewer);
+        factory_tools::submit_review(
+            &state,
+            &reviewer_auth,
+            cr_number,
+            "approve",
+            "LGTM",
+            Some("rev-1"),
+        )
+        .await
+        .unwrap();
+        let gh = Arc::new(FakeGitHub::new().with_checks(
+            &format!("sha-{cr_number}"),
+            CheckSummary {
+                overall: CheckConclusion::Success,
+                checks: vec![("ci".into(), CheckConclusion::Success)],
+            },
+        ));
+        mark_succeeded(&pool, reviewer_id).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        // The CR is ready after the first react.
+        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .expect("CR row");
+        assert_eq!(cr_row.factory_state, "ready");
+
+        // Simulate a re-dispatch: clear the react flag and tick again.
+        sqlx::query("UPDATE work_items SET reacted = false WHERE id = $1")
+            .bind(reviewer_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        // Still exactly one handoff comment and one assignment; CR still ready.
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one handoff comment survives the re-dispatch"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one assignment survives the re-dispatch"
+        );
+        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .expect("CR row");
+        assert_eq!(
+            cr_row.factory_state, "ready",
+            "CR stays ready (no double handoff)"
+        );
+    }
+
     /// FIX A: with NO `escalation_assignee` configured, a ready-for-merge handoff posts
     /// the handoff comment but performs NO assignment — exactly one comment, ZERO
     /// assignments. (A hardcoded placeholder assignee would be rejected by GitHub on a

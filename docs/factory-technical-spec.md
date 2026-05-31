@@ -109,7 +109,9 @@ The throwaway workroom. The Rust harness:
 The worker has **no** direct Postgres or Blob credentials — everything goes through Factory Tools (the one exception being model calls straight to Anthropic). Outbound internet is open (builds fetch packages); the trusted-tenant model is assumed per the product spec's non-goals.
 
 #### Worker lifecycle by role
-Every role runs Claude Code over the same MCP/Tools channel, but the harness's terminal action differs by `role` (only the **Coder** produces a change request):
+Every role runs Claude Code over the same MCP/Tools channel, but the harness's terminal action differs by `role` (only the **Coder** produces a change request).
+
+> **Implementation status (as of P4).** Only the **Coder** lifecycle below is built in the worker harness; `run_task` is currently Coder-shaped for every role. The **Manager** and **Reviewer** lifecycles in this table are the **P4.5** target (see the implementation plan) and are **not yet implemented** — until P4.5 lands, a Manager or Reviewer work item must not be dispatched to the worker (it would run the Coder path). This table is the contract P4.5 fulfils, not current behavior.
 
 | Role | Reads | Claude does | Terminal action (via Tools) | Produces a CR? |
 | --- | --- | --- | --- | --- |
@@ -212,7 +214,7 @@ CREATE TABLE change_requests (                     -- enables idempotent CR reus
     number        int,                             -- null until opened
     head_branch   text NOT NULL,
     linked_issue  int,
-    work_item_id  uuid REFERENCES work_items(id),  -- owning task → re-run updates the SAME CR
+    work_item_id  uuid REFERENCES work_items(id) ON DELETE SET NULL,  -- owning task → re-run updates the SAME CR; nulled (not cascaded) when the task is purged so retention can delete terminal work_items
     factory_state text NOT NULL DEFAULT 'draft'
                     CHECK (factory_state IN ('draft','open','changes_requested',
                                              'approved','ready','merged','closed')),
@@ -369,7 +371,9 @@ The worker's only channel to Factory, exposed by the Tools service as a **remote
 | `append_transcript` | Append a chunk to this run's transcript in Blob | `chunk` | ok |
 | `record_outcome` | Set the attempt's terminal state | `status` (succeeded\|failed\|blocked), `summary` | ok |
 | `heartbeat` | Extend the task lease (liveness) | — | new lease expiry |
-| `escalate` | Raise an escalation: posts a question as an issue/CR comment + assigns a human, marks the item blocked/escalated; idempotent by `dedupe_key` (one escalation per task) | `reason`, `context`, `dedupe_key?` | escalation id |
+| `escalate` | Raise an escalation: posts a question as an issue/CR comment + assigns a human, marks the item blocked/escalated; idempotent by `dedupe_key`, defaulting to **one escalation per `(task, reason)`** (a distinct reason escalates on its own; a repeat reason dedupes) | `reason`, `context`, `dedupe_key?` | escalation id |
+
+> The **Returns** column lists the load-bearing fields; the implementation may return additional context fields (e.g. `get_task` also returns `head_branch`/`base`/`correlation_id`/the composed `prompt`; `record_outcome` returns the resulting `state`). These are additive and don't change the contract.
 
 **Branch push vs CR creation.** The worker pushes its branch directly with the short-lived **git installation token**, via `git push --force-with-lease` to the task's own branch — idempotent, so a lease-expiry re-dispatch re-pushes without duplicating or diverging commits. The CR itself and all comments/reviews go through Factory Tools so they are recorded and **idempotent** — a re-run calls `open_or_update_change_request`, `post_comment`, `submit_review`, and `escalate` (each with `dedupe_key`) and updates the *same* objects rather than duplicating them.
 
@@ -423,6 +427,8 @@ The worker's only channel to Factory, exposed by the Tools service as a **remote
 ## Telemetry
 
 Every service and the worker harness emit **OpenTelemetry** traces/metrics/logs, exported to **Azure Monitor / Application Insights** (traces, metrics) and **Log Analytics** (structured logs, queried via KQL). A `correlation_id` per work item threads webhook → queue → dispatch → worker → tools → completion. Per the repo mandate: every decision, state transition, tool call, and error path is logged; an absent log is a defect.
+
+> **Implementation status (as of P4).** `libs/telemetry` currently configures **structured `tracing` logs** (env-filtered), which is what satisfies the "every decision/transition/tool-call/error is logged" mandate today, and `correlation_id` is recorded as a column on `work_items`/`events` and propagated through the data model. The **OpenTelemetry exporter** (OTLP → Azure Monitor) for **traces and metrics**, plus a `tracing`→OTel `correlation_id` span-propagation helper, are wired in **P7** (Azure productionization) — see the implementation plan. The vendor-neutral *instrumentation* points are the P7 swap; the logging mandate is met in the interim by `tracing`.
 
 ## Deployment & local parity
 

@@ -486,3 +486,130 @@ impl GitHubClient for OctocrabGitHub {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- map_conclusion: GitHub Checks API `conclusion` → CheckConclusion ----
+    //
+    // The load-bearing invariant: unknown/None must map to Pending (the conservative
+    // "unknown → never green" rule), so an unrecognized state can never be read as green.
+
+    #[test]
+    fn map_conclusion_none_is_pending() {
+        // queued/in_progress runs have no conclusion yet → Pending (never green).
+        assert_eq!(map_conclusion(None), CheckConclusion::Pending);
+    }
+
+    #[test]
+    fn map_conclusion_success_maps_to_success() {
+        assert_eq!(map_conclusion(Some("success")), CheckConclusion::Success);
+    }
+
+    #[test]
+    fn map_conclusion_failure_variants_map_to_failure() {
+        for c in [
+            "failure",
+            "timed_out",
+            "cancelled",
+            "action_required",
+            "startup_failure",
+        ] {
+            assert_eq!(
+                map_conclusion(Some(c)),
+                CheckConclusion::Failure,
+                "conclusion {c:?} must map to Failure",
+            );
+        }
+    }
+
+    #[test]
+    fn map_conclusion_neutral_and_skipped_map_to_neutral() {
+        assert_eq!(map_conclusion(Some("neutral")), CheckConclusion::Neutral);
+        assert_eq!(map_conclusion(Some("skipped")), CheckConclusion::Neutral);
+    }
+
+    #[test]
+    fn map_conclusion_stale_is_pending() {
+        // A stale run is superseded by a newer run, so it is not a terminal verdict.
+        assert_eq!(map_conclusion(Some("stale")), CheckConclusion::Pending);
+    }
+
+    #[test]
+    fn map_conclusion_unknown_is_pending() {
+        // The conservative rule: any unrecognized (incl. future) value → Pending,
+        // so an unknown state can never be mistaken for green.
+        assert_eq!(
+            map_conclusion(Some("some_future_value")),
+            CheckConclusion::Pending,
+        );
+        assert_eq!(map_conclusion(Some("")), CheckConclusion::Pending);
+    }
+
+    // ---- map_status_state: combined commit-status `state` → CheckConclusion ----
+
+    #[test]
+    fn map_status_state_success_maps_to_success() {
+        assert_eq!(map_status_state("success"), CheckConclusion::Success);
+    }
+
+    #[test]
+    fn map_status_state_failure_and_error_map_to_failure() {
+        assert_eq!(map_status_state("failure"), CheckConclusion::Failure);
+        assert_eq!(map_status_state("error"), CheckConclusion::Failure);
+    }
+
+    #[test]
+    fn map_status_state_pending_is_pending() {
+        assert_eq!(map_status_state("pending"), CheckConclusion::Pending);
+    }
+
+    #[test]
+    fn map_status_state_unknown_is_pending() {
+        // Conservative: an unrecognized state can never be read as green.
+        assert_eq!(
+            map_status_state("some_future_state"),
+            CheckConclusion::Pending,
+        );
+        assert_eq!(map_status_state(""), CheckConclusion::Pending);
+    }
+
+    // ---- installation_id_u64: positive-id guard ----
+
+    #[test]
+    fn installation_id_u64_zero_is_err() {
+        // Installation ids are positive; 0 is never valid.
+        assert!(installation_id_u64(0).is_err());
+    }
+
+    #[test]
+    fn installation_id_u64_negative_is_err() {
+        // A negative id must be rejected, not silently wrapped by `as u64`.
+        assert!(installation_id_u64(-1).is_err());
+        assert!(installation_id_u64(i64::MIN).is_err());
+    }
+
+    #[test]
+    fn installation_id_u64_positive_is_ok() {
+        assert_eq!(installation_id_u64(1).unwrap(), 1u64);
+        assert_eq!(installation_id_u64(i64::MAX).unwrap(), i64::MAX as u64);
+    }
+
+    // ---- id_u64: non-negative object-id guard ----
+
+    #[test]
+    fn id_u64_negative_is_err() {
+        // A negative number/id must be rejected, not wrapped under `as u64`.
+        assert!(id_u64(-1).is_err());
+        assert!(id_u64(i64::MIN).is_err());
+    }
+
+    #[test]
+    fn id_u64_zero_and_positive_are_ok() {
+        // Unlike installation ids, a plain object id of 0 is allowed (only negatives wrap).
+        assert_eq!(id_u64(0).unwrap(), 0u64);
+        assert_eq!(id_u64(42).unwrap(), 42u64);
+        assert_eq!(id_u64(i64::MAX).unwrap(), i64::MAX as u64);
+    }
+}

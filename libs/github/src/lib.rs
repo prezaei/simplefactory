@@ -213,7 +213,7 @@ pub fn parse_event(event_type: &str, payload: &[u8]) -> Result<WebhookEvent, Git
                 touched.extend(c.added.iter().cloned());
             }
             Ok(WebhookEvent::Push {
-                repo: p.repository.to_ref(None),
+                repo: p.repository.to_ref(p.installation.as_ref().map(|i| i.id)),
                 head_sha: p.after,
                 touched_paths: touched,
             })
@@ -334,6 +334,8 @@ struct PushPayload {
     repository: Repository,
     #[serde(default)]
     commits: Vec<Commit>,
+    #[serde(default)]
+    installation: Option<Installation>,
 }
 
 #[cfg(test)]
@@ -463,10 +465,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_push_touched_paths() {
+    fn parses_push_touched_paths_and_installation_id() {
         let payload = br#"{
             "after": "abc123",
             "repository": { "name": "r", "owner": { "login": "o" } },
+            "installation": { "id": 99 },
             "commits": [
                 { "modified": [".factory/config.yml"], "added": ["src/x.rs"] },
                 { "modified": ["README.md"] }
@@ -474,14 +477,18 @@ mod tests {
         }"#;
         let ev = parse_event("push", payload).unwrap();
         let WebhookEvent::Push {
+            repo,
             head_sha,
             touched_paths,
-            ..
         } = ev
         else {
             panic!("expected push");
         };
         assert_eq!(head_sha, "abc123");
+        // The installation id MUST survive parsing — config-auto-reload-on-push
+        // fetches `.factory/config.yml` with this id, so dropping it (the prior
+        // `to_ref(None)` bug) silently breaks auth on the live path.
+        assert_eq!(repo.installation_id, 99);
         assert!(touched_paths.contains(&".factory/config.yml".to_string()));
         assert!(touched_paths.contains(&"src/x.rs".to_string()));
     }

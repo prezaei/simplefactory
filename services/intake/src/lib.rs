@@ -173,17 +173,53 @@ pub async fn apply_config(
     yaml: &str,
     config_sha: &str,
 ) -> anyhow::Result<ApplyOutcome> {
+    // Every config decision is an auditable event (the "every decision logged" mandate),
+    // not just a tracing line — a rejected-bad-config (last-good kept) is security-relevant
+    // and must leave a queryable trail. The audit write is BEST-EFFORT: the config
+    // decision (apply / reject-keep-last-good) is already authoritative, so a transient
+    // failure writing the audit row must NOT flip the outcome to Err (which would mislabel
+    // an applied config as failed). A failed audit write is itself logged at warn.
     match factory_config::parse(yaml) {
         Ok(cfg) => {
             let json = serde_json::to_value(&cfg)?;
             record::set_repo_config(pool, repo_id, &json, config_sha).await?;
             tracing::info!(%repo_id, config_sha, "applied config");
+            audit_config_decision(
+                pool,
+                repo_id,
+                "config_applied",
+                serde_json::json!({ "config_sha": config_sha }),
+            )
+            .await;
             Ok(ApplyOutcome::Applied)
         }
         Err(e) => {
             tracing::warn!(%repo_id, error = %e, "invalid .factory/config.yml; keeping last good");
+            audit_config_decision(
+                pool,
+                repo_id,
+                "config_rejected_kept_last_good",
+                serde_json::json!({ "config_sha": config_sha, "error": e.to_string() }),
+            )
+            .await;
             Ok(ApplyOutcome::RejectedKeptLastGood)
         }
+    }
+}
+
+/// Best-effort audit of a config decision: append an `events` row, logging (not
+/// propagating) any failure so a transient DB blip can't flip an already-authoritative
+/// config outcome into an error.
+async fn audit_config_decision(
+    pool: &Pool,
+    repo_id: Uuid,
+    action: &str,
+    detail: serde_json::Value,
+) {
+    if let Err(e) =
+        record::append_event(pool, Some(repo_id), None, None, "intake", action, detail).await
+    {
+        tracing::warn!(%repo_id, action, error = %e, "failed to write config-decision audit event");
     }
 }
 
