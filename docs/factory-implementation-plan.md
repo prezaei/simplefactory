@@ -20,7 +20,7 @@
 
 | Phase | Goal | Exit criteria |
 | --- | --- | --- |
-| **P0 Foundations** | Workspace, CI, local stack, cross-cutting libs | `cargo fmt/clippy/test` green in CI; `docker-compose up` brings up Postgres + Azurite; telemetry + config libs usable |
+| **P0 Foundations** | Workspace, CI, local stack, cross-cutting libs, **full E2E suite stubbed** | `cargo fmt/clippy/test` green in CI; `docker-compose up` brings up Postgres + Azurite; telemetry + config libs usable; whole E2E acceptance suite exists as compiling `#[ignore]`d stubs |
 | **P1 Record book + queue** | Durable state, leasing, caps, idempotency | Concurrency tests prove no-double-starts + cap-never-exceeded |
 | **P2 GitHub + Intake** | Events in, opt-in gating | A labelled issue creates exactly one `work_item`; webhook dedupe verified |
 | **P3 Vertical slice (Coder→CR)** | First Coder→CR run (integration proof) | An injected coder work item yields a real change request, locally (labelled-issue→Coder needs P4) |
@@ -42,9 +42,10 @@
 - `docker-compose.yml`: Postgres 16 + Azurite (Blob emulator); `.env` wiring; gitignore `.ship-it/` and local state.
 - GitHub Actions CI: `cargo fmt --check && cargo clippy -- -D warnings && cargo test` + build images; integration-test job spins up the compose services.
 - `migrations/` directory wired to `sqlx migrate` + the CI migration gate.
+- **Author the full end-to-end acceptance suite, up front, as stubs.** One named E2E test per behavior the specs promise — at minimum: worked-example happy path (labelled issue → Manager → Coder → CR → Reviewer approve → human-merge handoff → issue closed); changes-requested rework loop + loop-cap escalation; needs-human-input (blocked → human comment → resume same session); crash-resume (worker killed mid-run → resumes); no-double-starts under concurrent coordinators; capacity caps never exceeded (per-worker + global); exactly-once escalation under re-dispatch; opt-in gating (unlabelled issue → nothing); can't-weaken-own-checks → escalated; invalid config → rejected, last-good kept; retention aging. Each is a **compiling, named, `#[ignore]`d stub** (skeleton + `todo!()`/pending assertions) driving the public entry points against the local stack (Claude Code faked at the seam for determinism). This is the **acceptance backbone**: it pins the whole contract now, and every later phase's exit becomes "the E2E stubs it owns are un-ignored and green."
 
-**Tests:** config parse/validate (valid + every invalid case), prompt-layering composition, telemetry smoke (spans emitted).
-**Exit:** CI green; `docker-compose up` healthy; `cargo test` covers `config` + `telemetry`.
+**Tests:** config parse/validate (valid + every invalid case), prompt-layering composition, telemetry smoke (spans emitted); **plus the full E2E acceptance suite authored as `#[ignore]`d stubs** — compiling and named, not yet passing.
+**Exit:** CI green; `docker-compose up` healthy; `cargo test` covers `config` + `telemetry`; the full E2E acceptance suite exists as compiling, ignored stubs (CI runs them as ignored, so the list can't silently rot).
 **Depends on:** nothing.
 
 ## P1 — Record book, queue & leasing (`libs/record`)
@@ -149,7 +150,7 @@
 ## Cross-cutting workstreams (every phase)
 
 - **Telemetry:** each new component emits spans/metrics/logs with `correlation_id`; "an absent log is a defect."
-- **Tests:** unit per function + integration per slice (real Postgres/Azurite, Claude Code faked at the seam where deterministic). Every enum variant through every entry point.
+- **Tests:** the **full E2E acceptance suite is authored up front in P0 as `#[ignore]`d stubs**; each later phase **activates (un-ignores) and makes green** the E2E tests its mechanism satisfies — a phase is not done while an E2E test it owns is still ignored. On top of that: unit per function + integration per slice (real Postgres/Azurite, Claude Code faked at the seam where deterministic). Every enum variant through every entry point.
 - **Security:** Managed Identity + per-task tokens enforced from P3; no secrets in code; worker can't weaken its own checks (P4).
 - **Docs:** keep the technical spec in sync if implementation reveals a needed change (PR updates the spec too).
 
@@ -162,4 +163,4 @@
 
 ## Definition of done (per phase)
 
-A phase is done when: its exit criterion holds, its tests pass in CI (`fmt`+`clippy`+`test`), telemetry covers its new paths, and the relevant requirements-traceability rows in the technical spec are backed by a real, tested mechanism.
+A phase is done when: its exit criterion holds, its tests pass in CI (`fmt`+`clippy`+`test`), **every E2E acceptance stub the phase owns is un-ignored and green** (and none it doesn't own was weakened), telemetry covers its new paths, and the relevant requirements-traceability rows in the technical spec are backed by a real, tested mechanism. The count of still-`#[ignore]`d E2E tests is the project's burndown to done.
