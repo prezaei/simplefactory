@@ -398,9 +398,36 @@ Every service and the worker harness emit **OpenTelemetry** traces/metrics/logs,
 
 ## Deployment & local parity
 
-- **Azure:** Container Apps environment hosting the services (N replicas) and worker Jobs; Azure DB for PostgreSQL Flexible Server; Blob Storage with lifecycle policies; Key Vault; ACR for images; Azure Monitor. Provisioned as IaC (Bicep/Terraform — to be decided in an infra doc).
+- **Azure:** Container Apps environment hosting the services (N replicas) and worker Jobs; Azure DB for PostgreSQL Flexible Server; Blob Storage with lifecycle policies; Key Vault; ACR for images; Azure Monitor. Provisioned as **Bicep** (see [Infrastructure & sizing](#infrastructure--sizing-azure)).
 - **CI/CD:** GitHub Actions runs `cargo fmt --check && cargo clippy -D warnings && cargo test`, builds images, pushes to ACR, deploys to Container Apps.
 - **Local:** `docker-compose` brings up Postgres + **Azurite** (Blob emulator) + the Factory services; workers run as local Docker containers driving Claude Code. Same binaries/images as production — one codebase, not two.
+
+## Infrastructure & sizing (Azure)
+
+Provisioned as **Bicep** (Azure-native, no state backend), across two environments — **dev** and **prod** — as separate resource groups (ideally separate subscriptions), parameterized by environment. **Single region** (regional-outage survival is an explicit non-goal).
+
+| Resource | dev | prod | Notes |
+| --- | --- | --- | --- |
+| Azure DB for PostgreSQL Flexible Server | Burstable (B1ms) | Burstable (B-series), **no HA for now** | Cost-first; automated backups on. **Tradeoff:** without zone-redundant HA the record book is a single point of failure — accepted for now. Enabling HA later is a config flip (`highAvailability: ZoneRedundant`), not a redesign. |
+| Azure Blob Storage | Standard **LRS**, hot | Standard **LRS**, hot | Lifecycle rule expires transcripts/checkpoints at 30 days. |
+| Azure Container Apps env | Consumption | Consumption | Services as apps (N replicas + scale rules); workers as Jobs (scale-to-zero). |
+| Azure Container Registry | Basic | Standard | Images for the services + worker. |
+| Azure Key Vault | Standard | Standard | Secrets; accessed via Managed Identity. |
+| Azure Monitor / Log Analytics / App Insights | shared workspace | dedicated workspace | OTel export sink. |
+
+**Identity & access:** each service runs with a **user-assigned Managed Identity** holding least-privilege roles (Postgres login, Blob Data Contributor on its own container, Key Vault Secrets User). **Networking:** services exposed over HTTPS; in prod, Postgres/Blob reached via private endpoints; in dev, public access + firewall rules for simplicity.
+
+## Database migrations & rollback
+
+- **Tool:** **sqlx migrations** — versioned SQL files in `migrations/`, committed to the repo, applied with `sqlx migrate run`. No second tool beyond our DB layer.
+- **Application:** a **dedicated pipeline step** runs migrations exactly once (single runner) **before** the new service revision rolls out, so the N replicas never race and schema change is decoupled from app start.
+- **Model — forward-only + expand/contract** (no down-migrations):
+  1. **Expand** — additive only (new nullable column, new table, index built `CONCURRENTLY`); deployed first, so old *and* new app versions both work against it.
+  2. **Backfill** — migrate/populate data in a later step if needed.
+  3. **Contract** — drop the old column/constraint in a still-later release, once no running version references it.
+- **Zero-downtime:** because every migration is backward-compatible, a rolling Container Apps deploy where old and new replicas briefly coexist is always safe.
+- **Rollback:** redeploy the **previous app revision** — it still works against the expanded schema. The DB is *not* rolled back; a bad data migration is corrected with a new forward migration. Postgres point-in-time restore (automated backups) covers catastrophic corruption only.
+- **CI gate:** migrations are applied against the integration Postgres in CI (per AGENTS.md) before merge; one that doesn't apply cleanly fails the build.
 
 ## Defaults (retention, capacity, effort, timeouts)
 
@@ -437,8 +464,3 @@ libs/
   telemetry/      # OpenTelemetry setup, correlation ids
 dashboard/        # React/TS SPA
 ```
-
-## Deferred to a later infra/design doc
-
-- IaC tool choice (Bicep vs Terraform) and exact Azure SKUs/sizing.
-- Database migration/rollback runbook.
