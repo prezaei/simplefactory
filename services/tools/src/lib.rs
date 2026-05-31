@@ -784,6 +784,12 @@ async fn escalate_won(
 
     // Map the reason to the work-item state: needs-human-input is resumable (blocked,
     // re-queued on a human reply via requeue_blocked); the rest are terminal.
+    //
+    // NOTE: escalate deliberately does NOT revoke the task token or finish the attempt
+    // here — it must stay safely RETRYABLE (a lost HTTP response → the worker's client
+    // retries → the claim-based idempotency makes it a no-op success). Revoking the
+    // token would 401 that retry. The bounded token TTL plus the P5 lease sweeper (which
+    // reclaims orphaned attempts and revokes their tokens) handle end-of-task cleanup.
     let target_state = escalation_target_state(reason);
     let state_changed = record::set_state(&state.pool, auth.work_item_id, target_state).await?;
 
@@ -818,14 +824,23 @@ const IDEMPOTENCY_COMPLETE_ATTEMPTS: u32 = 3;
 /// are layered on top of this by [`compose_prompt`].
 fn role_default_prompt(role: record::Kind) -> &'static str {
     match role {
+        // The Manager/Reviewer terminal action is decided by the worker harness from a
+        // trailing marker line in Claude's output, so the prompt MUST instruct Claude to
+        // emit it as the final line (see the worker's `parse_manager_actionable` /
+        // `parse_reviewer_verdict`).
         record::Kind::Manager => {
-            "You are a manager. Triage the subject, decide the work, and delegate to coders."
+            "You are a manager. Read the issue and triage it: decide whether it is an \
+             actionable software task Factory should code. End your response with a final \
+             line `ACTIONABLE: yes` (it is in scope — a coder will be assigned) or \
+             `ACTIONABLE: no` (out of scope / needs a human decision — it will be escalated)."
         }
         record::Kind::Coder => {
             "You are a coder. Implement the task with tests, then open a change request."
         }
         record::Kind::Reviewer => {
-            "You are a reviewer. Review the change request and submit a verdict."
+            "You are a reviewer. Review the change request's diff and checks. End your \
+             response with a final line `VERDICT: approve`, `VERDICT: request_changes`, or \
+             `VERDICT: comment`."
         }
         record::Kind::Tester => {
             "You are a tester. Exercise the change and report whether the checks pass."

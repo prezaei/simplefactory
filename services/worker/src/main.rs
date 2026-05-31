@@ -194,7 +194,7 @@ impl ClaudeRunner for ClaudeCli {
 }
 
 /// Write the MCP config into `scratch_dir` and run `claude` against it, returning the
-/// parsed [`RunResult`]. Split out from [`ClaudeRunner::run`] so the scratch-dir
+/// parsed [`RunOutcome`]. Split out from [`ClaudeRunner::run`] so the scratch-dir
 /// cleanup in the caller wraps EVERY exit path of this function — both the
 /// config-write failure and the claude-run failure — guaranteeing the token-bearing
 /// config never lingers on disk regardless of where this fails.
@@ -257,21 +257,39 @@ fn outcome_for_role(role: &str, summary: String) -> RunOutcome {
 
 /// Parse the manager's triage decision from a trailing `ACTIONABLE: yes|no` marker.
 /// Defaults to actionable when no clear "no" marker is present (fail toward doing the
-/// work rather than silently dropping an issue).
+/// work rather than silently dropping an issue). Matches the FIRST token of the marker
+/// value so a natural elaboration (`ACTIONABLE: no — out of scope`) still reads as
+/// non-actionable rather than being missed by an exact-string compare.
 fn parse_manager_actionable(summary: &str) -> bool {
-    !last_marker(summary, "ACTIONABLE:")
-        .map(|v| matches!(v.as_str(), "no" | "false" | "not_actionable"))
-        .unwrap_or(false)
+    let not_actionable = last_marker(summary, "ACTIONABLE:")
+        .and_then(|v| marker_first_token(&v))
+        .map(|t| matches!(t.as_str(), "no" | "false" | "not" | "not_actionable"))
+        .unwrap_or(false);
+    !not_actionable
 }
 
 /// Parse the reviewer's verdict from a trailing `VERDICT: approve|request_changes|comment`
 /// marker. Defaults to `comment` (the non-destructive verdict) when absent/unrecognized.
+/// Matches the FIRST token so trailing rationale after the verdict is tolerated.
 fn parse_reviewer_verdict(summary: &str) -> ReviewVerdict {
-    match last_marker(summary, "VERDICT:").as_deref() {
+    match last_marker(summary, "VERDICT:")
+        .and_then(|v| marker_first_token(&v))
+        .as_deref()
+    {
         Some("approve") => ReviewVerdict::Approve,
         Some("request_changes") => ReviewVerdict::RequestChanges,
         _ => ReviewVerdict::Comment,
     }
+}
+
+/// The first whitespace- or punctuation-delimited token of a marker value, lowercased.
+/// e.g. `"no — out of scope"` → `"no"`, `"request_changes (add tests)"` →
+/// `"request_changes"`. Returns `None` for an empty value.
+fn marker_first_token(value: &str) -> Option<String> {
+    value
+        .split(|c: char| c.is_whitespace() || (c.is_ascii_punctuation() && c != '_'))
+        .find(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
 }
 
 /// Find the last line that starts with `prefix` (case-insensitive on the prefix) and
@@ -744,6 +762,16 @@ mod tests {
         assert!(!parse_manager_actionable("ACTIONABLE: not_actionable"));
         // Case-insensitive on the marker; the LAST marker wins.
         assert!(!parse_manager_actionable("actionable: yes\nactionable: no"));
+        // Elaboration after the decision token still reads correctly (first token wins).
+        assert!(!parse_manager_actionable(
+            "ACTIONABLE: no — out of scope, needs product"
+        ));
+        assert!(!parse_manager_actionable(
+            "ACTIONABLE: not actionable; please clarify"
+        ));
+        assert!(parse_manager_actionable(
+            "ACTIONABLE: yes, assigning a coder"
+        ));
     }
 
     #[test]
@@ -766,6 +794,27 @@ mod tests {
             parse_reviewer_verdict("VERDICT: lgtm"),
             ReviewVerdict::Comment
         );
+        // Trailing rationale after the verdict token is tolerated (first token wins).
+        assert_eq!(
+            parse_reviewer_verdict("VERDICT: request_changes (add tests)"),
+            ReviewVerdict::RequestChanges
+        );
+        assert_eq!(
+            parse_reviewer_verdict("VERDICT: approve — ship it"),
+            ReviewVerdict::Approve
+        );
+    }
+
+    #[test]
+    fn marker_first_token_splits_on_space_and_punctuation() {
+        assert_eq!(marker_first_token("no — out of scope"), Some("no".into()));
+        assert_eq!(
+            marker_first_token("request_changes (add tests)"),
+            Some("request_changes".into()) // underscores are kept
+        );
+        assert_eq!(marker_first_token("approve"), Some("approve".into()));
+        assert_eq!(marker_first_token("   "), None);
+        assert_eq!(marker_first_token(""), None);
     }
 
     #[test]

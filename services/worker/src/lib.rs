@@ -90,17 +90,6 @@ pub enum RunOutcome {
     },
 }
 
-impl RunOutcome {
-    /// The human-readable summary, common to every variant.
-    pub fn summary(&self) -> &str {
-        match self {
-            RunOutcome::Code { summary }
-            | RunOutcome::Triage { summary, .. }
-            | RunOutcome::Review { summary, .. } => summary,
-        }
-    }
-}
-
 /// The worker's only channel to Factory: the Tools service over HTTP.
 ///
 /// Reads of the issue/CR are NOT on this trait: in the live flow Claude reads them
@@ -340,14 +329,21 @@ async fn run_manager(
             "worker(manager): outcome recorded (succeeded → Coordinator assigns a coder)"
         );
     } else {
-        // Non-actionable: escalate (terminalizes the work item as `escalated`); the
-        // Coordinator parks it and assigns no Coder. `escalate` is the terminal action
-        // here, so there is no `record_outcome` (which would overwrite the escalated
-        // state); the attempt/token are reclaimed by the P5 lease sweeper.
+        // Non-actionable: whether to act on the issue is a human judgment call, so
+        // escalate with reason `conflict` — which maps to the TERMINAL `escalated`
+        // state (unlike `needs_decision`/`blocked_input`, which are resumable
+        // `blocked`). The Coordinator parks a terminal item and assigns no Coder, per
+        // the spec's "non-actionable → escalate (terminal; no Coder)". `escalate` is the
+        // terminal action, so there is no `record_outcome` (it would overwrite the
+        // escalated state). The still-`running` attempt row and the task token are
+        // reclaimed by the P5 lease sweeper (escalate stays retryable, so it does not
+        // revoke the token itself); the token's bounded TTL caps the interim exposure.
         tools
-            .escalate("needs_decision", &summary, MANAGER_TRIAGE_DEDUPE_KEY)
+            .escalate("conflict", &summary, MANAGER_TRIAGE_DEDUPE_KEY)
             .await?;
-        tracing::info!("worker(manager): non-actionable issue escalated (no coder)");
+        tracing::info!(
+            "worker(manager): non-actionable issue escalated as conflict (terminal; no coder)"
+        );
     }
     Ok(())
 }
@@ -982,7 +978,10 @@ mod tests {
         );
         let esc = tools.escalations.lock().expect("lock");
         assert_eq!(esc.len(), 1, "exactly one escalation");
-        assert_eq!(esc[0].0, "needs_decision");
+        assert_eq!(
+            esc[0].0, "conflict",
+            "non-actionable escalates with the terminal `conflict` reason (a human judgment call)"
+        );
         assert_eq!(esc[0].2, MANAGER_TRIAGE_DEDUPE_KEY);
         assert_eq!(
             tools.outcomes.lock().expect("lock").len(),
@@ -1072,6 +1071,65 @@ mod tests {
             assert_eq!(outcomes.len(), 1);
             assert_eq!(outcomes[0].0, "failed");
         }
+    }
+
+    #[tokio::test]
+    async fn role_outcome_mismatch_fails_loudly_and_opens_no_cr() {
+        // A runner that returns the WRONG outcome variant for the role (a broken
+        // ClaudeRunner contract) must bail loudly, not silently mishandle it. Here a
+        // coder task gets a Triage outcome → run_coder bails; no CR, "failed" recorded.
+        let tools = FakeTools::seeded_role("coder", "issue#42", "factory/issue-42");
+        let git = FakeGit::default();
+        let claude = FakeClaude::with(RunOutcome::Triage {
+            actionable: true,
+            summary: "wrong variant".into(),
+        });
+        let cfg = config();
+
+        let err = run_task(&tools, &git, &claude, &cfg)
+            .await
+            .expect_err("a mismatched outcome variant must fail loudly");
+        assert!(
+            err.to_string().contains("non-Code"),
+            "error explains the mismatch: {err}"
+        );
+        assert_eq!(
+            tools.cr_calls.load(Ordering::SeqCst),
+            0,
+            "no CR on mismatch"
+        );
+        let outcomes = tools.outcomes.lock().expect("lock");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, "failed");
+    }
+
+    #[tokio::test]
+    async fn reviewer_with_non_cr_subject_fails_loudly() {
+        // A reviewer task whose subject is not `cr#N` cannot be acted on — bail loudly
+        // rather than submit a verdict against a bogus CR number.
+        let tools = FakeTools::seeded_role("reviewer", "issue#5", "factory/issue-5");
+        let git = FakeGit::default();
+        let claude = FakeClaude::with(RunOutcome::Review {
+            verdict: ReviewVerdict::Approve,
+            summary: "lgtm".into(),
+        });
+        let cfg = config();
+
+        let err = run_task(&tools, &git, &claude, &cfg)
+            .await
+            .expect_err("a reviewer with a non-cr subject must fail loudly");
+        assert!(
+            err.to_string().contains("cr#"),
+            "error explains the bad subject: {err}"
+        );
+        assert_eq!(
+            tools.reviews.lock().expect("lock").len(),
+            0,
+            "no verdict submitted on a bad subject"
+        );
+        let outcomes = tools.outcomes.lock().expect("lock");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, "failed");
     }
 
     #[tokio::test]
