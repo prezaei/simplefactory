@@ -138,6 +138,8 @@ pub enum ConfigError {
     EmptyInstructionsFile(String),
     #[error("settings.escalation_assignee must be a non-empty, trimmed GitHub login when set")]
     EmptyEscalationAssignee,
+    #[error("settings.gating_paths entries must each be a non-empty, trimmed path prefix")]
+    EmptyGatingPath,
 }
 
 /// Parse and validate a `.factory/config.yml` document.
@@ -168,6 +170,19 @@ pub fn parse(yaml: &str) -> Result<Config, ConfigError> {
         }
         None => None,
     };
+    // Each gating-path prefix must be a real (non-empty, trimmed) prefix. An empty `""`
+    // entry would make `is_gating_path` (a `path.starts_with(prefix)` test) match EVERY
+    // changed file, so every approved CR would be escalated as a gating conflict and no
+    // handoff could ever happen. Trim each entry and reject blanks so one stray list item
+    // can't silently disable all handoffs.
+    let mut gating_paths = Vec::with_capacity(raw.settings.gating_paths.len());
+    for p in &raw.settings.gating_paths {
+        let trimmed = p.trim();
+        if trimmed.is_empty() {
+            return Err(ConfigError::EmptyGatingPath);
+        }
+        gating_paths.push(trimmed.to_owned());
+    }
 
     let mut seen = HashSet::new();
     // Tracks the single worker allowed to subscribe to issue_labeled. A labelled
@@ -229,7 +244,7 @@ pub fn parse(yaml: &str) -> Result<Config, ConfigError> {
             label: raw.settings.label,
             default_model: raw.settings.default_model,
             instructions: raw.settings.instructions,
-            gating_paths: raw.settings.gating_paths,
+            gating_paths,
             retry_cap: raw.settings.retry_cap,
             loop_cap: raw.settings.loop_cap,
             escalation_assignee,
@@ -524,6 +539,30 @@ workers:
         let err =
             parse("version: 1\nsettings:\n  label: factory\n  escalation_assignee: \"   \"\n");
         assert!(matches!(err, Err(ConfigError::EmptyEscalationAssignee)));
+    }
+
+    #[test]
+    fn rejects_blank_gating_path() {
+        // An empty/whitespace gating prefix would make is_gating_path match every file
+        // (path.starts_with("") is always true), escalating every approved CR as a
+        // gating conflict — so a blank entry must be rejected at parse.
+        let err = parse(
+            "version: 1\nsettings:\n  label: factory\n  gating_paths: [\".github/workflows/\", \"   \"]\n",
+        );
+        assert!(matches!(err, Err(ConfigError::EmptyGatingPath)));
+    }
+
+    #[test]
+    fn reads_gating_paths_trimmed() {
+        let cfg = parse(
+            "version: 1\nsettings:\n  label: factory\n  gating_paths: [\"  .github/workflows/  \"]\n",
+        )
+        .expect("config with a gating_path should parse");
+        assert_eq!(
+            cfg.settings.gating_paths,
+            vec![".github/workflows/".to_owned()],
+            "a gating_path is read and trimmed"
+        );
     }
 
     #[test]
