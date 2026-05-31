@@ -128,23 +128,13 @@ the order for a substantive change even if an earlier stage was clean.
 ## Phase 4 — Copilot-gated ship (delegate the wait-loop to /ship-it)
 
 The Copilot review is **asynchronous and external** — do not busy-loop or block the turn waiting for it.
-Delegate the wait-iterate-merge loop to **`/ship-it`**, which runs on a recurring cron (re-checks every
-few minutes and resumes).
-
-> ⚠️ **Stock `/ship-it` does NOT know about Copilot.** Its built-in gates are required-CI-green +
-> review-threads-resolved + mergeable; it has **no** "Copilot reviewed the current HEAD" gate and **no**
-> field for one. If you invoke `/ship-it` plainly, it can merge the moment its own gates pass — silently
-> skipping the Copilot requirement. So you MUST enforce the gate yourself, one of two ways:
->
-> 1. **Augment the delegation (recommended, what this skill assumes):** when arming `/ship-it`'s
->    iteration loop (the cron prompt / Lead-Agent prompt), **inject the EXTRA MERGE GATE below verbatim**
->    AND persist a `require_copilot_review_on_head: true` flag in the ship-it state file, so every
->    iteration re-checks it before merging. (This is exactly how the gate is carried in practice.)
-> 2. **Keep Phase 4 in this skill:** run the wait/triage loop here and call `/ship-it` only once you have
->    confirmed Copilot reviewed the current HEAD and all comments are triaged — i.e. never hand a PR to
->    plain `/ship-it` while the Copilot gate is still open.
->
-> Until `/ship-it` natively supports this gate, plain `/ship-it` is NOT sufficient for this skill.
+Hand the wait-iterate-merge loop to **`/ship-it`**, which runs on a recurring cron (re-checks every few
+minutes and resumes). **`/ship-it` now enforces the Copilot-on-HEAD gate natively** (see the ship-it
+skill): when Copilot is available on the repo it automatically requests the review and will **not** merge
+until Copilot has *submitted* a review of the **current** HEAD with every comment triaged — so just
+invoke `/ship-it`; no manual gate injection is needed. (If Copilot isn't installed on the repo, `/ship-it`
+records that and proceeds without the gate rather than hanging.) The EXTRA MERGE GATE below is exactly the
+behavior `/ship-it` now enforces:
 
 > **EXTRA MERGE GATE — do not merge until BOTH:** (a) Copilot has submitted a review whose `commit_id`
 > equals the **current** PR head SHA, and (b) every new inline comment from that review is triaged —
@@ -188,9 +178,10 @@ conflict needs human judgment. "1–3 small hardening nits per round, trending d
 - **Each Copilot round tends to surface 1–3 real (often small, hardening) issues**, frequently in the
   prior fix. Convergence is normal but not instant — keep looping until a HEAD comes back clean, within
   the round bound above.
-- **/ship-it alone does not know about Copilot.** It resolves required checks, resolves threads, and
-  merges — it has no "Copilot reviewed current HEAD" concept. That gate only exists because Phase 4 hands
-  it the EXTRA MERGE GATE above. Never drop it, or a fix pushed mid-ship can merge un-reviewed.
+- **/ship-it enforces the Copilot-on-HEAD gate natively.** It requires CI green + threads/comments
+  triaged + mergeable AND — when Copilot is available on the repo — a *submitted* Copilot review of the
+  current HEAD before merging; a fix pushed mid-ship resets the gate to the new HEAD. So a fix can't merge
+  un-reviewed. (On a repo without Copilot it proceeds without that gate rather than hanging.)
 - **Migrations / irreversible artifacts:** prefer additive, checksum-safe changes (e.g., a new migration
   over editing an applied one) so the fix itself can't break existing state.
 - **Scope discipline:** the "no defer" rule is about *defects the loop found*. A genuinely separate
