@@ -6,3 +6,10 @@ license.workspace = true
 publish = false
 
 [dependencies]
+sqlx.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

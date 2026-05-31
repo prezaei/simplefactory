@@ -30,8 +30,14 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Database + async (wired in P1)
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "migrate", "macros"] }
+uuid = { version = "1", features = ["v7"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
 # Reserved for later phases (declared for intent; only fetched once a crate uses them):
-# tokio (P3), axum (P2/P3 services), sqlx + uuid + chrono (P1 record), octocrab (P2 github),
+# axum (P2/P3 services), octocrab (P2 github),
 # azure_storage_blobs (P3 blob), opentelemetry + opentelemetry-otlp (P7 telemetry export).
 
 # Internal crates
