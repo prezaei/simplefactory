@@ -113,9 +113,9 @@ Every role runs Claude Code over the same MCP/Tools channel, but the harness's t
 
 | Role | Reads | Claude does | Terminal action (via Tools) | Produces a CR? |
 | --- | --- | --- | --- | --- |
-| **Manager** | the issue (`read_issue`) | triages: actionable vs not | actionable → `post_comment` + `record_outcome` **success** (only a *succeeded* Manager makes the Coordinator assign a Coder); non-actionable → `escalate` (terminal; no Coder) | **No** |
+| **Manager** | the issue (`read_issue`) | triages: actionable vs not | actionable → `post_comment` + `record_outcome` `succeeded` (only a *succeeded* Manager makes the Coordinator assign a Coder); non-actionable → `escalate` (terminal; no Coder) | **No** |
 | **Coder** | the issue / CR | writes code on a fresh clone | push branch → `open_or_update_change_request` → `record_outcome` | **Yes** (the only role that does) |
-| **Reviewer** | the CR (`read_change_request`) | reviews the diff + checks | `submit_review` verdict (e.g. approve / request changes) → `record_outcome` | **No** |
+| **Reviewer** | the CR (`read_change_request`) | reviews the diff + checks | `submit_review` verdict (e.g. `approve` / `request_changes`) → `record_outcome` | **No** |
 
 A Manager or Reviewer therefore never pushes a branch or opens a CR. (The Coder→CR lifecycle ships in P3; the Manager-triage and Reviewer-verdict lifecycles are **P4.5** in the implementation plan.) This table defines the **manager / coder / reviewer** lifecycles only; the **`tester`** role is reserved (no shipped lifecycle yet — consistent with the config note below), so it has no terminal-action contract here.
 
