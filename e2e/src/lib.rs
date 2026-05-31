@@ -3,25 +3,218 @@
 //! Every behavior the specs promise has exactly one named test here, authored
 //! up front (P0) as a compiling `#[ignore]`d stub. A later phase **un-ignores**
 //! and implements the tests it satisfies; a phase is not done while a test it
-//! owns is still ignored. Run `cargo test -p factory-e2e -- --list` to see the
-//! burndown. These drive the public entry points against the local stack
-//! (docker-compose + Azurite), with Claude Code faked at the seam for
-//! determinism.
+//! owns is still ignored. The count of still-`#[ignore]`d tests is the project's
+//! burndown to done. DB-backed tests gate on `DATABASE_URL` and skip cleanly
+//! when it's unset.
 #![forbid(unsafe_code)]
 
 #[cfg(test)]
 mod acceptance {
-    // P1 — record book / queue
-    #[test]
-    #[ignore = "P1: implement record book + SKIP LOCKED leasing"]
-    fn no_double_starts_under_concurrent_coordinators() {
-        todo!("P1: N coordinators lease M items → each item leased exactly once")
+    use factory_record as record;
+    use uuid::Uuid;
+
+    async fn pool_or_skip() -> Option<record::Pool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let pool = record::connect(&url)
+            .await
+            .expect("connect to DATABASE_URL");
+        record::migrate(&pool).await.expect("run migrations");
+        Some(pool)
     }
 
-    #[test]
-    #[ignore = "P1: implement advisory-lock capacity enforcement"]
-    fn capacity_caps_never_exceeded() {
-        todo!("P1: concurrent leasers vs cap K → running count never exceeds K (per-worker AND global)")
+    fn item_for(repo: Uuid, worker: &str, subject: &str) -> record::NewWorkItem {
+        record::NewWorkItem {
+            repo_id: repo,
+            kind: record::Kind::Coder,
+            worker_name: worker.into(),
+            config_sha: "test-sha".into(),
+            trigger: "manager".into(),
+            subject_ref: subject.into(),
+            correlation_id: Uuid::now_v7(),
+            priority: 0,
+            available_at: None,
+        }
+    }
+
+    fn coder_item(repo: Uuid, subject: &str) -> record::NewWorkItem {
+        item_for(repo, "bug-fixer", subject)
+    }
+
+    /// A repo name unique to this invocation, so the acceptance tests are isolated
+    /// across repeated runs against the same database (fresh repo_id → fresh state).
+    fn unique(prefix: &str) -> String {
+        format!("{prefix}-{}", Uuid::now_v7())
+    }
+
+    // P1 — record book / queue. These drive the record-layer arbitration directly
+    // (the exact mechanism the dispatcher replicas rely on): concurrent leasers
+    // stand in for concurrent coordinators.
+
+    #[tokio::test]
+    async fn no_double_starts_under_concurrent_coordinators() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-no-double-starts"), 1)
+            .await
+            .unwrap();
+        const ITEMS: usize = 60;
+        for i in 0..ITEMS {
+            record::enqueue(&pool, &coder_item(repo, &format!("issue#{i}")))
+                .await
+                .unwrap();
+        }
+
+        // 8 concurrent coordinators race to lease; caps high so only the queue limits.
+        let mut set = tokio::task::JoinSet::new();
+        for n in 0..8 {
+            let pool = pool.clone();
+            set.spawn(async move {
+                let mut mine = Vec::new();
+                loop {
+                    let req = record::LeaseRequest {
+                        repo_id: repo,
+                        worker_name: "bug-fixer".into(),
+                        lease_owner: format!("coordinator-{n}"),
+                        ttl_secs: 60.0,
+                        per_worker_cap: 1000,
+                        global_cap: 1000,
+                    };
+                    match record::lease_next(&pool, &req).await.unwrap() {
+                        Some(wi) => mine.push(wi.id),
+                        None => break,
+                    }
+                }
+                mine
+            });
+        }
+
+        let mut all = Vec::new();
+        while let Some(res) = set.join_next().await {
+            all.extend(res.unwrap());
+        }
+        let unique: std::collections::HashSet<_> = all.iter().copied().collect();
+        assert_eq!(all.len(), ITEMS, "every queued item is leased exactly once");
+        assert_eq!(unique.len(), ITEMS, "no item is leased twice");
+    }
+
+    #[tokio::test]
+    async fn capacity_caps_never_exceeded() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-caps"), 1)
+            .await
+            .unwrap();
+        const ITEMS: usize = 40;
+        const CAP: i64 = 3;
+        for i in 0..ITEMS {
+            record::enqueue(&pool, &coder_item(repo, &format!("issue#{i}")))
+                .await
+                .unwrap();
+        }
+
+        // Concurrent leasers; none complete, so in-flight count must never exceed CAP.
+        let mut set = tokio::task::JoinSet::new();
+        for n in 0..8 {
+            let pool = pool.clone();
+            set.spawn(async move {
+                let mut leased = 0usize;
+                loop {
+                    let req = record::LeaseRequest {
+                        repo_id: repo,
+                        worker_name: "bug-fixer".into(),
+                        lease_owner: format!("c-{n}"),
+                        ttl_secs: 60.0,
+                        per_worker_cap: CAP,
+                        global_cap: 100,
+                    };
+                    match record::lease_next(&pool, &req).await.unwrap() {
+                        Some(_) => leased += 1,
+                        None => break,
+                    }
+                }
+                leased
+            });
+        }
+
+        let mut total = 0usize;
+        while let Some(res) = set.join_next().await {
+            total += res.unwrap();
+        }
+        assert_eq!(
+            total, CAP as usize,
+            "exactly CAP items leased; the rest blocked by the cap"
+        );
+
+        // Cap still holds: a fresh attempt yields nothing while CAP are in-flight.
+        let req = record::LeaseRequest {
+            repo_id: repo,
+            worker_name: "bug-fixer".into(),
+            lease_owner: "verify".into(),
+            ttl_secs: 60.0,
+            per_worker_cap: CAP,
+            global_cap: 100,
+        };
+        assert!(
+            record::lease_next(&pool, &req).await.unwrap().is_none(),
+            "cap remains enforced"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_cap_never_exceeded_across_workers() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-global-cap"), 1)
+            .await
+            .unwrap();
+        const GLOBAL: i64 = 4;
+        // Two worker pools with plenty of items each; per-worker cap is high so
+        // ONLY the global ceiling can bind.
+        for w in ["coder-a", "coder-b"] {
+            for i in 0..20 {
+                record::enqueue(&pool, &item_for(repo, w, &format!("{w}#{i}")))
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for w in ["coder-a", "coder-b"] {
+            for n in 0..4 {
+                let pool = pool.clone();
+                set.spawn(async move {
+                    let mut leased = 0usize;
+                    loop {
+                        let req = record::LeaseRequest {
+                            repo_id: repo,
+                            worker_name: w.into(),
+                            lease_owner: format!("{w}-{n}"),
+                            ttl_secs: 60.0,
+                            per_worker_cap: 1000,
+                            global_cap: GLOBAL,
+                        };
+                        match record::lease_next(&pool, &req).await.unwrap() {
+                            Some(_) => leased += 1,
+                            None => break,
+                        }
+                    }
+                    leased
+                });
+            }
+        }
+        let mut total = 0usize;
+        while let Some(res) = set.join_next().await {
+            total += res.unwrap();
+        }
+        assert_eq!(
+            total, GLOBAL as usize,
+            "the global ceiling binds across all worker pools"
+        );
     }
 
     // P2 — intake / opt-in / config application
@@ -76,8 +269,8 @@ mod acceptance {
     }
 
     #[test]
-    #[ignore = "P5/P1: implement retention purge + Blob lifecycle"]
+    #[ignore = "P5: implement full retention (record purge + Blob lifecycle)"]
     fn retention_aging_removes_only_terminal_records() {
-        todo!("P5/P1: terminal records past the retention window are purged; active work is untouched")
+        todo!("P5: terminal records past the retention window are purged; active work is untouched (record purge exists in P1; Blob lifecycle in P5)")
     }
 }
