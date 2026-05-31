@@ -17,12 +17,11 @@ fn unique(p: &str) -> String {
     format!("{p}-{}", Uuid::now_v7())
 }
 
-/// Register a repo with a config containing a single manager subscribed to
-/// issue_labeled. Returns (repo_id, owner, name).
-async fn repo_with_manager(pool: &record::Pool, slug: &str) -> (Uuid, String, String) {
+/// Register a repo (owner `acme`) with the given config YAML applied.
+/// Returns (repo_id, owner, name).
+async fn repo_with_yaml(pool: &record::Pool, slug: &str, yaml: &str) -> (Uuid, String, String) {
     let name = unique(slug);
     let id = record::upsert_repo(pool, "acme", &name, 1).await.unwrap();
-    let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: manager\n    role: manager\n    on: [issue_labeled]\n";
     assert_eq!(
         factory_intake::apply_config(pool, id, yaml, "sha1")
             .await
@@ -30,6 +29,13 @@ async fn repo_with_manager(pool: &record::Pool, slug: &str) -> (Uuid, String, St
         factory_intake::ApplyOutcome::Applied
     );
     (id, "acme".to_owned(), name)
+}
+
+/// Register a repo with a config containing a single manager subscribed to
+/// issue_labeled. Returns (repo_id, owner, name).
+async fn repo_with_manager(pool: &record::Pool, slug: &str) -> (Uuid, String, String) {
+    let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: manager\n    role: manager\n    on: [issue_labeled]\n";
+    repo_with_yaml(pool, slug, yaml).await
 }
 
 #[tokio::test]
@@ -132,6 +138,97 @@ async fn issue_comment_resumes_a_blocked_item() {
     .await
     .unwrap();
     assert_eq!(resumed.map(|w| w.id), Some(leased.id));
+}
+
+#[tokio::test]
+async fn lost_event_is_redriven_not_burned() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // An event arrives before the repo is connected to Factory.
+    let owner = "acme";
+    let name = unique("intake-lostevent");
+    let event = WebhookEvent::IssueLabeled {
+        repo: RepoRef {
+            owner: owner.into(),
+            name: name.clone(),
+            installation_id: 1,
+        },
+        issue: 5,
+        label: "factory".into(),
+    };
+    let delivery = format!("delivery-{}", Uuid::now_v7());
+
+    // Unknown repo → nothing enqueued, and the delivery id must NOT be recorded
+    // (otherwise the redelivery below would be silently dropped as a duplicate).
+    assert_eq!(
+        ingest(&pool, &event, &delivery).await.unwrap(),
+        IngestOutcome::UnknownRepo
+    );
+
+    // The repo is connected and configured.
+    let id = record::upsert_repo(&pool, owner, &name, 1).await.unwrap();
+    let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: manager\n    role: manager\n    on: [issue_labeled]\n";
+    factory_intake::apply_config(&pool, id, yaml, "sha1")
+        .await
+        .unwrap();
+
+    // GitHub redelivers the SAME delivery id → it must now enqueue, not dedupe.
+    assert_eq!(
+        ingest(&pool, &event, &delivery).await.unwrap(),
+        IngestOutcome::Enqueued(1)
+    );
+    assert_eq!(record::count_for_repo(&pool, id).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn cr_opened_enqueues_subscribed_worker_and_audits() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: reviewer\n    role: reviewer\n    on: [cr_opened]\n";
+    let (id, owner, name) = repo_with_yaml(&pool, "intake-cropened", yaml).await;
+    let event = WebhookEvent::CrOpened {
+        repo: RepoRef {
+            owner,
+            name,
+            installation_id: 1,
+        },
+        number: 42,
+    };
+    assert_eq!(
+        ingest(&pool, &event, &format!("d-{}", Uuid::now_v7()))
+            .await
+            .unwrap(),
+        IngestOutcome::Enqueued(1)
+    );
+    assert_eq!(record::count_for_repo(&pool, id).await.unwrap(), 1);
+    // Intake wrote an audit event for the delivery (spec §340).
+    assert!(record::count_events_for_repo(&pool, id).await.unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn review_changes_requested_enqueues_subscribed_worker() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: fixer\n    role: coder\n    on: [cr_changes_requested]\n";
+    let (id, owner, name) = repo_with_yaml(&pool, "intake-changes", yaml).await;
+    let event = WebhookEvent::CrChangesRequested {
+        repo: RepoRef {
+            owner,
+            name,
+            installation_id: 1,
+        },
+        number: 7,
+    };
+    assert_eq!(
+        ingest(&pool, &event, &format!("d-{}", Uuid::now_v7()))
+            .await
+            .unwrap(),
+        IngestOutcome::Enqueued(1)
+    );
+    assert_eq!(record::count_for_repo(&pool, id).await.unwrap(), 1);
 }
 
 #[tokio::test]

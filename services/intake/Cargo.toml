@@ -24,6 +24,7 @@ tracing.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 factory-record.workspace = true
@@ -31,3 +32,6 @@ factory-github.workspace = true
 uuid.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+chrono.workspace = true
+tower.workspace = true
+sqlx.workspace = true

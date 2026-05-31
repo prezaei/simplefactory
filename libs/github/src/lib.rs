@@ -72,6 +72,10 @@ pub enum WebhookEvent {
     CrOpened { repo: RepoRef, number: i64 },
     /// New commits pushed to a change request.
     CrUpdated { repo: RepoRef, number: i64 },
+    /// A review asked for changes on a change request (rework trigger).
+    CrChangesRequested { repo: RepoRef, number: i64 },
+    /// A reviewer was requested on a change request.
+    ReviewRequested { repo: RepoRef, number: i64 },
     /// A human commented on / edited an issue or change request.
     IssueComment { repo: RepoRef, subject: Subject },
     /// A push (used to detect `.factory/config.yml` changes).
@@ -113,8 +117,25 @@ pub fn parse_event(event_type: &str, payload: &[u8]) -> Result<WebhookEvent, Git
                     repo,
                     number: p.number,
                 }),
+                "review_requested" => Ok(WebhookEvent::ReviewRequested {
+                    repo,
+                    number: p.number,
+                }),
                 _ => Ok(WebhookEvent::Other),
             }
+        }
+        "pull_request_review" => {
+            let p: PullRequestReviewPayload = serde_json::from_slice(payload)?;
+            let repo = p.repository.to_ref(p.installation.as_ref().map(|i| i.id));
+            // Only a submitted "changes_requested" review drives rework; approvals
+            // and plain comments are handled by the coordinator off the record book.
+            if p.action == "submitted" && p.review.state.as_deref() == Some("changes_requested") {
+                return Ok(WebhookEvent::CrChangesRequested {
+                    repo,
+                    number: p.pull_request.number,
+                });
+            }
+            Ok(WebhookEvent::Other)
         }
         "issue_comment" => {
             let p: IssueCommentPayload = serde_json::from_slice(payload)?;
@@ -217,6 +238,27 @@ struct PullRequestPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct PrRef {
+    number: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct Review {
+    #[serde(default)]
+    state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestReviewPayload {
+    action: String,
+    review: Review,
+    pull_request: PrRef,
+    repository: Repository,
+    #[serde(default)]
+    installation: Option<Installation>,
+}
+
+#[derive(Debug, Deserialize)]
 struct IssueCommentPayload {
     action: String,
     issue: IssueRef,
@@ -311,6 +353,40 @@ mod tests {
             parse_event("pull_request", synced).unwrap(),
             WebhookEvent::CrUpdated { number: 7, .. }
         ));
+    }
+
+    #[test]
+    fn parses_review_requested_on_pull_request() {
+        let payload = br#"{"action":"review_requested","number":11,"repository":{"name":"r","owner":{"login":"o"}}}"#;
+        assert!(matches!(
+            parse_event("pull_request", payload).unwrap(),
+            WebhookEvent::ReviewRequested { number: 11, .. }
+        ));
+    }
+
+    #[test]
+    fn parses_pull_request_review_changes_requested() {
+        let changes = br#"{
+            "action": "submitted",
+            "review": { "state": "changes_requested" },
+            "pull_request": { "number": 13 },
+            "repository": { "name": "r", "owner": { "login": "o" } }
+        }"#;
+        assert!(matches!(
+            parse_event("pull_request_review", changes).unwrap(),
+            WebhookEvent::CrChangesRequested { number: 13, .. }
+        ));
+        // An approving review is not a rework trigger.
+        let approved = br#"{
+            "action": "submitted",
+            "review": { "state": "approved" },
+            "pull_request": { "number": 13 },
+            "repository": { "name": "r", "owner": { "login": "o" } }
+        }"#;
+        assert_eq!(
+            parse_event("pull_request_review", approved).unwrap(),
+            WebhookEvent::Other
+        );
     }
 
     #[test]

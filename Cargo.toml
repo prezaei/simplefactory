@@ -43,6 +43,8 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 subtle = "2"
+cron = "0.16"
+tower = { version = "0.5", features = ["util"] }
 
 # Reserved for later phases (declared for intent; only fetched once a crate uses them):
 # octocrab + jsonwebtoken (P3 GitHub App auth / installation tokens / Checks-PR API),

@@ -316,6 +316,47 @@ mod acceptance {
         );
     }
 
+    #[tokio::test]
+    async fn scheduler_fires_a_due_tick_once_across_replicas() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let name = unique("e2e-scheduler");
+        let repo = record::upsert_repo(&pool, "acme", &name, 1).await.unwrap();
+        // A coder on an every-minute schedule: the (now-90s, now] window always
+        // contains a due tick.
+        let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: nightly\n    role: coder\n    on:\n      - schedule: \"* * * * *\"\n";
+        let config = factory_config::parse(yaml).expect("valid config");
+        let now = chrono::Utc::now();
+
+        // Eight replicas run the SAME tick concurrently; the due slot must fire
+        // exactly once (per-(repo,worker) advisory lock + last_fired re-check).
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let pool = pool.clone();
+            let config = config.clone();
+            set.spawn(async move {
+                factory_intake::scheduler_tick_for_repo(&pool, repo, &config, "sha", now)
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut fired = 0usize;
+        while let Some(res) = set.join_next().await {
+            fired += res.unwrap();
+        }
+        assert_eq!(fired, 1, "the due tick fires exactly once across replicas");
+        assert_eq!(record::count_for_repo(&pool, repo).await.unwrap(), 1);
+
+        // Re-running the same tick does not double-fire (idempotent on the slot).
+        let again = factory_intake::scheduler_tick_for_repo(&pool, repo, &config, "sha", now)
+            .await
+            .unwrap();
+        assert_eq!(again, 0, "an already-fired slot is not re-fired");
+        assert_eq!(record::count_for_repo(&pool, repo).await.unwrap(), 1);
+    }
+
     // P4 — coordinator + reviewer (full loop)
     #[test]
     #[ignore = "P4: implement manager + coder + reviewer loop"]

@@ -15,5 +15,7 @@ publish = false
 factory-record.workspace = true
 factory-intake.workspace = true
 factory-github.workspace = true
+factory-config.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+chrono.workspace = true

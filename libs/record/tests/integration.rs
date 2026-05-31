@@ -5,7 +5,7 @@
 //! `docker compose up` provide the DB, where they run for real. Tests isolate by
 //! using a unique repo per test, so they're safe to run in parallel.
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use factory_record as record;
 use record::{EnqueueOutcome, Kind, LeaseRequest, NewWorkItem, State};
 use uuid::Uuid;
@@ -508,6 +508,123 @@ async fn concurrent_enqueue_of_same_subject_is_idempotent() {
         }
     }
     assert_eq!(inserted, 1, "exactly one concurrent enqueue wins");
+    assert_eq!(record::count_for_repo(&pool, repo).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn repo_by_name_resolves_only_active_repos() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let name = unique("status-gate");
+    let id = record::upsert_repo(&pool, "acme", &name, 1).await.unwrap();
+    assert!(
+        record::repo_by_name(&pool, "acme", &name)
+            .await
+            .unwrap()
+            .is_some(),
+        "active repo resolves"
+    );
+    // A suspended/removed repo must not resolve, so its events never act.
+    sqlx::query("UPDATE repos SET status = 'suspended' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        record::repo_by_name(&pool, "acme", &name)
+            .await
+            .unwrap()
+            .is_none(),
+        "suspended repo does not resolve"
+    );
+}
+
+#[tokio::test]
+async fn purge_deliveries_removes_only_rows_past_the_cutoff() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // One backdated delivery and one fresh one.
+    let old = unique("old-delivery");
+    sqlx::query(
+        "INSERT INTO webhook_deliveries (delivery_id, received_at)
+         VALUES ($1, now() - interval '10 days')",
+    )
+    .bind(&old)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let fresh = unique("fresh-delivery");
+    assert!(record::mark_delivery(&pool, &fresh).await.unwrap());
+
+    // Purge older than 1 day: removes the backdated row, keeps the fresh one (and
+    // can't touch other tests' recent rows, so this is parallel-safe).
+    record::purge_deliveries(&pool, Utc::now() - Duration::days(1))
+        .await
+        .unwrap();
+    assert!(
+        !record::delivery_seen(&pool, &old).await.unwrap(),
+        "old delivery purged"
+    );
+    assert!(
+        record::delivery_seen(&pool, &fresh).await.unwrap(),
+        "fresh delivery retained"
+    );
+}
+
+#[tokio::test]
+async fn record_scheduled_fire_is_exactly_once_across_replicas() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("sched-fire"), 1)
+        .await
+        .unwrap();
+    let slot = Utc::now();
+    let item = NewWorkItem {
+        repo_id: repo,
+        kind: Kind::Coder,
+        worker_name: "nightly".into(),
+        config_sha: "sha".into(),
+        trigger: "schedule".into(),
+        subject_ref: format!("schedule@nightly@{}", slot.to_rfc3339()),
+        correlation_id: Uuid::now_v7(),
+        priority: 0,
+        available_at: None,
+    };
+
+    // Many replicas race to fire the same slot; exactly one inserts.
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..16 {
+        let pool = pool.clone();
+        let item = item.clone();
+        set.spawn(async move {
+            record::record_scheduled_fire(&pool, &item, slot)
+                .await
+                .unwrap()
+        });
+    }
+    let mut fired = 0usize;
+    while let Some(res) = set.join_next().await {
+        if matches!(res.unwrap(), EnqueueOutcome::Inserted(_)) {
+            fired += 1;
+        }
+    }
+    assert_eq!(fired, 1, "the slot fires exactly once across replicas");
+    assert_eq!(record::count_for_repo(&pool, repo).await.unwrap(), 1);
+
+    // An earlier slot never re-fires after a later one has been recorded.
+    let earlier = slot - Duration::minutes(5);
+    let mut earlier_item = item.clone();
+    earlier_item.subject_ref = format!("schedule@nightly@{}", earlier.to_rfc3339());
+    assert_eq!(
+        record::record_scheduled_fire(&pool, &earlier_item, earlier)
+            .await
+            .unwrap(),
+        EnqueueOutcome::DuplicateActive,
+        "a stale slot is not fired"
+    );
     assert_eq!(record::count_for_repo(&pool, repo).await.unwrap(), 1);
 }
 

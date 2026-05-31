@@ -6,6 +6,7 @@
 //! tested unit.
 #![forbid(unsafe_code)]
 
+use chrono::{DateTime, Utc};
 use factory_config::{Config, Role, Trigger};
 use factory_github::{RepoRef, WebhookEvent};
 use factory_record::{self as record, EnqueueOutcome, Kind, NewWorkItem, Pool};
@@ -43,75 +44,147 @@ pub async fn ingest(
     event: &WebhookEvent,
     delivery_id: &str,
 ) -> anyhow::Result<IngestOutcome> {
-    // Dedupe redelivered webhooks first.
-    if !record::mark_delivery(pool, delivery_id).await? {
+    // Dedupe: skip if this delivery was already fully processed.
+    if record::delivery_seen(pool, delivery_id).await? {
         return Ok(IngestOutcome::Duplicate);
     }
 
+    let (repo_id, outcome) = process(pool, event).await?;
+
+    // Audit every handled delivery (spec §340: every activity is recorded in the
+    // events book, not just in tracing). repo_id is None for events we couldn't
+    // attribute to a connected repo.
+    record::append_event(
+        pool,
+        repo_id,
+        None,
+        None,
+        "intake",
+        "webhook_ingested",
+        serde_json::json!({ "outcome": format!("{outcome:?}") }),
+    )
+    .await?;
+
+    // Record the delivery as handled ONLY for terminal outcomes. "Not ready"
+    // outcomes (repo not connected yet / config not applied yet) are left
+    // unmarked so a later GitHub redelivery re-drives them — nothing is lost.
+    // The work itself is idempotent (enqueue's partial unique index; requeue is
+    // a no-op when nothing is blocked), so if processing errors after some work,
+    // the unmarked redelivery re-drives it without double-creating. (Errors
+    // propagate before this point, so a failed delivery is never marked.)
+    if !matches!(
+        outcome,
+        IngestOutcome::UnknownRepo | IngestOutcome::NoConfig
+    ) {
+        record::mark_delivery(pool, delivery_id).await?;
+    }
+    Ok(outcome)
+}
+
+/// Resolve the repo + config and act on the event. Idempotent. Returns the
+/// resolved `repo_id` (for the audit trail) alongside the outcome.
+async fn process(
+    pool: &Pool,
+    event: &WebhookEvent,
+) -> anyhow::Result<(Option<Uuid>, IngestOutcome)> {
     let Some(repo_ref) = event_repo(event) else {
-        return Ok(IngestOutcome::Ignored);
+        return Ok((None, IngestOutcome::Ignored));
     };
     let Some(rc) = record::repo_by_name(pool, &repo_ref.owner, &repo_ref.name).await? else {
-        return Ok(IngestOutcome::UnknownRepo);
+        return Ok((None, IngestOutcome::UnknownRepo));
     };
     let Some(config_json) = rc.config else {
-        return Ok(IngestOutcome::NoConfig);
+        return Ok((Some(rc.id), IngestOutcome::NoConfig));
     };
     let config: Config = serde_json::from_value(config_json)?;
     let config_sha = rc.config_sha.unwrap_or_default();
 
-    match event {
+    let outcome = match event {
         WebhookEvent::IssueLabeled { label, issue, .. } => {
             if *label != config.settings.label {
-                return Ok(IngestOutcome::Ignored);
+                IngestOutcome::Ignored
+            } else {
+                let subject = format!("issue#{issue}");
+                let n = enqueue_matching(
+                    pool,
+                    rc.id,
+                    &config,
+                    &config_sha,
+                    Trigger::IssueLabeled,
+                    &subject,
+                )
+                .await?;
+                enqueued_or_ignored(n)
             }
-            let subject = format!("issue#{issue}");
-            let n = enqueue_matching(
-                pool,
-                rc.id,
-                &config,
-                &config_sha,
-                Trigger::IssueLabeled,
-                &subject,
-            )
-            .await?;
-            Ok(enqueued_or_ignored(n))
         }
         WebhookEvent::CrOpened { number, .. } => {
-            let subject = format!("cr#{number}");
-            let n = enqueue_matching(
+            cr_enqueue(
                 pool,
                 rc.id,
                 &config,
                 &config_sha,
                 Trigger::CrOpened,
-                &subject,
+                *number,
             )
-            .await?;
-            Ok(enqueued_or_ignored(n))
+            .await?
         }
         WebhookEvent::CrUpdated { number, .. } => {
-            let subject = format!("cr#{number}");
-            let n = enqueue_matching(
+            cr_enqueue(
                 pool,
                 rc.id,
                 &config,
                 &config_sha,
                 Trigger::CrUpdated,
-                &subject,
+                *number,
             )
-            .await?;
-            Ok(enqueued_or_ignored(n))
+            .await?
+        }
+        WebhookEvent::CrChangesRequested { number, .. } => {
+            cr_enqueue(
+                pool,
+                rc.id,
+                &config,
+                &config_sha,
+                Trigger::CrChangesRequested,
+                *number,
+            )
+            .await?
+        }
+        WebhookEvent::ReviewRequested { number, .. } => {
+            cr_enqueue(
+                pool,
+                rc.id,
+                &config,
+                &config_sha,
+                Trigger::ReviewRequested,
+                *number,
+            )
+            .await?
         }
         WebhookEvent::IssueComment { subject, .. } => {
             // A human reply resumes any blocked work on this subject.
             let n = record::requeue_blocked(pool, rc.id, &subject.as_ref_string()).await?;
-            Ok(IngestOutcome::Resumed(n))
+            IngestOutcome::Resumed(n)
         }
         // Push → config-apply requires fetching the file content via the GitHub
         // API (octocrab, P3); `apply_config` below is the tested unit for it.
-        WebhookEvent::Push { .. } | WebhookEvent::Other => Ok(IngestOutcome::Ignored),
-    }
+        WebhookEvent::Push { .. } | WebhookEvent::Other => IngestOutcome::Ignored,
+    };
+    Ok((Some(rc.id), outcome))
+}
+
+/// Enqueue work for a change-request-keyed trigger (`cr#<number>` subject).
+async fn cr_enqueue(
+    pool: &Pool,
+    repo_id: Uuid,
+    config: &Config,
+    config_sha: &str,
+    trigger: Trigger,
+    number: i64,
+) -> anyhow::Result<IngestOutcome> {
+    let subject = format!("cr#{number}");
+    let n = enqueue_matching(pool, repo_id, config, config_sha, trigger, &subject).await?;
+    Ok(enqueued_or_ignored(n))
 }
 
 /// Validate a `.factory/config.yml` and, if valid, store it on the repo. Invalid
@@ -134,6 +207,76 @@ pub async fn apply_config(
             Ok(ApplyOutcome::RejectedKeptLastGood)
         }
     }
+}
+
+/// How far back the scheduler scans for a due tick when a `(repo, worker)` has
+/// never fired. Slightly larger than the tick cadence to tolerate jitter; a
+/// missed window only delays a fire, never duplicates one.
+pub const SCHEDULER_WINDOW_SECS: i64 = 90;
+
+/// Fire any scheduled work due for one repo's config as of `now`, returning the
+/// number fired. Exactly-once across replicas — the fire is committed under a
+/// per-`(repo, worker)` advisory lock that re-checks the last fired slot (see
+/// [`record::record_scheduled_fire`]).
+pub async fn scheduler_tick_for_repo(
+    pool: &Pool,
+    repo_id: Uuid,
+    config: &Config,
+    config_sha: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<usize> {
+    let mut fired = 0;
+    for worker in &config.workers {
+        for trigger in &worker.on {
+            let Trigger::Schedule(cron) = trigger else {
+                continue;
+            };
+            let floor = now - chrono::Duration::seconds(SCHEDULER_WINDOW_SECS);
+            let after = match record::last_scheduled_fire(pool, repo_id, &worker.name).await? {
+                Some(last) => last.max(floor),
+                None => floor,
+            };
+            let due = factory_config::schedule_due_between(cron, after, now)?;
+            // Fire only the most recent due slot — after downtime we resume, we
+            // don't stampede one work item per missed tick.
+            let Some(slot) = due.last().copied() else {
+                continue;
+            };
+            let item = NewWorkItem {
+                repo_id,
+                kind: role_to_kind(worker.role),
+                worker_name: worker.name.clone(),
+                config_sha: config_sha.to_owned(),
+                trigger: "schedule".to_owned(),
+                subject_ref: format!("schedule@{}@{}", worker.name, slot.to_rfc3339()),
+                correlation_id: Uuid::now_v7(),
+                priority: 0,
+                available_at: None,
+            };
+            if let EnqueueOutcome::Inserted(_) =
+                record::record_scheduled_fire(pool, &item, slot).await?
+            {
+                fired += 1;
+            }
+        }
+    }
+    Ok(fired)
+}
+
+/// One scheduler pass over every configured repo. Returns total schedules fired.
+pub async fn scheduler_tick(pool: &Pool, now: DateTime<Utc>) -> anyhow::Result<usize> {
+    let mut fired = 0;
+    for (repo_id, config_sha, config_json) in record::list_configured_repos(pool).await? {
+        let config: Config = match serde_json::from_value(config_json) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(%repo_id, error = %e, "skipping repo with unparseable stored config");
+                continue;
+            }
+        };
+        fired += scheduler_tick_for_repo(pool, repo_id, &config, &config_sha, now).await?;
+    }
+    Ok(fired)
 }
 
 fn enqueued_or_ignored(n: usize) -> IngestOutcome {
@@ -202,6 +345,8 @@ fn event_repo(event: &WebhookEvent) -> Option<&RepoRef> {
         WebhookEvent::IssueLabeled { repo, .. }
         | WebhookEvent::CrOpened { repo, .. }
         | WebhookEvent::CrUpdated { repo, .. }
+        | WebhookEvent::CrChangesRequested { repo, .. }
+        | WebhookEvent::ReviewRequested { repo, .. }
         | WebhookEvent::IssueComment { repo, .. }
         | WebhookEvent::Push { repo, .. } => Some(repo),
         WebhookEvent::Other => None,
