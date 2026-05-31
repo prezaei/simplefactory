@@ -125,11 +125,26 @@ the order for a substantive change even if an earlier stage was clean.
    `gh api --method POST repos/{owner}/{repo}/pulls/<N>/requested_reviewers -f "reviewers[]=copilot-pull-request-reviewer[bot]"`.
 4. Record the current HEAD SHA — the Copilot gate is keyed to it.
 
-## Phase 4 — Copilot-gated ship (hand the wait-loop to /ship-it)
+## Phase 4 — Copilot-gated ship (delegate the wait-loop to /ship-it)
 
 The Copilot review is **asynchronous and external** — do not busy-loop or block the turn waiting for it.
 Delegate the wait-iterate-merge loop to **`/ship-it`**, which runs on a recurring cron (re-checks every
-few minutes and resumes), and give it the extra merge gate `/ship-it` does not enforce on its own:
+few minutes and resumes).
+
+> ⚠️ **Stock `/ship-it` does NOT know about Copilot.** Its built-in gates are required-CI-green +
+> review-threads-resolved + mergeable; it has **no** "Copilot reviewed the current HEAD" gate and **no**
+> field for one. If you invoke `/ship-it` plainly, it can merge the moment its own gates pass — silently
+> skipping the Copilot requirement. So you MUST enforce the gate yourself, one of two ways:
+>
+> 1. **Augment the delegation (recommended, what this skill assumes):** when arming `/ship-it`'s
+>    iteration loop (the cron prompt / Lead-Agent prompt), **inject the EXTRA MERGE GATE below verbatim**
+>    AND persist a `require_copilot_review_on_head: true` flag in the ship-it state file, so every
+>    iteration re-checks it before merging. (This is exactly how the gate is carried in practice.)
+> 2. **Keep Phase 4 in this skill:** run the wait/triage loop here and call `/ship-it` only once you have
+>    confirmed Copilot reviewed the current HEAD and all comments are triaged — i.e. never hand a PR to
+>    plain `/ship-it` while the Copilot gate is still open.
+>
+> Until `/ship-it` natively supports this gate, plain `/ship-it` is NOT sufficient for this skill.
 
 > **EXTRA MERGE GATE — do not merge until BOTH:** (a) Copilot has submitted a review whose `commit_id`
 > equals the **current** PR head SHA, and (b) every new inline comment from that review is triaged —
