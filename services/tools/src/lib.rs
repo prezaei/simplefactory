@@ -445,9 +445,19 @@ pub async fn post_comment(
             // human edit made after this update. (`idempotency_complete` is an UPDATE of
             // the stored result; the Done branch of `idempotent` does not re-store on its
             // own, so we do it here.)
+            //
+            // BEST-EFFORT: the GitHub update already succeeded, so this re-persist must
+            // NOT propagate (a `?` here would return a tool error AFTER the write, prompting
+            // the caller to retry → re-run `update_comment` → the exact clobber we're
+            // preventing). On failure we log and still return success; worst case a later
+            // identical re-dispatch does one redundant update, never a lost write.
             let updated = json!({ "comment_id": comment_id, "body": body });
-            record::idempotency_complete(&state.pool, auth.work_item_id, "comment", key, &updated)
-                .await?;
+            if let Err(e) =
+                record::idempotency_complete(&state.pool, auth.work_item_id, "comment", key, &updated)
+                    .await
+            {
+                tracing::warn!(work_item = %auth.work_item_id, comment_id, error = %e, "post_comment: failed to re-persist updated body (best-effort); a later identical re-dispatch may do one redundant update");
+            }
             Ok(updated)
         },
     )

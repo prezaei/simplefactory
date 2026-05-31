@@ -1618,13 +1618,21 @@ async fn post_comment_redispatch_of_updated_body_does_not_reput() {
     let fx = fixture_with(&pool, "issue#1701", FakeGitHub::new()).await;
     let mk = |body: &str| json!({ "target": "issue#1701", "body": body, "dedupe_key": "k" });
 
-    // A: first post.
-    let (_, _) = http_call(fx.state.clone(), &fx.raw_token, "post_comment", mk("A")).await;
+    // A: first post. Each call must return 200 — otherwise a redo-path error could make
+    // this test pass for the wrong reason (GitHub call counts alone wouldn't catch it).
+    let (sa, _) = http_call(fx.state.clone(), &fx.raw_token, "post_comment", mk("A")).await;
+    assert_eq!(sa, StatusCode::OK, "first post returns 200");
     // B: changed body → one update.
-    let (_, _) = http_call(fx.state.clone(), &fx.raw_token, "post_comment", mk("B")).await;
+    let (sb, _) = http_call(fx.state.clone(), &fx.raw_token, "post_comment", mk("B")).await;
+    assert_eq!(sb, StatusCode::OK, "body-change re-run returns 200");
     assert_eq!(count_calls(&fx.gh, "update_comment"), 1, "A→B updates once");
     // B again: identical re-dispatch of the current body → NO further update.
-    let (_, _) = http_call(fx.state.clone(), &fx.raw_token, "post_comment", mk("B")).await;
+    let (sb2, _) = http_call(fx.state.clone(), &fx.raw_token, "post_comment", mk("B")).await;
+    assert_eq!(
+        sb2,
+        StatusCode::OK,
+        "identical re-dispatch still returns 200"
+    );
     assert_eq!(
         count_calls(&fx.gh, "update_comment"),
         1,
