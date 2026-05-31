@@ -57,7 +57,8 @@ names used here.
    Copilot's *review-summary body* or a *PR-level (issue) comment* has no inline `comment_id` to reply
    on — for those, one reply on the review/PR is acceptable (it is not the forbidden "new comment instead
    of using the thread"). Be specific: name the commit and what changed.
-6. **Telemetry + tests are part of "done."** Per `AGENTS.md`: every new decision/error path is logged,
+6. **Telemetry + tests are part of "done."** Per `AGENTS.md` (do not weaken it): every new function,
+   decision, and error path has info-level logging,
    and every behavior in the design has a test. New code without tests is incomplete.
 
 ## Applicability — scope the loop to the change (read FIRST)
