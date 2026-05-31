@@ -46,9 +46,16 @@ CREATE TABLE work_items (
 CREATE UNIQUE INDEX work_items_active_uniq ON work_items (repo_id, subject_ref, kind)
     WHERE state IN ('queued', 'leased', 'running', 'blocked');
 
--- SKIP LOCKED pickup: ready, unleased items per (repo, worker_name), oldest-first.
+-- SKIP LOCKED pickup: ready, unleased items per (repo, worker_name),
+-- highest-priority first then oldest (matches lease ORDER BY priority DESC, available_at).
 CREATE INDEX work_items_pickup ON work_items (repo_id, worker_name, priority DESC, available_at)
     WHERE state = 'queued';
+
+-- Capacity counts: lease_next counts in-flight items by repo_id (global cap) and by
+-- (repo_id, worker_name) (per-worker cap). This partial index serves both predicates
+-- (repo_id is a leading column), keeping the cap checks off a sequential scan.
+CREATE INDEX work_items_inflight ON work_items (repo_id, worker_name)
+    WHERE state IN ('leased', 'running');
 
 -- Sweeper: find expired leases fast (reclaim_expired filters lease_expires_at + leased/running).
 CREATE INDEX work_items_lease_expiry ON work_items (lease_expires_at)
