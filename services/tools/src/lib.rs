@@ -569,18 +569,17 @@ pub async fn heartbeat(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
     Ok(json!({ "lease_expires_at": expires }))
 }
 
-/// Escalate to a human — the single human channel. Idempotent per task+reason under
-/// scope `"escalate"` via the claim-first pattern: the claim winner records the
-/// escalation, posts the question on the subject, and moves the work item to the state
-/// mapped from `reason` (resumable `blocked` for needs-human-input, terminal
-/// `escalated` otherwise), then stores the result. When the caller passes NO
-/// `dedupe_key` the key defaults to the `reason` string (NOT a per-task constant): so
-/// re-escalating the SAME reason is idempotent (exactly one escalation row, state
-/// unchanged), while escalating a DIFFERENT reason later (e.g. `blocked_input` then
-/// `retries_exhausted`) creates a NEW escalation and applies that reason's
-/// reason→state mapping. Using a constant default would conflate distinct reasons:
-/// the second, different reason would hit `Done` and silently no-op, leaving the work
-/// item in the wrong state.
+/// Escalate to a human — the single human channel. The spec invariant is ONE
+/// escalation per task: idempotent under scope `"escalate"` via the claim-first
+/// pattern, defaulting (when the caller passes NO `dedupe_key`) to a per-task
+/// constant key ([`ESCALATE_DEFAULT_KEY`]). The FIRST escalate to win the claim
+/// records the escalation, posts the question on the subject, and moves the work item
+/// to the state mapped from its `reason` (resumable `blocked` for needs-human-input,
+/// terminal `escalated` otherwise), then stores the result. Any LATER escalate with
+/// no key — regardless of reason — hits `Done` and is a no-op: no second escalation
+/// row, no second comment, and the state stays as the first escalation left it. A
+/// caller who genuinely needs to distinguish multiple escalations may pass an explicit
+/// `dedupe_key`, which is honored as the claim key instead of the default.
 pub async fn escalate(
     state: &ToolsState,
     auth: &TaskAuth,
@@ -592,10 +591,11 @@ pub async fn escalate(
     // front with a clear message rather than surfacing a DB constraint error.
     validate_escalation_reason(reason)?;
 
-    // When the caller omits a dedupe_key, default it to the reason: re-escalating the
-    // same reason is idempotent, but a different reason creates a new escalation and
-    // applies its own reason→state mapping (a constant default would conflate them).
-    let key = dedupe_key.unwrap_or(reason);
+    // Spec: ONE escalation per task. When the caller omits a dedupe_key, default it to
+    // a per-task constant so that ANY later escalate (any reason) dedupes to the first.
+    // An explicit caller-supplied key is honored for callers that genuinely want to
+    // file distinct escalations.
+    let key = dedupe_key.unwrap_or(ESCALATE_DEFAULT_KEY);
 
     idempotent(
         state,
@@ -668,6 +668,18 @@ async fn escalate_won(
 
 /// Default heartbeat lease extension (15 minutes), per the spec.
 const HEARTBEAT_TTL_SECS: f64 = 900.0;
+
+/// The per-task default idempotency key for [`escalate`]. The spec requires ONE
+/// escalation per task, so when no explicit `dedupe_key` is supplied EVERY escalate
+/// for a task claims this same key — the first wins and files the single escalation;
+/// any later one (any reason) dedupes to it.
+const ESCALATE_DEFAULT_KEY: &str = "task";
+
+/// How many times [`idempotent`] retries `idempotency_complete` after a successful
+/// side effect before falling back to release+warn. Complete-failures are usually
+/// transient DB blips; a few retries with a yield between usually succeed and avoid a
+/// duplicate side effect on the next request.
+const IDEMPOTENCY_COMPLETE_ATTEMPTS: u32 = 3;
 
 /// The built-in, role-specific base prompt. Repo-wide and per-worker instructions
 /// are layered on top of this by [`compose_prompt`].
@@ -844,28 +856,60 @@ where
                 // re-runs the side effect — a DUPLICATE. Instead release the claim so a
                 // retry re-claims immediately.
                 //
-                // Residual tradeoff: because the side effect already ran but its result
-                // was never recorded, a retry that re-claims will run the side effect a
-                // SECOND time (a duplicate). This is the irreducible dual-write window
-                // between the external side effect and our record book — there is no way
-                // to make "do the side effect" and "record that we did it" atomic across
-                // two systems. Releasing here trades the old failure mode (wedge for
-                // CLAIM_STALE_SECS, THEN silently double-fire) for a faster, logged one
-                // (retry MAY double-fire), which is strictly better: bounded and visible.
-                if let Err(e) = record::idempotency_complete(
-                    &state.pool,
-                    auth.work_item_id,
-                    scope,
-                    key,
-                    &result,
-                )
-                .await
-                {
-                    tracing::warn!(work_item = %auth.work_item_id, scope, error = %e, "idempotency_complete failed after side effect; releasing claim (a retry may duplicate the side effect)");
-                    release_claim(state, auth, scope, key).await;
-                    return Err(ToolError::Internal(e.into()));
+                // First, shrink the duplicate window: most complete-failures are
+                // transient DB blips (a dropped connection, a momentary deadlock), so we
+                // retry idempotency_complete a small bounded number of times with a yield
+                // between attempts. A success here records the result and avoids the
+                // duplicate entirely. Only after all attempts fail do we fall back to
+                // release+warn below.
+                let mut last_err = None;
+                for attempt in 1..=IDEMPOTENCY_COMPLETE_ATTEMPTS {
+                    match record::idempotency_complete(
+                        &state.pool,
+                        auth.work_item_id,
+                        scope,
+                        key,
+                        &result,
+                    )
+                    .await
+                    {
+                        Ok(()) => return Ok(result),
+                        Err(e) => {
+                            tracing::warn!(work_item = %auth.work_item_id, scope, attempt, error = %e, "idempotency_complete failed; retrying");
+                            last_err = Some(e);
+                            // Yield so a transient blip (e.g. a pool slot freeing up) has
+                            // a chance to clear before the next attempt; no new dep.
+                            tokio::task::yield_now().await;
+                        }
+                    }
                 }
-                Ok(result)
+
+                // Residual tradeoff: after the bounded retries still failed, the side
+                // effect already ran but its result was never recorded, so a retry that
+                // re-claims will run the side effect a SECOND time (a duplicate). This is
+                // the irreducible dual-write window between the external side effect and
+                // our record book — there is no way to make "do the side effect" and
+                // "record that we did it" atomic across two systems. Releasing here trades
+                // the old failure mode (wedge for CLAIM_STALE_SECS, THEN silently
+                // double-fire) for a faster, logged one (retry MAY double-fire), which is
+                // strictly better: bounded and visible. The retry loop above shrinks how
+                // often we reach this fallback, but cannot eliminate the window.
+                //
+                // The loop only falls through here after every attempt returned Err, so
+                // last_err is always Some; the match keeps us from fabricating an error.
+                match last_err {
+                    Some(e) => {
+                        tracing::warn!(work_item = %auth.work_item_id, scope, attempts = IDEMPOTENCY_COMPLETE_ATTEMPTS, error = %e, "idempotency_complete failed after retries; releasing claim (a retry may duplicate the side effect)");
+                        release_claim(state, auth, scope, key).await;
+                        Err(ToolError::Internal(e.into()))
+                    }
+                    // Unreachable: the loop runs at least once and only exits via the
+                    // Err arm (the Ok arm returns). Surface a defined error rather than
+                    // panicking if the invariant is ever broken.
+                    None => Err(ToolError::Internal(anyhow::anyhow!(
+                        "idempotency_complete retry loop produced no result"
+                    ))),
+                }
             }
             Err(e) => {
                 // Side effect failed: release the claim so the next retry re-claims

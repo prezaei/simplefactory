@@ -471,7 +471,7 @@ async fn escalate_is_idempotent_per_task_without_a_dedupe_key() {
 
 #[tokio::test]
 async fn escalate_same_reason_twice_without_key_is_idempotent_and_keeps_state() {
-    // FIX 5: the default dedupe_key is the reason, so re-escalating the SAME reason
+    // The default dedupe_key is a per-task constant, so re-escalating the SAME reason
     // (no key) is idempotent — exactly one escalation row, state unchanged.
     let Some(pool) = pool_or_skip().await else {
         eprintln!("SKIP: DATABASE_URL not set");
@@ -503,12 +503,12 @@ async fn escalate_same_reason_twice_without_key_is_idempotent_and_keeps_state() 
 }
 
 #[tokio::test]
-async fn escalate_different_reasons_without_key_file_separately_and_apply_state() {
-    // FIX 5: with a constant default key, a SECOND escalate with a DIFFERENT reason
-    // would hit Done and silently no-op, leaving the wrong state. Defaulting the key
-    // to the reason fixes this: blocked_input → Blocked, then a LATER
-    // retries_exhausted on the SAME item creates a new escalation and moves it to
-    // Escalated (terminal). blocked is non-terminal, so blocked→escalated is allowed.
+async fn escalate_is_one_per_task_regardless_of_reason() {
+    // Spec invariant: ONE escalation per task. With no dedupe_key the key defaults to a
+    // per-task constant, so a LATER escalate with a DIFFERENT reason dedupes to the
+    // first — no second escalation row, no second comment, and the state stays as the
+    // FIRST escalation left it. The FIRST escalation defines the task's escalation and
+    // state; a later escalate (any reason) hits Done and is a no-op.
     let Some(pool) = pool_or_skip().await else {
         eprintln!("SKIP: DATABASE_URL not set");
         return;
@@ -531,8 +531,8 @@ async fn escalate_different_reasons_without_key_file_separately_and_apply_state(
         .unwrap();
     assert_eq!(item.state, State::Blocked);
 
-    // Later: a DIFFERENT reason (retries_exhausted) must NOT be deduped away — it
-    // creates a new escalation and moves the item to Escalated (terminal).
+    // Later: a DIFFERENT reason (retries_exhausted) with no key must dedupe to the
+    // first escalation — same escalation id, no state change.
     let (s2, b2) = http_call(
         fx.state.clone(),
         &fx.raw_token,
@@ -541,25 +541,30 @@ async fn escalate_different_reasons_without_key_file_separately_and_apply_state(
     )
     .await;
     assert_eq!(s2, StatusCode::OK);
-    assert_eq!(b2["state"], "escalated");
-    // DISTINCT escalation ids and exactly TWO escalation rows.
-    assert_ne!(b1["escalation_id"], b2["escalation_id"]);
+    // Same escalation id as the first (deduped), and the state reflects the FIRST
+    // escalation (Blocked), NOT the second reason's terminal mapping.
+    assert_eq!(b1["escalation_id"], b2["escalation_id"]);
+    assert_eq!(b2["state"], "blocked");
+
+    // Exactly ONE escalation row and exactly ONE comment for the whole task.
     assert_eq!(
         record::count_escalations_for_item(&pool, fx.work_item_id)
             .await
             .unwrap(),
-        2,
-        "distinct reasons file two escalations"
+        1,
+        "one escalation per task regardless of reason"
     );
-    // The item ends terminal (escalated), not stuck at blocked.
+    assert_eq!(count_calls(&fx.gh, "post_comment"), 1);
+
+    // The item stays at the first escalation's state (blocked), not escalated.
     let item = record::work_item_by_id(&pool, fx.work_item_id)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
         item.state,
-        State::Escalated,
-        "the second, different reason applied its terminal state"
+        State::Blocked,
+        "the first escalation defines the task's state; the later reason is a no-op"
     );
 }
 

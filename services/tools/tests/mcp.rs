@@ -492,6 +492,71 @@ async fn mcp_tools_call_bad_request_is_invalid_params_error() {
 }
 
 // ===========================================================================
+// 8b. tools/call hitting an in-flight idempotency claim → JSON-RPC retryable
+// Conflict (-32009). FIX 4: exercise the non-BadRequest error mapping (Conflict)
+// through the MCP transport, not just the REST surface.
+// ===========================================================================
+
+/// JSON-RPC retryable-conflict code (matches `mcp::CONFLICT_RETRYABLE`).
+const CONFLICT_RETRYABLE: i64 = -32009;
+
+#[tokio::test]
+async fn mcp_tools_call_conflict_is_retryable_error() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#120", FakeGitHub::new()).await;
+
+    // Pre-seed a PENDING idempotency claim for escalate's per-task default slot
+    // (scope "escalate", key "task" — the constant default when no dedupe_key is
+    // passed). A claim with no recorded result is the "winner in flight" placeholder:
+    // the next caller for the same slot gets IdempotencyClaim::Pending → Conflict.
+    let claim = record::idempotency_claim(&pool, fx.work_item_id, "escalate", "task")
+        .await
+        .expect("seed claim");
+    assert_eq!(
+        claim,
+        record::IdempotencyClaim::Won,
+        "seed claim wins the placeholder (now pending for the next caller)"
+    );
+
+    // Drive escalate over MCP with NO dedupe_key → it claims (scope "escalate", key
+    // "task"), finds the pending placeholder, and returns a retryable Conflict.
+    let (status, body) = mcp_call(
+        fx.state.clone(),
+        Some(&fx.raw_token),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "escalate",
+                "arguments": { "reason": "needs_decision", "context": "which db?" }
+            }
+        }),
+    )
+    .await;
+
+    // JSON-RPC errors ride HTTP 200 with the error in the envelope; a Conflict is a
+    // JSON-RPC error (retryable code), NOT an isError result.
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], 9);
+    assert!(
+        body["result"].is_null(),
+        "a conflict is a JSON-RPC error, not a tool result"
+    );
+    assert_eq!(
+        body["error"]["code"], CONFLICT_RETRYABLE,
+        "the idempotency Pending path maps to the retryable Conflict code"
+    );
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Conflict"));
+}
+
+// ===========================================================================
 // 9. malformed body → parse error -32700
 // ===========================================================================
 

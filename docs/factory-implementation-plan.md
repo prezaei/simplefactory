@@ -124,6 +124,7 @@ The real subprocess seams are implemented too: `GitCli` (shallow clone + `--forc
 - Continuous **checkpoint** of Claude Code session + worktree → Blob (short interval + tool boundaries); `attempts.session_id`/`checkpoint_uri`.
 - **Resume:** on lease expiry, restore worktree + `claude --resume`; bounded resume count → fresh attempt/escalation.
 - `services/coordinator` **lease sweeper:** reclaim expired leases, mark attempt failed/reclaimed, revoke token.
+- **Worker heartbeat loop:** the worker's *periodic* heartbeat (a ~60s loop that calls the Tools `heartbeat` endpoint to extend its 15-min lease for the whole run) lands here, alongside crash-resume and the sweeper — it is the liveness signal the sweeper trusts. P3 already ships the `heartbeat` Tools endpoint and emits a single heartbeat; that one beat is correct within the 15-min lease window, but keeping a long run alive needs this loop, which is why it is a P5 resilience task.
 - Retry bounds (`attempt_count`), per-attempt wall-clock cap.
 - **config_sha pinning** honored: in-flight attempts use pinned config; removed workers finish then stop.
 

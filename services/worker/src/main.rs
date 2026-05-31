@@ -131,36 +131,62 @@ impl ClaudeRunner for ClaudeCli {
         // to the remote. Keeping it outside the tree means git never sees it.
         let scratch_dir = mcp_scratch_dir();
         tokio::fs::create_dir_all(&scratch_dir).await?;
-        let config_path = scratch_dir.join(MCP_CONFIG_FILENAME);
-        write_mcp_config_file(&config_path, tools_url, token).await?;
 
-        let args = claude_args(&config_path, prompt);
-        let run = tokio::process::Command::new("claude")
-            .current_dir(workdir)
-            .args(&args)
-            .output()
-            .await;
+        // Run the token-bearing config write + claude invocation inside a scope that
+        // ALWAYS cleans up the scratch dir afterward — including the config-WRITE
+        // failure path. If cleanup ran only after a successful write+run, a write that
+        // failed (e.g. a planted file at the path) would leave the scratch dir (and any
+        // partial token file) on disk. cleanup_scratch runs on every exit path here.
+        let result = run_claude_with_config(&scratch_dir, workdir, prompt, tools_url, token).await;
+        cleanup_scratch(&scratch_dir).await;
+        result
+    }
+}
 
-        // Best-effort delete the entire scratch directory once the run is done,
-        // whether it succeeded or failed, so the token does not linger on disk.
-        if let Err(e) = tokio::fs::remove_dir_all(&scratch_dir).await {
-            tracing::warn!(error = %e, "ClaudeCli: failed to remove MCP scratch dir");
-        }
+/// Write the MCP config into `scratch_dir` and run `claude` against it, returning the
+/// parsed [`RunResult`]. Split out from [`ClaudeRunner::run`] so the scratch-dir
+/// cleanup in the caller wraps EVERY exit path of this function — both the
+/// config-write failure and the claude-run failure — guaranteeing the token-bearing
+/// config never lingers on disk regardless of where this fails.
+async fn run_claude_with_config(
+    scratch_dir: &Path,
+    workdir: &Path,
+    prompt: &str,
+    tools_url: &str,
+    token: &str,
+) -> anyhow::Result<RunResult> {
+    let config_path = scratch_dir.join(MCP_CONFIG_FILENAME);
+    write_mcp_config_file(&config_path, tools_url, token).await?;
 
-        let output = run?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::error!(status = ?output.status.code(), stderr = %stderr, "claude run failed");
-            anyhow::bail!("claude run failed ({}): {stderr}", output.status);
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let summary = if stdout.is_empty() {
-            "claude run completed with no output".to_string()
-        } else {
-            stdout
-        };
-        tracing::info!("ClaudeCli: run completed");
-        Ok(RunResult { summary })
+    let args = claude_args(&config_path, prompt);
+    let output = tokio::process::Command::new("claude")
+        .current_dir(workdir)
+        .args(&args)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!(status = ?output.status.code(), stderr = %stderr, "claude run failed");
+        anyhow::bail!("claude run failed ({}): {stderr}", output.status);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let summary = if stdout.is_empty() {
+        "claude run completed with no output".to_string()
+    } else {
+        stdout
+    };
+    tracing::info!("ClaudeCli: run completed");
+    Ok(RunResult { summary })
+}
+
+/// Best-effort delete the entire MCP scratch directory (and its token-bearing config)
+/// once the run is done — success OR failure — so the token never lingers on disk.
+/// A failure to remove is logged but never propagated: it must not mask the run's own
+/// outcome.
+async fn cleanup_scratch(scratch_dir: &Path) {
+    if let Err(e) = tokio::fs::remove_dir_all(scratch_dir).await {
+        tracing::warn!(error = %e, "ClaudeCli: failed to remove MCP scratch dir");
     }
 }
 
@@ -328,6 +354,47 @@ mod tests {
         );
 
         tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    async fn scratch_dir_is_cleaned_up_when_the_config_write_fails() {
+        // Restructured cleanup (FIX 3): the scratch dir must be removed on EVERY exit
+        // path after creation, including the config-WRITE failure path. We force a
+        // write failure by pre-planting a file at the config path so create_new(true)
+        // fails with AlreadyExists — this returns Err BEFORE claude is ever spawned —
+        // then run the SAME sequence the trait method uses (run_claude_with_config then
+        // cleanup_scratch) and assert the dir is gone and the error surfaced.
+        let scratch_dir =
+            std::env::temp_dir().join(format!("factory-mcp-cleanup-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&scratch_dir).await.unwrap();
+        // Pre-plant the config file so the atomic create_new write fails.
+        let config_path = scratch_dir.join(MCP_CONFIG_FILENAME);
+        tokio::fs::write(&config_path, "pre-existing")
+            .await
+            .unwrap();
+
+        let result = run_claude_with_config(
+            &scratch_dir,
+            Path::new("/tmp"),
+            "prompt",
+            "https://tools.factory.test",
+            TOKEN,
+        )
+        .await;
+        cleanup_scratch(&scratch_dir).await;
+
+        // The write failed (claude was never spawned)...
+        let err = result.expect_err("write into a clobbered path must fail");
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::AlreadyExists),
+            "the failure is the create_new clobber refusal, before claude runs"
+        );
+        // ...and the scratch dir (with the partial/pre-planted token file) is gone.
+        assert!(
+            !tokio::fs::try_exists(&scratch_dir).await.unwrap(),
+            "scratch dir must be removed even when the config write fails"
+        );
     }
 
     #[test]
