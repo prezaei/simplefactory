@@ -27,7 +27,7 @@ Getting a repository onto Factory takes two steps, both done once:
 
 2. **Describe your team (it lives in the repo).** You add one small config file to the repository itself that lists the workers you want — a manager, a coder, a reviewer, a tester — what wakes each one up (a new issue, a new change request, a nightly timer), and any limits (how many may run at once). Because this file lives in your repo, your Factory setup is version-controlled and reviewed like any other code, and Factory re-reads it automatically whenever it changes — no redeploy, no console clicking. This file *is* your team: with no config there are no workers, and Factory does nothing on the repo.
 
-That's the whole setup. From this point on Factory watches the repo on its own. You never "start a run" — you work normally, and Factory reacts. **Removing a repo is just as clean:** disconnecting it stops its in-progress work, revokes Factory's access, and purges the data Factory itself holds on the retention schedule. (The detailed play-by-play of each run is written into your own repository — see "Being transparent" — so that part lives and dies with your repository, not with Factory.)
+That's the whole setup. From this point on Factory watches the repo on its own. You never "start a run" — you work normally, and Factory reacts.
 
 **One safety rule keeps you in control:** Factory only acts on work you explicitly hand it. By default it ignores everything; you opt a piece of work in by adding a label (e.g. `factory`) to an issue. Anything without that label, Factory leaves alone.
 
