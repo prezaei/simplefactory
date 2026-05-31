@@ -128,6 +128,10 @@ pub struct NewWorkItem {
     pub trigger: String,
     pub subject_ref: String,
     pub correlation_id: Uuid,
+    /// Pickup priority; higher leases first (default 0).
+    pub priority: i32,
+    /// Earliest time the item may be leased; `None` means now (immediate).
+    pub available_at: Option<DateTime<Utc>>,
 }
 
 /// Outcome of [`enqueue`].
@@ -214,8 +218,9 @@ pub async fn upsert_repo(
 pub async fn enqueue(pool: &Pool, item: &NewWorkItem) -> Result<EnqueueOutcome> {
     let row = sqlx::query(
         "INSERT INTO work_items
-           (id, repo_id, kind, worker_name, config_sha, trigger, subject_ref, correlation_id, state)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued')
+           (id, repo_id, kind, worker_name, config_sha, trigger, subject_ref, correlation_id,
+            state, priority, available_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued', $9, coalesce($10, now()))
          ON CONFLICT (repo_id, subject_ref, kind)
            WHERE state IN ('queued', 'leased', 'running', 'blocked')
            DO NOTHING
@@ -229,13 +234,23 @@ pub async fn enqueue(pool: &Pool, item: &NewWorkItem) -> Result<EnqueueOutcome> 
     .bind(&item.trigger)
     .bind(&item.subject_ref)
     .bind(item.correlation_id)
+    .bind(item.priority)
+    .bind(item.available_at)
     .fetch_optional(pool)
     .await?;
 
-    Ok(match row {
+    let outcome = match row {
         Some(r) => EnqueueOutcome::Inserted(r.try_get("id")?),
         None => EnqueueOutcome::DuplicateActive,
-    })
+    };
+    tracing::info!(
+        repo_id = %item.repo_id,
+        kind = item.kind.as_str(),
+        subject = %item.subject_ref,
+        duplicate = matches!(outcome, EnqueueOutcome::DuplicateActive),
+        "enqueue"
+    );
+    Ok(outcome)
 }
 
 /// Atomically lease the next ready item for `worker_name`, enforcing the
@@ -259,6 +274,7 @@ pub async fn lease_next(pool: &Pool, req: &LeaseRequest) -> Result<Option<WorkIt
     .await?;
     if global >= req.global_cap {
         tx.rollback().await?;
+        tracing::info!(repo_id = %req.repo_id, worker = %req.worker_name, global, cap = req.global_cap, "lease blocked: global cap reached");
         return Ok(None);
     }
 
@@ -272,6 +288,7 @@ pub async fn lease_next(pool: &Pool, req: &LeaseRequest) -> Result<Option<WorkIt
     .await?;
     if per_worker >= req.per_worker_cap {
         tx.rollback().await?;
+        tracing::info!(repo_id = %req.repo_id, worker = %req.worker_name, per_worker, cap = req.per_worker_cap, "lease blocked: per-worker cap reached");
         return Ok(None);
     }
 
@@ -300,7 +317,16 @@ pub async fn lease_next(pool: &Pool, req: &LeaseRequest) -> Result<Option<WorkIt
     .await?;
 
     tx.commit().await?;
-    row.map(map_work_item).transpose()
+    let leased = row.map(map_work_item).transpose()?;
+    match &leased {
+        Some(wi) => {
+            tracing::info!(repo_id = %req.repo_id, worker = %req.worker_name, work_item = %wi.id, subject = %wi.subject_ref, "leased")
+        }
+        None => {
+            tracing::info!(repo_id = %req.repo_id, worker = %req.worker_name, "lease: no ready work")
+        }
+    }
+    Ok(leased)
 }
 
 /// Extend the lease on `id` if still held by `lease_owner`. Returns the new
@@ -329,29 +355,42 @@ pub async fn heartbeat(
 }
 
 /// Transition a work item to `state`. Returns whether a row was updated.
+/// Terminal states (`succeeded`, `failed`, `escalated`) are final: a work item
+/// already in one is never transitioned again (returns `false`), so a terminal
+/// item can't be resurrected back into the active/cap-counted set.
 pub async fn set_state(pool: &Pool, id: Uuid, state: State) -> Result<bool> {
     let row = sqlx::query(
-        "UPDATE work_items SET state = $2, updated_at = now() WHERE id = $1 RETURNING id",
+        "UPDATE work_items SET state = $2, updated_at = now()
+          WHERE id = $1 AND state NOT IN ('succeeded', 'failed', 'escalated')
+         RETURNING id",
     )
     .bind(id)
     .bind(state.as_str())
     .fetch_optional(pool)
     .await?;
-    Ok(row.is_some())
+    let updated = row.is_some();
+    tracing::info!(work_item = %id, to_state = state.as_str(), updated, "set_state");
+    Ok(updated)
 }
 
-/// Reclaim leases whose expiry has passed: return them to `queued`, clear the
-/// lease, and count the lapsed attempt. Returns the number reclaimed.
+/// Reclaim work items whose lease has expired: return them to `queued`, clear
+/// the lease, and count the lapsed attempt. Covers both `leased` (never started)
+/// and `running` (started then the worker crashed/hung) — both hold a cap slot,
+/// so both must be reclaimable. Returns the number reclaimed.
 pub async fn reclaim_expired(pool: &Pool) -> Result<u64> {
     let result = sqlx::query(
         "UPDATE work_items
             SET state = 'queued', lease_owner = NULL, lease_expires_at = NULL,
                 attempt_count = attempt_count + 1, updated_at = now()
-          WHERE state = 'leased' AND lease_expires_at < now()",
+          WHERE state IN ('leased', 'running') AND lease_expires_at < now()",
     )
     .execute(pool)
     .await?;
-    Ok(result.rows_affected())
+    let n = result.rows_affected();
+    if n > 0 {
+        tracing::info!(reclaimed = n, "reclaimed expired leases");
+    }
+    Ok(n)
 }
 
 /// Purge terminal work items (and their cascading children) older than the cutoff.
@@ -364,7 +403,49 @@ pub async fn purge_terminal(pool: &Pool, older_than: DateTime<Utc>) -> Result<u6
     .bind(older_than)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected())
+    let n = result.rows_affected();
+    tracing::info!(purged = n, "purged terminal work items");
+    Ok(n)
+}
+
+/// Append a row to the append-only `events` audit trail. Producers (intake,
+/// dispatcher, manager, Tools — P2+) call this to record every decision, tool
+/// call, and state transition. Returns the new event id.
+pub async fn append_event(
+    pool: &Pool,
+    repo_id: Option<Uuid>,
+    work_item_id: Option<Uuid>,
+    correlation_id: Option<Uuid>,
+    actor: &str,
+    action: &str,
+    detail: serde_json::Value,
+) -> Result<Uuid> {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO events (id, repo_id, work_item_id, correlation_id, actor, action, detail)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(id)
+    .bind(repo_id)
+    .bind(work_item_id)
+    .bind(correlation_id)
+    .bind(actor)
+    .bind(action)
+    .bind(detail)
+    .execute(pool)
+    .await?;
+    tracing::info!(actor, action, work_item = ?work_item_id, "event recorded");
+    Ok(id)
+}
+
+/// Count audit events recorded for a work item (diagnostic/test helper).
+pub async fn count_events_for_item(pool: &Pool, work_item_id: Uuid) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE work_item_id = $1")
+            .bind(work_item_id)
+            .fetch_one(pool)
+            .await?,
+    )
 }
 
 /// Count all work items belonging to a repo (diagnostic/test helper).

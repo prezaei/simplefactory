@@ -28,6 +28,8 @@ fn coder_item(repo: Uuid, subject: &str) -> NewWorkItem {
         trigger: "manager".into(),
         subject_ref: subject.into(),
         correlation_id: Uuid::now_v7(),
+        priority: 0,
+        available_at: None,
     }
 }
 
@@ -166,10 +168,10 @@ async fn reclaim_returns_expired_lease_to_queue() {
     let leased = record::lease_next(&pool, &req).await.unwrap().unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // reclaim_expired is global (the production sweeper sweeps all repos), so it
-    // reclaims at least our expired lease and may also sweep stragglers from other
-    // tests — assert our item specifically rather than the global count.
-    assert!(record::reclaim_expired(&pool).await.unwrap() >= 1);
+    // reclaim_expired is global (the sweeper sweeps all repos), and parallel
+    // reclaim tests can sweep each other's expired items — so don't assert its
+    // return count; assert OUR item is back in the queue below.
+    record::reclaim_expired(&pool).await.unwrap();
 
     // It's leasable again, and the lapsed attempt was counted.
     let released = record::lease_next(&pool, &lease_req(repo, 10, 10))
@@ -221,4 +223,149 @@ async fn purge_removes_only_old_terminal_items() {
         .unwrap()
         .expect("active item should remain");
     assert_eq!(survivor.subject_ref, "issue#2");
+}
+
+#[tokio::test]
+async fn reclaim_also_recovers_expired_running_items() {
+    // A worker that reaches `running` and then crashes must be reclaimable too —
+    // otherwise it holds a cap slot forever.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("reclaim-running"), 1)
+        .await
+        .unwrap();
+    record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap();
+    let mut req = lease_req(repo, 10, 10);
+    req.ttl_secs = 0.0;
+    let leased = record::lease_next(&pool, &req).await.unwrap().unwrap();
+    // Worker starts running, then "crashes"; lease expires.
+    assert!(record::set_state(&pool, leased.id, State::Running)
+        .await
+        .unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Global sweep (count not asserted — parallel reclaim tests share it); the
+    // re-lease below proves our running item was recovered.
+    record::reclaim_expired(&pool).await.unwrap();
+    let released = record::lease_next(&pool, &lease_req(repo, 10, 10))
+        .await
+        .unwrap()
+        .expect("running item should be reclaimed and leasable again");
+    assert_eq!(released.id, leased.id);
+    assert_eq!(released.attempt_count, 1);
+}
+
+#[tokio::test]
+async fn set_state_cannot_resurrect_a_terminal_item() {
+    // Terminal states are final: set_state on a succeeded item is a no-op, so a
+    // terminal item can't be re-activated and re-occupy a cap slot.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("terminal-guard"), 1)
+        .await
+        .unwrap();
+    let EnqueueOutcome::Inserted(id) = record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(record::set_state(&pool, id, State::Succeeded)
+        .await
+        .unwrap());
+    // Attempt to resurrect → rejected (returns false), state stays terminal.
+    assert!(!record::set_state(&pool, id, State::Running).await.unwrap());
+    assert!(!record::set_state(&pool, id, State::Queued).await.unwrap());
+    // Nothing leasable (it stayed terminal, not queued).
+    assert!(record::lease_next(&pool, &lease_req(repo, 10, 10))
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn lease_honors_priority_order() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("priority"), 1)
+        .await
+        .unwrap();
+    let mut low = coder_item(repo, "low");
+    low.priority = 0;
+    let mut high = coder_item(repo, "high");
+    high.priority = 5;
+    record::enqueue(&pool, &low).await.unwrap();
+    record::enqueue(&pool, &high).await.unwrap();
+
+    // Higher priority leases first regardless of insert order.
+    let first = record::lease_next(&pool, &lease_req(repo, 10, 10))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.subject_ref, "high");
+}
+
+#[tokio::test]
+async fn lease_respects_available_at_delayed_visibility() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("delayed"), 1)
+        .await
+        .unwrap();
+    let mut future = coder_item(repo, "later");
+    future.available_at = Some(Utc::now() + chrono::Duration::hours(1));
+    record::enqueue(&pool, &future).await.unwrap();
+
+    // Not yet visible.
+    assert!(record::lease_next(&pool, &lease_req(repo, 10, 10))
+        .await
+        .unwrap()
+        .is_none());
+
+    // An immediately-available item IS leased.
+    record::enqueue(&pool, &coder_item(repo, "now"))
+        .await
+        .unwrap();
+    let leased = record::lease_next(&pool, &lease_req(repo, 10, 10))
+        .await
+        .unwrap()
+        .expect("the available item should lease");
+    assert_eq!(leased.subject_ref, "now");
+}
+
+#[tokio::test]
+async fn append_event_writes_the_audit_trail() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("events"), 1)
+        .await
+        .unwrap();
+    let EnqueueOutcome::Inserted(id) = record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(record::count_events_for_item(&pool, id).await.unwrap(), 0);
+
+    record::append_event(
+        &pool,
+        Some(repo),
+        Some(id),
+        Some(Uuid::now_v7()),
+        "manager",
+        "assigned_coder",
+        serde_json::json!({ "worker": "bug-fixer" }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(record::count_events_for_item(&pool, id).await.unwrap(), 1);
 }

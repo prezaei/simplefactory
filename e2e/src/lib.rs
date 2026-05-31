@@ -22,16 +22,22 @@ mod acceptance {
         Some(pool)
     }
 
-    fn coder_item(repo: Uuid, subject: &str) -> record::NewWorkItem {
+    fn item_for(repo: Uuid, worker: &str, subject: &str) -> record::NewWorkItem {
         record::NewWorkItem {
             repo_id: repo,
             kind: record::Kind::Coder,
-            worker_name: "bug-fixer".into(),
+            worker_name: worker.into(),
             config_sha: "test-sha".into(),
             trigger: "manager".into(),
             subject_ref: subject.into(),
             correlation_id: Uuid::now_v7(),
+            priority: 0,
+            available_at: None,
         }
+    }
+
+    fn coder_item(repo: Uuid, subject: &str) -> record::NewWorkItem {
+        item_for(repo, "bug-fixer", subject)
     }
 
     /// A repo name unique to this invocation, so the acceptance tests are isolated
@@ -155,6 +161,59 @@ mod acceptance {
         assert!(
             record::lease_next(&pool, &req).await.unwrap().is_none(),
             "cap remains enforced"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_cap_never_exceeded_across_workers() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-global-cap"), 1)
+            .await
+            .unwrap();
+        const GLOBAL: i64 = 4;
+        // Two worker pools with plenty of items each; per-worker cap is high so
+        // ONLY the global ceiling can bind.
+        for w in ["coder-a", "coder-b"] {
+            for i in 0..20 {
+                record::enqueue(&pool, &item_for(repo, w, &format!("{w}#{i}")))
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for w in ["coder-a", "coder-b"] {
+            for n in 0..4 {
+                let pool = pool.clone();
+                set.spawn(async move {
+                    let mut leased = 0usize;
+                    loop {
+                        let req = record::LeaseRequest {
+                            repo_id: repo,
+                            worker_name: w.into(),
+                            lease_owner: format!("{w}-{n}"),
+                            ttl_secs: 60.0,
+                            per_worker_cap: 1000,
+                            global_cap: GLOBAL,
+                        };
+                        match record::lease_next(&pool, &req).await.unwrap() {
+                            Some(_) => leased += 1,
+                            None => break,
+                        }
+                    }
+                    leased
+                });
+            }
+        }
+        let mut total = 0usize;
+        while let Some(res) = set.join_next().await {
+            total += res.unwrap();
+        }
+        assert_eq!(
+            total, GLOBAL as usize,
+            "the global ceiling binds across all worker pools"
         );
     }
 

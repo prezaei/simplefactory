@@ -50,6 +50,14 @@ CREATE UNIQUE INDEX work_items_active_uniq ON work_items (repo_id, subject_ref, 
 CREATE INDEX work_items_pickup ON work_items (repo_id, worker_name, priority DESC, available_at)
     WHERE state = 'queued';
 
+-- Sweeper: find expired leases fast (reclaim_expired filters lease_expires_at + leased/running).
+CREATE INDEX work_items_lease_expiry ON work_items (lease_expires_at)
+    WHERE state IN ('leased', 'running');
+
+-- Retention: find old terminal rows fast (purge_terminal filters updated_at + terminal state).
+CREATE INDEX work_items_terminal_purge ON work_items (updated_at)
+    WHERE state IN ('succeeded', 'failed', 'escalated');
+
 CREATE TABLE attempts (
     id               uuid PRIMARY KEY,
     work_item_id     uuid NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
