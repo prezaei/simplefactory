@@ -23,7 +23,7 @@
 | **P0 Foundations** | Workspace, CI, local stack, cross-cutting libs | `cargo fmt/clippy/test` green in CI; `docker-compose up` brings up Postgres + Azurite; telemetry + config libs usable |
 | **P1 Record book + queue** | Durable state, leasing, caps, idempotency | Concurrency tests prove no-double-starts + cap-never-exceeded |
 | **P2 GitHub + Intake** | Events in, opt-in gating | A labelled issue creates exactly one `work_item`; webhook dedupe verified |
-| **P3 Vertical slice (Coder→CR)** | First end-to-end run | A real labelled issue yields a real change request, locally |
+| **P3 Vertical slice (Coder→CR)** | First Coder→CR run (integration proof) | An injected coder work item yields a real change request, locally (labelled-issue→Coder needs P4) |
 | **P4 Coordinator + Reviewer** | Full decide/delegate/review loop | issue → code → review → human-merge handoff works; loop cap + escalation enforced |
 | **P5 Resilience** | Crash-resume, sweeper, bounds, config pinning | Kill a worker mid-run → it resumes the same session; all bounds tested |
 | **P6 Dashboard** | Live read-only view | SSE stream reflects state within seconds |
@@ -38,7 +38,7 @@
 **Tasks**
 - Cargo workspace scaffold: `services/*` (bins) + `libs/*` (crates), shared workspace deps (tokio, axum, sqlx, anyhow/thiserror, opentelemetry).
 - `libs/telemetry`: OpenTelemetry setup (traces/metrics/logs), `correlation_id` propagation helpers, OTLP exporter (Azure Monitor in prod, console/collector locally).
-- `libs/config`: parse + validate `.factory/config.yml` (serde-yaml) → typed model; validation rules (roles, cron, positive caps, `instructions_file` resolvable); prompt-layering resolver (role default → repo-wide → per-worker).
+- `libs/config`: parse + validate `.factory/config.yml` (serde-yaml) → typed model; validation rules (roles, cron, positive caps, `instructions_file` resolvable, and **no non-manager worker subscribed to `issue_labeled`** — manager-first, see P2); prompt-layering resolver (role default → repo-wide → per-worker).
 - `docker-compose.yml`: Postgres 16 + Azurite (Blob emulator); `.env` wiring; gitignore `.ship-it/` and local state.
 - GitHub Actions CI: `cargo fmt --check && cargo clippy -- -D warnings && cargo test` + build images; integration-test job spins up the compose services.
 - `migrations/` directory wired to `sqlx migrate` + the CI migration gate.
@@ -54,7 +54,7 @@
 **Tasks**
 - Migrations for all tables: `repos`, `work_items`, `attempts`, `issues`, `change_requests`, `escalations`, `events`, `webhook_deliveries` (UUIDv7 PKs, text+CHECK enums, `config_sha` pin).
 - Indexes: `work_items_active_uniq` (partial unique, idempotent enqueue), `work_items_pickup` (partial, by `worker_name`).
-- `record` API: enqueue (idempotent), atomic lease (`FOR UPDATE SKIP LOCKED`), capacity check serialized via `pg_advisory_xact_lock` on `(repo_id, worker_name)` + global ceiling, state transitions, `events` append (audit), retention purge.
+- `record` API: enqueue (idempotent), atomic lease (`FOR UPDATE SKIP LOCKED`), capacity check serialized via `pg_advisory_xact_lock` — keyed on `(repo_id, worker_name)` for the per-worker cap and on a coarser `repo_id` key (or a `SERIALIZABLE` txn) for the global ceiling, since a per-pool lock alone does not serialize the global count — state transitions, `events` append (audit), retention purge.
 - Lease lifecycle: lease/extend(heartbeat)/expire helpers.
 
 **Tests (the load-bearing ones):**
@@ -72,6 +72,7 @@
 **Tasks**
 - `libs/github` (octocrab): App auth, mint short-lived **installation tokens**, webhook **HMAC verification**, typed events (issue labelled, CR opened/updated, review, **issue_comment**), Checks/PR read APIs.
 - `services/intake` (Axum): verify signature → dedupe on delivery id → filter by opt-in `label` → enqueue `work_item` (pinning current `config_sha`). Fast 2xx; all work async off the queue.
+- **Enqueue policy — manager-first.** On `issue_labeled`, Intake enqueues a single **Manager** work item; coders/reviewers/testers are woken downstream by the Manager (`manager` trigger) or by their own CR/comment triggers — never by `issue_labeled` directly. (This resolves the spec's config-vs-worked-example ambiguity; P0 config validation enforces it.)
 - `services/intake` scheduler loop: read each repo's config timers, advisory-lock the tick, enqueue due `schedule` work.
 - **blocked→queued transition:** an `issue_comment` on a tracked blocked item flips it to `queued` (`available_at=now()`).
 
@@ -80,7 +81,7 @@
 
 ## P3 — Vertical slice: Dispatcher + Worker + minimal Tools (Coder → CR)
 
-**Goal:** the first real end-to-end run, locally. Crude but real.
+**Goal:** the first real Coder→CR run, locally — proving the worker / dispatcher / Tools / Claude-Code integration. Crude but real. (Full end-to-end *from a labelled issue* arrives in P4, once the Manager exists.)
 
 **Tasks**
 - `services/tools` (MCP server, HTTP/SSE) — **minimal surface:** `get_task`, `read_issue`, `open_or_update_change_request`, `post_comment`, `append_transcript`, `record_outcome`, `heartbeat`. Per-task token auth; every call → `events`.
@@ -89,7 +90,7 @@
 - `libs/blob` (+ Azurite): transcript append.
 
 **Tests:** worker harness drives a stub MCP through a clone→edit→CR sequence; idempotent CR (re-run updates same CR); Tools token scoping (a token can't touch another task).
-**Exit (the milestone moment):** label a real issue in a test repo → a Coder runs → a real change request appears, with tests, locally. **Depends on:** P2.
+**Exit (the milestone moment):** a hand-injected coder work item drives a real Coder run — fresh clone → Claude Code → tests + code → a real change request — locally (this is exactly the seam P3's own test uses). Driving it from a *labelled issue* needs the Manager and lands in P4. **Depends on:** P2.
 
 ## P4 — Coordinator + Reviewer (full loop)
 
@@ -97,11 +98,11 @@
 
 **Tasks**
 - `services/coordinator` (Manager): react to completions → assign Coder, wake Reviewer on new CR, hand approved+green CR to a human, close the loop, or escalate. Per-issue decisions serialized by an issue row-lock; enqueue next-steps idempotently.
-- Reviewer flow: event-driven on `cr_opened`; `submit_review` tool (with `dedupe_key`); `get_check_status`.
+- Reviewer flow: event-driven on `cr_opened`; Tools added here — `read_change_request` (diff + threads), `submit_review` (with `dedupe_key`), `get_check_status`.
 - **Bounded loops:** `loop_count` increments on changes-requested rework; escalate at cap.
 - **Escalation:** `escalate` tool (with `dedupe_key`) → comment + assign issue + `escalations` row; the single human channel.
 
-**Tests:** full happy path (issue→code→review→ready-for-human-merge); changes-requested loop increments and caps; **exactly-once** escalation under re-dispatch; reviewer verdict idempotent.
+**Tests:** full happy path (issue→code→review→ready-for-human-merge); changes-requested loop increments and caps; **exactly-once** escalation under re-dispatch; reviewer verdict idempotent; **a change that weakens/disables its own gating checks is rejected → escalated, never marked ready** (PROD "can't weaken its own checks").
 **Exit:** end-to-end issue→merge-handoff works locally for the worked example. **Depends on:** P3.
 
 ## P5 — Resilience (crash-resume, sweeper, bounds, config pinning)
@@ -141,7 +142,7 @@
 - CD: GitHub Actions → ACR → Container Apps; the single-runner migration step before rollout.
 
 **Tests:** smoke-test the full loop in dev Azure; deploy/rollback (redeploy prior revision) drill; expand/contract migration applied with old+new replicas coexisting.
-**Exit:** a labelled issue in a real connected repo runs end-to-end on Azure dev. **Depends on:** P3 (minimum) for a meaningful deploy; ideally P6.
+**Exit:** a labelled issue in a real connected repo runs end-to-end on Azure dev. **Depends on:** P4 (the full loop the smoke test exercises); ideally P5–P6 for a production-honest deploy. (A thin P3-only slice can be deployed earlier to validate the Azure plumbing, but that is not the full-loop exit above.)
 
 ---
 
