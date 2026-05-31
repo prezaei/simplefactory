@@ -5,8 +5,7 @@
 **PR**: #{{PR_NUMBER}} | **Branch**: {{BRANCH}} -> {{BASE_BRANCH}}
 **Repo**: {{REPO}} | **Max rounds**: {{MAX_ROUNDS}}
 **Required checks**: {{REQUIRED_CHECKS}} (JSON array — see Case B below for behavior when empty)
-**Require Copilot review on HEAD**: {{REQUIRE_COPILOT_REVIEW}} (true/false — filled by pre-flight from `state.require_copilot_review_on_head`; when true, see Step 3d and Step 4 Gate 5)
-**Copilot reviewer login**: {{COPILOT_REVIEWER_LOGIN}} (the reviewer whose review on the exact HEAD is required when the gate is true; null when the gate is off)
+**Copilot available**: {{COPILOT_AVAILABLE}} (true/false — filled by pre-flight from `state.copilot_available`; when true the Copilot-on-HEAD gate applies, see Step 3d and Step 4 Gate 5; when false the gate is skipped). Reviewer login for the `reviews` API check is the fixed `copilot-pull-request-reviewer[bot]`. GOTCHA: Copilot's inline review **comments** appear under login `"Copilot"` (not the bot slug) in the REST comments API.
 **GHE hostname**: {{GHE_HOSTNAME}} (null for github.com; sub-agents should read `ghe_hostname` from state.json and pass `--hostname <value>` on every `gh api` call when non-null)
 **State file**: `.ship-it/pr-{{PR_NUMBER}}/state.json`
 
@@ -103,7 +102,15 @@ FIRST: git fetch origin {{BRANCH}} && git checkout {{BRANCH}} && git pull && git
 
 Run these commands:
   gh pr view {{PR_NUMBER}} --json reviews,comments,reviewDecision
-  gh api repos/{{REPO}}/pulls/{{PR_NUMBER}}/comments
+  gh api --paginate repos/{{REPO}}/pulls/{{PR_NUMBER}}/comments
+
+CRITICAL — PAGINATE: the REST review-comments endpoint returns at most 30 comments per page. ALWAYS pass `--paginate` so you fetch ALL comments — a single unpaginated page silently drops comments past the first 30 and has caused a real miss (an untriaged Copilot comment left open at merge). This applies to every comment author, not just Copilot.
+
+CRITICAL — COPILOT LOGIN: in the REST comments API, Copilot's inline review comments appear under author login "Copilot" (NOT the bot slug `copilot-pull-request-reviewer[bot]`, which is only the login on the reviews API). When detecting/triaging Copilot comments, match login "Copilot". Do NOT rely on the bot slug for comments.
+
+ALSO check review-thread resolution so no unresolved thread is left open at merge (GraphQL — the REST comments API does not expose resolution state):
+  gh api graphql -f query='query { repository(owner:\"<owner>\", name:\"<repo>\") { pullRequest(number: {{PR_NUMBER}}) { reviewThreads(first: 100) { nodes { isResolved comments(first: 1) { nodes { databaseId author { login } } } } } } }'
+Treat any thread with isResolved == false (especially one authored by "Copilot" or a human reviewer) as an unaddressed item — its root comment id should be surfaced as a NEW/untriaged comment so the decision gate routes it to triage. A still-open thread must NOT be merged over.
 
 (Note: if the repo is on GitHub Enterprise rather than github.com, add `--hostname <ghe-host>` to every `gh api` call.)
 
@@ -111,8 +118,8 @@ Read the state file at .ship-it/pr-{{PR_NUMBER}}/state.json and extract the tria
 
 For each comment, capture: id, author login, author_association (MEMBER, COLLABORATOR, CONTRIBUTOR, NONE, or bot), body, path (file), line, created_at, in_reply_to_id.
 
-Identify NEW comments: those whose id is NOT in triaged_comment_ids.
-Bot detection: if author login contains [bot] or author_association is 'NONE' and the account name suggests automation (github-actions, copilot, dependabot, etc.), mark as bot.
+Identify NEW comments: those whose id is NOT in triaged_comment_ids. Also surface the root comment of any UNRESOLVED review thread (from the GraphQL query) that is not already triaged.
+Bot detection: if author login contains [bot] or author_association is 'NONE' and the account name suggests automation (github-actions, copilot, dependabot, etc.), mark as bot. The Copilot reviewer's comments use login "Copilot" — mark these as bot.
 
 Report as JSON:
 {
@@ -136,11 +143,11 @@ Once both agents complete, evaluate results. Take the **FIRST matching** action:
 | 2 | `mergeable == CONFLICTING` AND no new comments | Go to **Step 3c: Rebase onto base** |
 | 3 | CI has failures AND no new comments | Go to **Step 3a: Fix CI** |
 | 4 | `mergeable == UNKNOWN` AND no new comments | Log "Iteration {{N}}: mergeability still computing." Update state, exit. |
-| 5 | CI green AND `mergeable == MERGEABLE` AND no new comments AND ( `{{REQUIRE_COPILOT_REVIEW}}` is false OR the Copilot-on-HEAD check passes — see Step 3d ) | Go to **Step 4: Merge** |
-| 5b | `{{REQUIRE_COPILOT_REVIEW}}` is true AND CI green AND `mergeable == MERGEABLE` AND no new comments AND the Copilot-on-HEAD check does NOT yet pass | Go to **Step 3d: Wait for Copilot review** |
+| 5 | CI green AND `mergeable == MERGEABLE` AND no new comments AND ( `{{COPILOT_AVAILABLE}}` is false OR the Copilot-on-HEAD check passes — see Step 3d ) | Go to **Step 4: Merge** |
+| 5b | `{{COPILOT_AVAILABLE}}` is true AND CI green AND `mergeable == MERGEABLE` AND no new comments AND the Copilot-on-HEAD check does NOT yet pass | Go to **Step 3d: Wait for Copilot review** |
 | 6 | CI pending AND `mergeable == MERGEABLE` AND no new comments | Log "Iteration {{N}}: CI still running, no new comments." Update state, exit. |
 
-**Comments always take priority.** Reviewers post at any time — addressing feedback promptly shows respect for their time and prevents comment pile-up across iterations. Note that even when the Copilot-review gate is enabled, NEW comments (including any from the Copilot review itself) are still triaged first via row 1 before any merge is considered.
+**Comments always take priority.** Reviewers post at any time — addressing feedback promptly shows respect for their time and prevents comment pile-up across iterations. Note that even when the Copilot gate applies (`{{COPILOT_AVAILABLE}}` is true), NEW comments (including any from the Copilot review itself, under login "Copilot") and any unresolved review thread are still triaged first via row 1 before any merge is considered.
 
 **`CHANGES_REQUESTED` does NOT block merge.** If all reviewer comments have been triaged (addressed, rejected with rationale, or skipped), the PR is merge-ready regardless of `reviewDecision`. Reviewers often don't re-review promptly, and waiting burns iterations for no reason. The `--admin` merge flag bypasses this GitHub status. The real gate is: have we seen and addressed every comment?
 
@@ -407,23 +414,23 @@ Do NOT spam the user with noise from mechanical conflicts — those were resolve
 
 ## Step 3d: Wait for Copilot review
 
-**Only reached when `{{REQUIRE_COPILOT_REVIEW}}` is true.** When the gate is false this step is dead and never routed to.
+**Only reached when `{{COPILOT_AVAILABLE}}` is true.** When Copilot is unavailable (`false`) this step is dead and never routed to — behavior is exactly as before the Copilot gate existed.
 
-The Copilot-review gate requires a review by `{{COPILOT_REVIEWER_LOGIN}}` whose `commit_id` equals the EXACT current PR head SHA. A review on a superseded commit does NOT count — when the caller pushes a fix, HEAD moves and the gate naturally resets to the new HEAD.
+The Copilot gate requires a review by `copilot-pull-request-reviewer[bot]` (the fixed reviews-API login) whose `commit_id` equals the EXACT current PR head SHA. A review on a superseded commit does NOT count — when the caller pushes a fix, HEAD moves and the gate naturally resets to the new HEAD.
 
 Run the exact-login / current-HEAD check:
 
 ```bash
 HEAD=$(gh pr view {{PR_NUMBER}} --json headRefOid -q .headRefOid)
 gh api [--hostname <host>] repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
-  --jq "[.[] | select(.user.login==\"{{COPILOT_REVIEWER_LOGIN}}\" and .commit_id==\"$HEAD\")] | length"   # must be >= 1
+  --jq "[.[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\")] | length"   # must be >= 1
 ```
 
 (Add `--hostname` from `state.ghe_hostname` when non-null, per the convention used elsewhere.)
 
-- **If the count is >= 1**: a qualifying review exists for the current HEAD. The review's inline comments will surface as NEW comments via Step 1 / Agent B and get triaged through row 1 of the decision gate (the existing comment-triage machinery). Once all of them are triaged, the next iteration routes to Step 4 (row 5). Do not merge from this step.
+- **If the count is >= 1**: a qualifying review exists for the current HEAD. The review's inline comments will surface as NEW comments via Step 1 / Agent B (remember: those comments carry login "Copilot", and Agent B paginates with `--paginate` + checks unresolved threads) and get triaged through row 1 of the decision gate (the existing comment-triage machinery). Once all of them are triaged and no Copilot thread is left unresolved, the next iteration routes to Step 4 (row 5). Do not merge from this step.
 - **If the count is 0**: the reviewer has not yet reviewed the current HEAD. Then:
-  1. Log: `"waiting for {{COPILOT_REVIEWER_LOGIN}} review on <HEAD>"` (substitute the actual HEAD SHA).
+  1. Log: `"waiting for copilot-pull-request-reviewer[bot] review on <HEAD>"` (substitute the actual HEAD SHA).
   2. **Re-request the reviewer** if EITHER (a) it has been ~2 iterations since the review was requested with no qualifying review, OR (b) the reviewer has dropped from the PR's requested-reviewers list:
      ```bash
      # Check whether the reviewer is still in the requested list:
@@ -431,7 +438,7 @@ gh api [--hostname <host>] repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
      # If absent (or the ~2-iteration threshold is hit), re-request:
      gh api [--hostname <host>] --method POST \
        repos/{{REPO}}/pulls/{{PR_NUMBER}}/requested_reviewers \
-       -f "reviewers[]={{COPILOT_REVIEWER_LOGIN}}"
+       -f "reviewers[]=copilot-pull-request-reviewer[bot]"
      ```
      A pushed fix (HEAD moved) also warrants a re-request, since the prior review no longer applies to the new HEAD.
   3. Append an iteration record with `action: "waiting_copilot_review"` and the HEAD SHA in `details`. Update state, **exit the iteration** — the cron retries next cycle.
@@ -440,7 +447,7 @@ gh api [--hostname <host>] repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
 
 ## Step 4: Merge
 
-**All gates must pass. If ANY gate fails, exit iteration — next cron fire retries.** Gates 1–4 always apply; Gate 5 applies ONLY when `{{REQUIRE_COPILOT_REVIEW}}` is true (when false it is skipped entirely and behavior is unchanged).
+**All gates must pass. If ANY gate fails, exit iteration — next cron fire retries.** Gates 1–4 always apply; Gate 5 applies ONLY when `{{COPILOT_AVAILABLE}}` is true (when false — Copilot not installed/assignable on this repo — it is skipped entirely and behavior is unchanged).
 
 ### Gate 1 — CI green FOR THE HEAD COMMIT
 
@@ -501,24 +508,24 @@ Verify that every comment ID from the PR is present in `triaged_comment_ids`. If
 gh pr view {{PR_NUMBER}} --json state,mergeable
 ```
 
-### Gate 5 — Copilot review on the EXACT current HEAD (only when `{{REQUIRE_COPILOT_REVIEW}}` is true)
+### Gate 5 — Copilot review on the EXACT current HEAD (only when `{{COPILOT_AVAILABLE}}` is true)
 
-**Skip this gate entirely when `{{REQUIRE_COPILOT_REVIEW}}` is false — Step 4 then behaves exactly as before.**
+**Skip this gate entirely when `{{COPILOT_AVAILABLE}}` is false (Copilot not installed/assignable on this repo) — Step 4 then behaves exactly as before.**
 
 When true, run the exact-login / current-HEAD assertion and ABORT the merge (exit iteration) if it returns 0:
 
 ```bash
 HEAD=$(gh pr view {{PR_NUMBER}} --json headRefOid -q .headRefOid)
 COUNT=$(gh api [--hostname <host>] repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
-  --jq "[.[] | select(.user.login==\"{{COPILOT_REVIEWER_LOGIN}}\" and .commit_id==\"$HEAD\")] | length")
+  --jq "[.[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\")] | length")
 # COUNT must be >= 1. If 0, the reviewer has not reviewed the current HEAD —
-# go to Step 3d (log "waiting for {{COPILOT_REVIEWER_LOGIN}} review on $HEAD", re-request per the rule),
+# go to Step 3d (log "waiting for copilot-pull-request-reviewer[bot] review on $HEAD", re-request per the rule),
 # update state, and EXIT the iteration. Do NOT merge.
 ```
 
 (Add `--hostname` from `state.ghe_hostname` when non-null.)
 
-Additionally, every NEW inline comment from that HEAD review must already be triaged (its id present in `triaged_comment_ids`). Gate 2 (fresh comment re-check) already enforces this — any untriaged comment, including one from the Copilot review, routes back to Step 3b. If any comment from the qualifying review is untriaged, do NOT merge; triage it first. A review on a SUPERSEDED commit does not satisfy this gate; a pushed fix resets it to the new HEAD.
+Additionally, every NEW inline comment from that HEAD review must already be triaged (its id present in `triaged_comment_ids`) AND no Copilot review thread may be left unresolved. Gate 2 (fresh comment re-check) enforces this — but ONLY if it paginated and matched the right login: re-fetch with `gh api --paginate` (comments cap at 30/page) and match Copilot comments by login "Copilot" (the reviews API uses the bot slug; the comments API uses "Copilot"). Also re-run the GraphQL `reviewThreads { isResolved }` check — any unresolved thread routes back to Step 3b. If any comment from the qualifying review is untriaged or any thread is unresolved, do NOT merge; triage it first. A review on a SUPERSEDED commit does not satisfy this gate; a pushed fix resets it to the new HEAD.
 
 ### Execute Merge
 
