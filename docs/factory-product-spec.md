@@ -45,7 +45,7 @@ You've connected your repo and you want a bug fixed. You don't open a console or
    - **Approves**, and once the repo's own automated checks are green → Factory marks the change ready and **hands it to a human to merge**. Factory never merges on its own — a person performs the final merge, keeping the one irreversible step under human control.
 8. **The Manager closes the loop** — comments the outcome and closes the issue.
 
-Throughout, you can watch every step on the dashboard — which worker is doing what, the live play-by-play, the change request, the review — and you can comment, redirect, or stop it at any time. At most you wrote an issue and clicked merge; Factory did the rest.
+Throughout, you can watch every step on the dashboard — which worker is doing what, the live play-by-play, the change request, the review — and you can leave a comment or edit the issue or change request to steer it. At most you wrote an issue and clicked merge; Factory did the rest.
 
 ## What a good version must satisfy (the requirements)
 
@@ -56,8 +56,8 @@ These are the requirements a good version must satisfy — the qualities to hit,
 - **Nothing is lost.** Every task, and every action a worker takes, is written down durably the instant it happens, in one authoritative place. A full restart of the system picks up from those records.
 - **A crash never loses work — it resumes the same session.** The worker *is* an AI coding assistant, so its session — conversation/context, working tree, in-flight tool calls, and any human inputs along the way — is checkpointed continuously and durably. When a worker or the coordinator stops for *any* reason (graceful pause, crash, or full restart), Factory resumes that *same* session from its last checkpoint rather than starting fresh. **Bounded:** repeated resumes that keep failing at the same point fall through, after a few, to a fresh attempt or escalation, so a deterministic crash can't resume-loop forever. **Fallback:** if the session state itself can't be recovered, Factory runs a *fresh* attempt of the same task — which, being safe to redo, reuses the same change request and comments instead of duplicating them.
 - **Safe to redo.** Because the fallback re-runs a task from scratch, a worker must be able to repeat a task without making a mess: if last time it already opened a change request or left a comment, the redo updates the *same* one instead of creating duplicates.
-- **Bounded effort, then a human.** Work is retried only a few times; if it still can't be done — or needs a human decision (a conflict, a judgment call) — the system stops and escalates with context, never looping forever or silently giving up.
-- **Bounded loops, not just bounded retries.** A single issue can cycle through the review-and-rework loop (Coder → Reviewer → Coder…) only a capped number of times; when that cap is hit, the system escalates to a human rather than reworking forever. Retries bound a *failing* attempt; this bounds *successful* attempts that keep cycling.
+- **Bounded effort, then a human.** Work is retried only a few times; if it still can't be done — or needs a human decision (a conflict, a judgment call) — the system stops and escalates with context, never looping forever or silently giving up. An escalation is delivered where a human already looks — a comment on, and assignment of, the issue or change request — not left silently on a dashboard.
+- **Bounded loops, not just bounded retries.** A single issue can cycle through the review-and-rework loop (Coder → Reviewer → Coder…) only a capped number of times; when that cap is hit, the system escalates to a human rather than reworking forever. Retries bound a *failing* attempt; this bounds *successful* attempts that keep cycling. What counts toward the cap is each completed Coder→Reviewer rework cycle; time spent waiting on the reviewer's verdict does not (the same carve-out as *Needs human input*).
 - **Needs human input → ask, don't block.** A worker never waits interactively for an answer (there is no live chat with a worker) or holds its slot while idle. On low-stakes, reversible ambiguity it makes a reasonable best-effort call and records the assumption on the change request so a human can correct it in review. On a high-stakes or irreversible choice it instead writes a clear question with context onto the issue or change request, records a distinct *blocked: waiting on a human* state (not failed, not done), and ends the attempt, freeing its slot. The human answers asynchronously by commenting or editing; that reply is itself an event that resumes the worker's session (with the same resume-and-fallback rules as a crash). Time spent blocked on a human does **not** count against the retry or per-issue loop caps, so a slow reply never causes the work to be abandoned.
 - **Stuck workers are caught.** A worker that hangs or goes quiet is detected and cleaned up automatically, so it can't occupy a slot forever.
 - **Capped and scalable.** Many repositories and many workers run at once. Capacity is capped — globally and per repository-and-worker-type — so the system never runs more than its configured limits, and it scales by adding machines rather than being rewritten.
@@ -66,11 +66,11 @@ These are the requirements a good version must satisfy — the qualities to hit,
 - **Workers genuinely good at coding.** The hard requirement is competence at real coding tasks — exploring an unfamiliar codebase, making correct changes, and writing real tests — not merely producing plausible-looking diffs.
 - **Records don't pile up forever.** Everything Factory keeps — summaries, logs, finished tasks, and each run's detailed play-by-play — is held in Factory's own storage for a bounded time and then aged out, so storage stays under control.
 
-**Staying in control (a human is always above the machine)**
+**Staying in control (work proceeds only as a human permits)**
 
 - **Opt-in only** (as described above): it acts only on work explicitly handed to it.
-- **Least privilege.** Each worker can touch only its one repository, with credentials that are short-lived and revoked when its task ends (or when a stuck worker is reclaimed). For the first version, builds need the open internet (to fetch packages), so a worker's outbound network is *not* otherwise locked down. Factory makes a best effort to keep secrets out of what it records, but can't guarantee it — so treat anyone allowed to view a run's records as able to see whatever they captured.
-- **Confidential by default.** The code Factory works on, and the records Factory keeps — including each run's detailed play-by-play — are treated as confidential: shown only to the people allowed in, never used to train models, and purged on the retention schedule above.
+- **Least privilege.** Each worker can touch only its one repository, with credentials that are short-lived and revoked when its task ends (or when a stuck worker is reclaimed). For the first version, builds need the open internet (to fetch packages), so a worker's outbound network is *not* otherwise locked down. Factory makes a best effort to keep secrets out of what it records, but can't guarantee it — so treat anyone allowed to view a run's records as able to see whatever they captured. A worker also may not weaken or disable the automated checks that gate its own work; altering those checks is itself escalated to a human.
+- **Confidential by default.** The code Factory works on, and the records Factory keeps — including each run's detailed play-by-play — are treated as confidential: shown only to the people allowed in, never used to train models, and purged after the bounded retention period above.
 
 **Being transparent**
 
@@ -97,7 +97,7 @@ The flow, rendered inline:
 
 ```mermaid
 flowchart LR
-    T["Triggers<br/>tickets · timers · manager"] --> I["Intake / Matcher"]
+    T["Triggers<br/>tickets · timers · manager"] --> I["Intake<br/>opt-in label filter"]
     I --> Q[("To-Do List<br/>durable queue")]
     Q --> D["Dispatcher<br/>capacity caps"]
     D --> A
