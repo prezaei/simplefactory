@@ -5,10 +5,32 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lib]
+name = "factory_dispatcher"
+path = "src/lib.rs"
+
 [[bin]]
 name = "factory-dispatcher"
 path = "src/main.rs"
 
 [dependencies]
+factory-record.workspace = true
+factory-config.workspace = true
+factory-github.workspace = true
 factory-telemetry.workspace = true
+tokio = { workspace = true, features = ["process"] }
 tracing.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+factory-record.workspace = true
+factory-config.workspace = true
+factory-github.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true

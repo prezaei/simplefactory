@@ -32,7 +32,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Database + async (wired in P1)
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 serde_json = "1"
@@ -46,6 +46,12 @@ subtle = "2"
 cron = "0.16"
 tower = { version = "0.5", features = ["util"] }
 
+# Outbound GitHub + worker/tools HTTP + async traits (P3). octocrab's defaults are
+# rustls-based (no OpenSSL) and include built-in GitHub App / installation-token auth.
+octocrab = "0.51"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+async-trait = "0.1"
+
 # Reserved for later phases (declared for intent; only fetched once a crate uses them):
 # octocrab + jsonwebtoken (P3 GitHub App auth / installation tokens / Checks-PR API),
 # azure_storage_blobs (P3 blob), opentelemetry + opentelemetry-otlp (P7 telemetry export).
@@ -57,3 +63,5 @@ factory-record = { path = "libs/record" }
 factory-github = { path = "libs/github" }
 factory-blob = { path = "libs/blob" }
 factory-intake = { path = "services/intake" }
+factory-tools = { path = "services/tools" }
+factory-dispatcher = { path = "services/dispatcher" }

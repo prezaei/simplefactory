@@ -87,16 +87,21 @@
 
 **Goal:** the first real Coder→CR run, locally — proving the worker / dispatcher / Tools / Claude-Code integration. Crude but real. (Full end-to-end *from a labelled issue* arrives in P4, once the Manager exists.)
 
-**Tasks**
-- `libs/github` (**outbound**, carried from P2): octocrab App auth, short-lived **installation-token** minting, **Checks/PR read APIs**. First real consumers are the worker (clone token) and Tools (posting to GitHub); needs the dev App's private key to test against GitHub.
-- **Config-auto-reload-on-push** (carried from P2): on a push touching `.factory/config.yml`, fetch the file content via the installation token and call the existing `apply_config`. (Detection + validate/store already exist; this wires the authenticated fetch.)
-- `services/tools` (MCP server, HTTP/SSE) — **minimal surface:** `get_task`, `read_issue`, `open_or_update_change_request`, `post_comment`, `append_transcript`, `record_outcome`, `heartbeat`. Per-task token auth; every call → `events`.
-- `services/dispatcher`: lease → launch a worker (local Docker container in dev) with the per-task token + Tools URL.
-- `services/worker` harness: mint installation token → **fresh shallow clone** → launch **Claude Code headless** with the composed prompt + Factory MCP configured → on finish, `open_or_update_change_request` (idempotent) + `record_outcome`; push branch via `--force-with-lease`.
-- `libs/blob` (+ Azurite): transcript append.
+**Approach (local-first):** every external system the slice touches — GitHub's API, a git clone, the `claude` subprocess, the worker container launch, Blob — is behind a **trait seam** with a deterministic fake, so the whole slice is built and tested locally against real Postgres without live credentials. The matching real implementations are the **deploy-time seams** (they need a live GitHub App key / Docker / the `claude` binary, so they can't run in CI) and are clearly isolated.
 
-**Tests:** worker harness drives a stub MCP through a clone→edit→CR sequence; idempotent CR (re-run updates same CR); Tools token scoping (a token can't touch another task).
-**Exit (the milestone moment):** a hand-injected coder work item drives a real Coder run — fresh clone → Claude Code → tests + code → a real change request — locally (this is exactly the seam P3's own test uses). Driving it from a *labelled issue* needs the Manager and lands in P4. **Depends on:** P2.
+**Tasks**
+- `libs/github` (**outbound**, carried from P2): `GitHubClient` trait + types + `FakeGitHub` (deterministic double, tested). *(Done.)* Real `OctocrabGitHub` wired against octocrab 0.51 — **7 of 8 methods** (installation token, read issue/CR, open/update CR idempotent-by-branch, comment, review, get file); `check_status` stays `unwired` pending an octocrab 0.51 `combined_status_for_ref` limitation (can't pass a raw commit SHA). Live calls need the App private key, so the network path is verified at deploy, not in CI. 
+- **Config-auto-reload-on-push** (carried from P2): `apply_config_from_push` fetches `.factory/config.yml` via `GitHubClient.get_file` on a push that touches it and calls the existing `apply_config`; wired into the intake webhook handler. Tested with `FakeGitHub` (apply / ignore-unrelated / reject-invalid-keep-last-good). *(Done.)*
+- `services/tools` (the worker's only channel): Axum server, **per-task bearer-token auth** (sha-256-hashed tokens, scoped to one work item/repo/role, TTL), the full tool surface (`get_task`, `read_issue`, `read_change_request`, `open_or_update_change_request`, `post_comment`, `submit_review`, `get_check_status`, `append_transcript`, `record_outcome`, `heartbeat`, `escalate`), **every call → `events` audit** (single choke point), and idempotency for CR / comment / review / escalate (`dedupe_key`); tokens revoked on task completion. *(Done; 16 REST + 10 MCP integration tests.)* A real **MCP JSON-RPC 2.0 server at `POST /mcp`** (`initialize` / `tools/list` / `tools/call`) sits over the same audited tool dispatch — what a live Claude Code connects to. *(Done; tested.)*
+- `services/dispatcher`: `dispatch_once` walks configured repos, leases under per-worker + global caps, mints a per-task token, starts an attempt, and launches a worker via a `WorkerLauncher` seam (`FakeLauncher` tested; `DockerLauncher` = deploy seam, secrets via env). *(Done; 3 integration tests incl. cap binding + token scoping.)*
+- `services/worker` harness: `run_task` orchestrates get_task → shallow clone → Claude Code → push branch → `open_or_update_change_request` (idempotent) → `record_outcome`, all over `ToolsClient` / `Workspace` / `ClaudeRunner` seams (fakes tested; `HttpTools`/`GitCli`/`ClaudeCli` = deploy seams). *(Done; pure tests: full sequence, idempotent re-run, failure path.)*
+- `libs/blob`: `TranscriptStore` trait + `InMemoryTranscripts` (tested) + `FsTranscripts` (local parity). *(Done.)* Azure Blob / Azurite is the P7 swap.
+
+**Tests:** worker harness drives the fakes through a clone→edit→CR sequence; idempotent CR (re-run updates same CR); Tools token scoping (an invalid token is rejected; a token acts only on its own task); dispatcher caps bind; config-on-push apply/ignore/reject. *(All implemented and green against Postgres.)*
+The real subprocess seams are implemented too: `GitCli` (shallow clone + `--force-with-lease` push, token-in-URL), `ClaudeCli` (runs `claude` headless with the Factory MCP server at `{tools_url}/mcp` + bearer), `DockerLauncher` (`docker run` with secrets via env) — each with pure-helper unit tests (URL/arg/MCP-config construction); only their actual subprocess execution needs git/claude/docker present.
+
+**Tests:** worker harness drives the fakes through clone→edit→CR; idempotent CR; **`HttpTools` ↔ Tools router over the wire** (real reqwest against a live `build_router`); MCP `initialize`/`tools/list`/`tools/call`; token scoping + revoke-on-completion; dispatcher caps bind; config-on-push apply/ignore/reject; **P3 acceptance E2E** (`p3_coder_work_item_drives_a_change_request`). *(All green against Postgres.)*
+**Exit (the milestone moment):** a hand-injected coder work item drives a Coder run — clone → Claude Code → CR — locally. The orchestration, the Tools MCP server, and the real GitHub/git/claude/docker impls are all built and tested to the limit of what runs without live credentials; the only remaining step is executing against a real GitHub App + `claude` binary + Docker. Driving it from a *labelled issue* needs the Manager and lands in P4. **Depends on:** P2. ✅ **met (live execution needs real creds/binaries).**
 
 ## P4 — Coordinator + Reviewer (full loop)
 
@@ -119,6 +124,7 @@
 - Continuous **checkpoint** of Claude Code session + worktree → Blob (short interval + tool boundaries); `attempts.session_id`/`checkpoint_uri`.
 - **Resume:** on lease expiry, restore worktree + `claude --resume`; bounded resume count → fresh attempt/escalation.
 - `services/coordinator` **lease sweeper:** reclaim expired leases, mark attempt failed/reclaimed, revoke token.
+- **Worker heartbeat loop:** the worker's *periodic* heartbeat (a ~60s loop that calls the Tools `heartbeat` endpoint to extend its 15-min lease for the whole run) lands here, alongside crash-resume and the sweeper — it is the liveness signal the sweeper trusts. P3 already ships the `heartbeat` Tools endpoint and emits a single heartbeat; that one beat is correct within the 15-min lease window, but keeping a long run alive needs this loop, which is why it is a P5 resilience task.
 - Retry bounds (`attempt_count`), per-attempt wall-clock cap.
 - **config_sha pinning** honored: in-flight attempts use pinned config; removed workers finish then stop.
 

@@ -5,10 +5,39 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lib]
+name = "factory_tools"
+path = "src/lib.rs"
+
 [[bin]]
 name = "factory-tools"
 path = "src/main.rs"
 
 [dependencies]
+factory-record.workspace = true
+factory-config.workspace = true
+factory-github.workspace = true
+factory-blob.workspace = true
 factory-telemetry.workspace = true
+axum.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+factory-record.workspace = true
+factory-github.workspace = true
+factory-blob.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tower.workspace = true
+sqlx.workspace = true
+reqwest.workspace = true

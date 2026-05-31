@@ -126,49 +126,18 @@ async fn process(
                 enqueued_or_ignored(n)
             }
         }
-        WebhookEvent::CrOpened { number, .. } => {
-            cr_enqueue(
-                pool,
-                rc.id,
-                &config,
-                &config_sha,
-                Trigger::CrOpened,
-                *number,
-            )
-            .await?
-        }
-        WebhookEvent::CrUpdated { number, .. } => {
-            cr_enqueue(
-                pool,
-                rc.id,
-                &config,
-                &config_sha,
-                Trigger::CrUpdated,
-                *number,
-            )
-            .await?
-        }
-        WebhookEvent::CrChangesRequested { number, .. } => {
-            cr_enqueue(
-                pool,
-                rc.id,
-                &config,
-                &config_sha,
-                Trigger::CrChangesRequested,
-                *number,
-            )
-            .await?
-        }
-        WebhookEvent::ReviewRequested { number, .. } => {
-            cr_enqueue(
-                pool,
-                rc.id,
-                &config,
-                &config_sha,
-                Trigger::ReviewRequested,
-                *number,
-            )
-            .await?
+        // CR-keyed triggers: same shape, differing only in the Trigger variant.
+        WebhookEvent::CrOpened { number, .. }
+        | WebhookEvent::CrUpdated { number, .. }
+        | WebhookEvent::CrChangesRequested { number, .. }
+        | WebhookEvent::ReviewRequested { number, .. } => {
+            let trigger = match event {
+                WebhookEvent::CrOpened { .. } => Trigger::CrOpened,
+                WebhookEvent::CrUpdated { .. } => Trigger::CrUpdated,
+                WebhookEvent::CrChangesRequested { .. } => Trigger::CrChangesRequested,
+                _ => Trigger::ReviewRequested,
+            };
+            cr_enqueue(pool, rc.id, &config, &config_sha, trigger, *number).await?
         }
         WebhookEvent::IssueComment { subject, .. } => {
             // A human reply resumes any blocked work on this subject.
@@ -216,6 +185,64 @@ pub async fn apply_config(
             Ok(ApplyOutcome::RejectedKeptLastGood)
         }
     }
+}
+
+/// Path of the per-repo config file Factory reloads on push.
+const CONFIG_PATH: &str = ".factory/config.yml";
+
+/// React to a push: if it touched `.factory/config.yml`, fetch the file at the
+/// pushed head and (re)apply it. Returns `Ok(None)` when there's nothing to do
+/// (push didn't touch the config, the repo isn't connected, or the file vanished)
+/// and `Ok(Some(outcome))` when [`apply_config`] ran. Fail-safe: an invalid
+/// config is rejected and the last good config stays in effect (see
+/// [`apply_config`]).
+pub async fn apply_config_from_push(
+    pool: &Pool,
+    gh: &dyn factory_github::GitHubClient,
+    repo: &RepoRef,
+    head_sha: &str,
+    touched_paths: &[String],
+) -> anyhow::Result<Option<ApplyOutcome>> {
+    if !touched_paths.iter().any(|p| p == CONFIG_PATH) {
+        tracing::info!(
+            owner = %repo.owner,
+            repo = %repo.name,
+            head_sha,
+            "push did not touch config; nothing to reload"
+        );
+        return Ok(None);
+    }
+
+    let Some(rc) = record::repo_by_name(pool, &repo.owner, &repo.name).await? else {
+        tracing::info!(
+            owner = %repo.owner,
+            repo = %repo.name,
+            head_sha,
+            "config push for unconnected repo; ignoring"
+        );
+        return Ok(None);
+    };
+
+    let Some(yaml) = gh.get_file(repo, CONFIG_PATH, head_sha).await? else {
+        tracing::info!(
+            owner = %repo.owner,
+            repo = %repo.name,
+            head_sha,
+            "config push but file is absent at head; nothing to apply"
+        );
+        return Ok(None);
+    };
+
+    let outcome = apply_config(pool, rc.id, &yaml, head_sha).await?;
+    tracing::info!(
+        owner = %repo.owner,
+        repo = %repo.name,
+        repo_id = %rc.id,
+        head_sha,
+        ?outcome,
+        "reloaded config from push"
+    );
+    Ok(Some(outcome))
 }
 
 /// How far back the scheduler scans for a due tick when a `(repo, worker)` has
