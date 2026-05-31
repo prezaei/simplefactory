@@ -95,6 +95,11 @@ impl TranscriptStore for FsTranscripts {
             .open(&path)
             .await?;
         f.write_all(chunk.as_bytes()).await?;
+        // `tokio::fs::File` buffers writes and does NOT guarantee a flush on drop, so
+        // dropping `f` here (without this) can lose the just-written chunk — a later
+        // append/read then sees a truncated transcript (a lost append). Flush explicitly
+        // so the bytes reach the file before the handle is dropped.
+        f.flush().await?;
         Ok(())
     }
 
@@ -124,9 +129,14 @@ mod tests {
     #[tokio::test]
     async fn fs_appends_accumulate_and_reject_traversal() {
         let dir = std::env::temp_dir().join(format!("factory-blob-test-{}", std::process::id()));
+        // Start from a clean dir so a stale `a/b.log` left by a prior run (e.g. a reused
+        // PID) can't make the appends accumulate onto old content.
+        let _ = tokio::fs::remove_dir_all(&dir).await;
         let store = FsTranscripts::new(&dir);
         store.append("a/b.log", "one\n").await.unwrap();
         store.append("a/b.log", "two\n").await.unwrap();
+        // Two sequential appends must accumulate; this is the regression guard for the
+        // missing-flush bug (a dropped buffered write would yield only "one\n").
         assert_eq!(store.read("a/b.log").await.unwrap(), "one\ntwo\n");
         assert!(store.append("../escape", "x").await.is_err());
         let _ = tokio::fs::remove_dir_all(&dir).await;
