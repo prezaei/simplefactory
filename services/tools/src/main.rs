@@ -93,6 +93,14 @@ impl factory_github::GitHubClient for UnconfiguredGitHub {
     ) -> anyhow::Result<i64> {
         Err(no_creds("post_comment"))
     }
+    async fn update_comment(
+        &self,
+        _repo: &factory_github::RepoRef,
+        _comment_id: i64,
+        _body: &str,
+    ) -> anyhow::Result<()> {
+        Err(no_creds("update_comment"))
+    }
     async fn submit_review(
         &self,
         _repo: &factory_github::RepoRef,

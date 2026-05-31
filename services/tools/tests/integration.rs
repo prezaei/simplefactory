@@ -409,9 +409,11 @@ async fn escalate_is_idempotent_and_escalates_the_item() {
     };
     let fx = fixture_with(&pool, "issue#13", FakeGitHub::new()).await;
 
+    // A terminal reason so the item ends up escalated (FIX 3 maps needs-human-input
+    // reasons to blocked; this test asserts the terminal path).
     let args = json!({
-        "reason": "needs_decision",
-        "context": "Which database should we use?",
+        "reason": "conflict",
+        "context": "Merge conflict needs a human",
         "dedupe_key": "db-choice",
     });
     let (s1, b1) = http_call(fx.state.clone(), &fx.raw_token, "escalate", args.clone()).await;
@@ -432,7 +434,7 @@ async fn escalate_is_idempotent_and_escalates_the_item() {
     // Exactly ONE human-facing comment posted (the question).
     assert_eq!(count_calls(&fx.gh, "post_comment"), 1);
 
-    // The work item is escalated.
+    // The work item is escalated (terminal reason).
     let item = record::work_item_by_id(&pool, fx.work_item_id)
         .await
         .unwrap()
@@ -939,4 +941,354 @@ async fn invalid_verdict_is_400_bad_request() {
     );
     // No review was submitted.
     assert_eq!(count_calls(&fx.gh, "submit_review"), 0);
+}
+
+// ===========================================================================
+// FIX 1 — poison-pending recovery. A side effect that FAILS after winning the
+// idempotency claim must release the placeholder so the NEXT retry re-claims and
+// succeeds — at-most-once AND eventually-once. Without FIX 1(a)/(b) the first
+// failure wedges every retry as Pending (500) forever and the comment/escalation
+// can never be made.
+// ===========================================================================
+
+#[tokio::test]
+async fn idempotency_recovers_after_side_effect_failure() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    // Arm the FakeGitHub so the FIRST post_comment fails once, then succeeds.
+    let fx = fixture_with(
+        &pool,
+        "issue#301",
+        FakeGitHub::new().with_fail_next("post_comment"),
+    )
+    .await;
+
+    let args = json!({ "target": "issue#301", "body": "hello", "dedupe_key": "greet" });
+
+    // First call: the claim is won, the GitHub side effect fails → 500, and the
+    // placeholder is released.
+    let (s1, _) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "post_comment",
+        args.clone(),
+    )
+    .await;
+    assert_eq!(
+        s1,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the failed side effect surfaces as 500"
+    );
+    // No successful post recorded by the fake yet.
+    assert_eq!(count_calls(&fx.gh, "post_comment"), 0);
+
+    // Second call with the SAME dedupe_key: re-claims immediately (placeholder was
+    // released), posts successfully, and records the real result.
+    let (s2, b2) = http_call(fx.state.clone(), &fx.raw_token, "post_comment", args).await;
+    assert_eq!(s2, StatusCode::OK, "retry succeeds");
+    let comment_id = b2["comment_id"].as_i64().expect("comment_id");
+
+    // EXACTLY ONE successful post overall, and the idempotency row now holds the real
+    // (non-null) result.
+    assert_eq!(
+        count_calls(&fx.gh, "post_comment"),
+        1,
+        "exactly one successful post after failure + retry"
+    );
+    let stored: Value = sqlx::query_scalar(
+        "SELECT result FROM tool_idempotency
+          WHERE work_item_id = $1 AND scope = 'comment' AND dedupe_key = 'greet'",
+    )
+    .bind(fx.work_item_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored["comment_id"].as_i64(),
+        Some(comment_id),
+        "the idempotency row holds the real comment result, not the placeholder"
+    );
+}
+
+#[tokio::test]
+async fn escalate_recovers_after_side_effect_failure() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    // escalate's "side effect" runs under a won idempotency claim; if it fails before
+    // idempotency_complete, the wrapper releases the placeholder so the next retry
+    // re-claims and succeeds. We simulate a winner that crashed after claiming (the
+    // poison-pending case) by manually claiming the escalate slot and then releasing
+    // it via the same path the tool takes on failure, then assert a real escalate
+    // succeeds and produces EXACTLY ONE escalation row (eventually-once liveness).
+    let fx = fixture_with(&pool, "issue#302", FakeGitHub::new()).await;
+    let key = "esc";
+
+    // A prior attempt won the claim then died before completing (poison placeholder).
+    let claim = record::idempotency_claim(&pool, fx.work_item_id, "escalate", key)
+        .await
+        .unwrap();
+    assert_eq!(
+        claim,
+        record::IdempotencyClaim::Won,
+        "first claim wins the placeholder"
+    );
+    // Its side effect failed: it releases the placeholder (FIX 1a/b) instead of
+    // leaving it to poison every retry.
+    record::idempotency_release(&pool, fx.work_item_id, "escalate", key)
+        .await
+        .unwrap();
+
+    // The retry through the real tool re-claims immediately and succeeds.
+    let (s, b) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "escalate",
+        json!({ "reason": "needs_decision", "context": "which db?", "dedupe_key": key }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "retry after release succeeds");
+    assert!(b["escalation_id"].is_string());
+
+    // EXACTLY ONE escalation row overall — the failed attempt created none, the retry
+    // created exactly one.
+    assert_eq!(
+        record::count_escalations_for_item(&pool, fx.work_item_id)
+            .await
+            .unwrap(),
+        1,
+        "exactly one escalation row after failed-then-succeeded escalate"
+    );
+
+    // And the slot now holds the real (non-null) result.
+    let stored: Value = sqlx::query_scalar(
+        "SELECT result FROM tool_idempotency
+          WHERE work_item_id = $1 AND scope = 'escalate' AND dedupe_key = $2",
+    )
+    .bind(fx.work_item_id)
+    .bind(key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !stored.is_null() && stored["escalation_id"].is_string(),
+        "the escalate slot holds the real result, not the placeholder"
+    );
+}
+
+// ===========================================================================
+// FIX 4 — post_comment with a dedupe_key UPDATES the same comment on re-run with a
+// DIFFERENT body (create once, update on the re-run; never a second create).
+// ===========================================================================
+
+#[tokio::test]
+async fn post_comment_updates_same_comment_on_rerun() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#303", FakeGitHub::new()).await;
+
+    let (s1, b1) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "post_comment",
+        json!({ "target": "issue#303", "body": "first body", "dedupe_key": "k" }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+
+    // Re-run with the SAME dedupe_key but a DIFFERENT body.
+    let (s2, b2) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "post_comment",
+        json!({ "target": "issue#303", "body": "second body", "dedupe_key": "k" }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+
+    // Same (stable) comment id both times.
+    assert_eq!(b1["comment_id"], b2["comment_id"]);
+
+    // EXACTLY ONE create and EXACTLY ONE update — the re-run updated, not created.
+    assert_eq!(
+        count_calls(&fx.gh, "post_comment"),
+        1,
+        "exactly one create_comment"
+    );
+    assert_eq!(
+        count_calls(&fx.gh, "update_comment"),
+        1,
+        "the re-run updated the same comment"
+    );
+}
+
+// ===========================================================================
+// FIX 3 — escalate maps reason to resumable (blocked) vs terminal (escalated).
+// ===========================================================================
+
+#[tokio::test]
+async fn escalate_blocked_input_is_resumable_and_terminal_reasons_escalate() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+
+    // blocked_input → Blocked, and a human reply (requeue_blocked) re-queues it.
+    let fx = fixture_with(&pool, "issue#304", FakeGitHub::new()).await;
+    let (s, b) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "escalate",
+        json!({ "reason": "blocked_input", "context": "need an API key", "dedupe_key": "b" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["state"], "blocked");
+
+    let item = record::work_item_by_id(&pool, fx.work_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.state, State::Blocked, "blocked_input parks at blocked");
+
+    // A human reply re-queues exactly this blocked item.
+    let requeued = record::requeue_blocked(&pool, item.repo_id, "issue#304")
+        .await
+        .unwrap();
+    assert_eq!(requeued, 1, "the blocked item is re-queued on a reply");
+    let item = record::work_item_by_id(&pool, fx.work_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.state, State::Queued, "re-queued back to queued");
+
+    // retries_exhausted → Escalated (terminal), not re-queued by requeue_blocked.
+    let fx2 = fixture_with(&pool, "issue#305", FakeGitHub::new()).await;
+    let (s2, b2) = http_call(
+        fx2.state.clone(),
+        &fx2.raw_token,
+        "escalate",
+        json!({ "reason": "retries_exhausted", "context": "gave up", "dedupe_key": "r" }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(b2["state"], "escalated");
+    let item2 = record::work_item_by_id(&pool, fx2.work_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        item2.state,
+        State::Escalated,
+        "retries_exhausted is terminal"
+    );
+    // requeue_blocked never touches a terminal (escalated) item.
+    let requeued2 = record::requeue_blocked(&pool, item2.repo_id, "issue#305")
+        .await
+        .unwrap();
+    assert_eq!(requeued2, 0, "escalated items are not re-queued");
+}
+
+// ===========================================================================
+// FIX 5 — variants through entry points: submit_review request_changes & comment;
+// post_comment to a cr#N target; concurrent submit_review dedupe (exactly one).
+// ===========================================================================
+
+#[tokio::test]
+async fn submit_review_request_changes_and_comment_through_dispatch() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+
+    // request_changes
+    let fx = fixture_with(&pool, "cr#401", FakeGitHub::new()).await;
+    let (s, _) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "submit_review",
+        json!({ "cr_number": 401, "verdict": "request_changes", "body": "please fix" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        count_calls(&fx.gh, "submit_review cr#401 request_changes"),
+        1
+    );
+
+    // comment
+    let fx2 = fixture_with(&pool, "cr#402", FakeGitHub::new()).await;
+    let (s2, _) = http_call(
+        fx2.state.clone(),
+        &fx2.raw_token,
+        "submit_review",
+        json!({ "cr_number": 402, "verdict": "comment", "body": "a note" }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(count_calls(&fx2.gh, "submit_review cr#402 comment"), 1);
+}
+
+#[tokio::test]
+async fn post_comment_to_change_request_target_through_dispatch() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "cr#403", FakeGitHub::new()).await;
+
+    // A cr#N target drives CommentTarget::ChangeRequest through dispatch.
+    let (s, _) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "post_comment",
+        json!({ "target": "cr#403", "body": "on the change request" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        count_calls(&fx.gh, "post_comment ChangeRequest(403)"),
+        1,
+        "the comment targeted the change request"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_submit_review_with_key_submits_exactly_once() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "cr#404", FakeGitHub::new()).await;
+
+    // Concurrent submit_review with the SAME dedupe_key: exactly one review under
+    // concurrency (winner submits; losers return the stored result or retry).
+    let mut handles = Vec::new();
+    for _ in 0..6 {
+        let state = fx.state.clone();
+        let token = fx.raw_token.clone();
+        handles.push(tokio::spawn(async move {
+            http_call(
+                state,
+                &token,
+                "submit_review",
+                json!({ "cr_number": 404, "verdict": "approve", "body": "LGTM", "dedupe_key": "once" }),
+            )
+            .await
+        }));
+    }
+    for h in handles {
+        let _ = h.await.unwrap();
+    }
+
+    assert_eq!(
+        count_calls(&fx.gh, "submit_review"),
+        1,
+        "exactly one review submitted despite concurrent calls"
+    );
 }

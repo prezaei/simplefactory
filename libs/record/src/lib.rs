@@ -932,14 +932,26 @@ pub enum IdempotencyClaim {
     Done(serde_json::Value),
 }
 
+/// How long a claim placeholder may sit unfinished before it is considered
+/// abandoned and may be re-claimed. Matches the 15-minute lease/attempt window: a
+/// claim older than this can only belong to a process that crashed (or whose side
+/// effect hung past its own lease), so re-claiming it restores liveness without
+/// risking a second side effect from a still-live winner.
+const CLAIM_STALE_SECS: f64 = 900.0;
+
 /// Claim a tool-idempotency slot, the first step of the claim-first pattern.
 ///
 /// Atomically inserts a placeholder row (`result = 'null'::jsonb`) for
 /// `(work_item, scope, dedupe_key)`:
 /// - if the insert wins, the caller owns the side effect → [`IdempotencyClaim::Won`];
-/// - otherwise the existing row is read back: a JSON-null result means the winner's
-///   side effect is still in flight → [`IdempotencyClaim::Pending`]; a non-null
-///   result is the recorded outcome → [`IdempotencyClaim::Done`].
+/// - otherwise the existing row is read back: a non-null result is the recorded
+///   outcome → [`IdempotencyClaim::Done`]; a JSON-null result means a placeholder is
+///   still present. A *fresh* placeholder means the winner's side effect is still in
+///   flight → [`IdempotencyClaim::Pending`]; a *stale* one (older than
+///   [`CLAIM_STALE_SECS`]) belongs to a winner that died before completing or
+///   releasing it, so it is atomically re-claimed → [`IdempotencyClaim::Won`]. This
+///   stale-reclaim is what restores liveness: without it a crashed winner would
+///   wedge every retry as `Pending` forever.
 pub async fn idempotency_claim(
     pool: &Pool,
     work_item_id: Uuid,
@@ -975,13 +987,63 @@ pub async fn idempotency_claim(
     .fetch_one(pool)
     .await?;
 
-    if stored.is_null() {
+    if !stored.is_null() {
+        tracing::info!(%work_item_id, scope, dedupe_key, "idempotency: claim already done");
+        return Ok(IdempotencyClaim::Done(stored));
+    }
+
+    // A placeholder is present. If it is stale (the winner crashed before completing
+    // or releasing it), atomically re-claim it by stamping `created_at = now()`. The
+    // `created_at < now() - interval` guard in the UPDATE makes the reclaim a no-op
+    // for any caller that loses the race, so exactly one re-claimer wins.
+    let reclaimed = sqlx::query_scalar::<_, i32>(
+        "UPDATE tool_idempotency SET created_at = now()
+          WHERE work_item_id = $1 AND scope = $2 AND dedupe_key = $3
+            AND result = 'null'::jsonb
+            AND created_at < now() - make_interval(secs => $4)
+         RETURNING 1",
+    )
+    .bind(work_item_id)
+    .bind(scope)
+    .bind(dedupe_key)
+    .bind(CLAIM_STALE_SECS)
+    .fetch_optional(pool)
+    .await?;
+
+    if reclaimed.is_some() {
+        tracing::info!(%work_item_id, scope, dedupe_key, "idempotency: re-claimed abandoned placeholder");
+        Ok(IdempotencyClaim::Won)
+    } else {
+        // Either the placeholder is still fresh (winner's side effect in flight), or
+        // another caller just re-claimed the stale one. Both mean: back off and retry.
         tracing::info!(%work_item_id, scope, dedupe_key, "idempotency: claim pending (side effect in flight)");
         Ok(IdempotencyClaim::Pending)
-    } else {
-        tracing::info!(%work_item_id, scope, dedupe_key, "idempotency: claim already done");
-        Ok(IdempotencyClaim::Done(stored))
     }
+}
+
+/// Release a claim previously won via [`idempotency_claim`] when the side effect
+/// FAILED before [`idempotency_complete`] could record its result. Deletes the row
+/// ONLY while it is still the placeholder (`result = 'null'::jsonb`), so a completed
+/// result is never destroyed. After release the next retry re-claims immediately
+/// rather than waiting out the stale window.
+pub async fn idempotency_release(
+    pool: &Pool,
+    work_item_id: Uuid,
+    scope: &str,
+    dedupe_key: &str,
+) -> Result<()> {
+    let result = sqlx::query(
+        "DELETE FROM tool_idempotency
+          WHERE work_item_id = $1 AND scope = $2 AND dedupe_key = $3
+            AND result = 'null'::jsonb",
+    )
+    .bind(work_item_id)
+    .bind(scope)
+    .bind(dedupe_key)
+    .execute(pool)
+    .await?;
+    tracing::info!(%work_item_id, scope, dedupe_key, released = result.rows_affected(), "idempotency: released placeholder");
+    Ok(())
 }
 
 /// Record the side-effect result for a slot previously won via [`idempotency_claim`],

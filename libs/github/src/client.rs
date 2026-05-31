@@ -139,6 +139,15 @@ pub trait GitHubClient: Send + Sync {
         body: &str,
     ) -> anyhow::Result<i64>;
 
+    /// Update an existing comment's body (used by `post_comment`'s idempotent re-run:
+    /// the same dedupe_key updates the same comment rather than creating a new one).
+    async fn update_comment(
+        &self,
+        repo: &RepoRef,
+        comment_id: i64,
+        body: &str,
+    ) -> anyhow::Result<()>;
+
     /// Submit a review verdict on a change request. Returns the review id.
     async fn submit_review(
         &self,
@@ -180,6 +189,9 @@ struct FakeState {
     next_review: i64,
     /// Recorded mutating calls, for assertions.
     pub_calls: Vec<String>,
+    /// One-shot failure injection: a method name whose NEXT call returns an error
+    /// once (then clears), used to exercise the side-effect-failure recovery paths.
+    fail_next: Option<String>,
 }
 
 /// In-memory [`GitHubClient`] for tests. Records mutating calls and serves seeded
@@ -235,6 +247,25 @@ impl FakeGitHub {
     /// The mutating calls recorded so far (for assertions).
     pub fn calls(&self) -> Vec<String> {
         self.state.lock().unwrap().pub_calls.clone()
+    }
+
+    /// Arm a one-shot failure: the NEXT call to `method` (e.g. `"post_comment"` or
+    /// `"submit_review"`) returns `Err` once, then subsequent calls succeed. Used to
+    /// reproduce a side effect that fails after the idempotency claim is won.
+    pub fn with_fail_next(self, method: &str) -> Self {
+        self.state.lock().unwrap().fail_next = Some(method.to_owned());
+        self
+    }
+
+    /// If a one-shot failure is armed for `method`, consume it and return an error to
+    /// inject; otherwise `None`. Caller holds the state lock.
+    fn take_injected_failure(s: &mut FakeState, method: &str) -> Option<anyhow::Error> {
+        if s.fail_next.as_deref() == Some(method) {
+            s.fail_next = None;
+            Some(anyhow::anyhow!("injected {method} failure"))
+        } else {
+            None
+        }
     }
 }
 
@@ -304,10 +335,27 @@ impl GitHubClient for FakeGitHub {
         _body: &str,
     ) -> anyhow::Result<i64> {
         let mut s = self.state.lock().unwrap();
+        if let Some(e) = Self::take_injected_failure(&mut s, "post_comment") {
+            return Err(e);
+        }
         let id = s.next_comment;
         s.next_comment += 1;
         s.pub_calls.push(format!("post_comment {target:?} -> {id}"));
         Ok(id)
+    }
+
+    async fn update_comment(
+        &self,
+        _repo: &RepoRef,
+        comment_id: i64,
+        _body: &str,
+    ) -> anyhow::Result<()> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(e) = Self::take_injected_failure(&mut s, "update_comment") {
+            return Err(e);
+        }
+        s.pub_calls.push(format!("update_comment {comment_id}"));
+        Ok(())
     }
 
     async fn submit_review(
@@ -318,6 +366,9 @@ impl GitHubClient for FakeGitHub {
         _body: &str,
     ) -> anyhow::Result<i64> {
         let mut s = self.state.lock().unwrap();
+        if let Some(e) = Self::take_injected_failure(&mut s, "submit_review") {
+            return Err(e);
+        }
         let id = s.next_review;
         s.next_review += 1;
         s.pub_calls.push(format!(

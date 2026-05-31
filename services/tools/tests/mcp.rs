@@ -259,6 +259,74 @@ async fn mcp_tools_call_get_task_routes_and_audits() {
 }
 
 // ===========================================================================
+// 3b. tools/call for a MUTATING tool (record_outcome) — routes through the real
+// tool fn, mutates state, AND audits (FIX 5).
+// ===========================================================================
+
+#[tokio::test]
+async fn mcp_tools_call_record_outcome_routes_mutates_and_audits() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#70", FakeGitHub::new()).await;
+
+    let before = record::count_events_for_item(&pool, fx.work_item_id)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_call(
+        fx.state.clone(),
+        Some(&fx.raw_token),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "record_outcome",
+                "arguments": { "status": "succeeded", "summary": "done via mcp" }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["isError"], false);
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    let inner: Value = serde_json::from_str(text).expect("tool JSON result");
+    assert_eq!(inner["state"], "succeeded");
+    assert_eq!(inner["finished"], true);
+
+    // The mutating call actually moved the work item to its terminal state.
+    let item = record::work_item_by_id(&pool, fx.work_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.state, factory_record::State::Succeeded);
+
+    // Exactly one audit event for the routed call, with a tool:<name> actor.
+    let after = record::count_events_for_item(&pool, fx.work_item_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        after - before,
+        1,
+        "tools/call writes exactly one audit event"
+    );
+    let row: (String, String) = sqlx::query_as(
+        "SELECT actor, action FROM events WHERE work_item_id = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(fx.work_item_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "tool:record_outcome");
+    assert_eq!(row.1, "record_outcome");
+}
+
+// ===========================================================================
 // 4. bad / absent bearer → 401
 // ===========================================================================
 

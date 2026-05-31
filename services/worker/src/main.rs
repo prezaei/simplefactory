@@ -159,16 +159,29 @@ impl ClaudeRunner for ClaudeCli {
 /// of the way of the cloned repo's tree.
 const MCP_CONFIG_FILENAME: &str = ".factory-mcp.json";
 
-/// Write the MCP server config JSON to `path` with Unix mode 0600 (owner read/write
-/// only) so the embedded token is not world-readable. The token lives only in this
-/// file, never on the `claude` command line.
+/// Write the MCP server config JSON to `path` *atomically* with Unix mode 0600
+/// (owner read/write only) so the embedded token is never world-readable, not even
+/// for a window. The token lives only in this file, never on the `claude` command
+/// line.
+///
+/// The file is created with `create_new(true)` and `mode(0o600)` in a single
+/// `open` syscall: the permission bits are applied at creation (no readable window
+/// between create and chmod), and `create_new` fails if `path` already exists — so a
+/// pre-planted symlink cannot redirect the write to another file. This crate targets
+/// Unix.
 async fn write_mcp_config_file(path: &Path, tools_url: &str, token: &str) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
     let json = mcp_config_json(tools_url, token);
-    tokio::fs::write(path, json.as_bytes()).await?;
-    // This crate targets Linux/Unix; restrict the file to the owner.
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    tracing::info!(path = %path.display(), "ClaudeCli: wrote MCP config (mode 0600)");
+    let mut f = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .await?;
+    f.write_all(json.as_bytes()).await?;
+    f.sync_all().await?;
+    tracing::info!(path = %path.display(), "ClaudeCli: wrote MCP config (atomic create, mode 0600)");
     Ok(())
 }
 
@@ -246,6 +259,61 @@ mod tests {
     use super::*;
 
     const TOKEN: &str = "ghs_secrettoken";
+
+    #[tokio::test]
+    async fn write_mcp_config_file_creates_0600_with_token_contents() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("factory-mcp-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join(MCP_CONFIG_FILENAME);
+
+        write_mcp_config_file(&path, "https://tools.factory.test", TOKEN)
+            .await
+            .unwrap();
+
+        // The file exists with mode 0600 (owner read/write only).
+        let meta = tokio::fs::metadata(&path).await.unwrap();
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "config file is owner-only"
+        );
+        // Its contents are the MCP config carrying the token in the Authorization header.
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            contents,
+            mcp_config_json("https://tools.factory.test", TOKEN)
+        );
+        assert!(contents.contains(&format!("Bearer {TOKEN}")));
+
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    async fn write_mcp_config_file_refuses_to_clobber_a_pre_existing_path() {
+        // create_new(true) means a pre-planted file (or symlink) at the path is a hard
+        // error rather than a silent overwrite — closing the symlink-redirect window.
+        let dir = std::env::temp_dir().join(format!("factory-mcp-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join(MCP_CONFIG_FILENAME);
+        tokio::fs::write(&path, "pre-existing").await.unwrap();
+
+        let err = write_mcp_config_file(&path, "https://tools.factory.test", TOKEN)
+            .await
+            .expect_err("must refuse to clobber an existing path");
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::AlreadyExists),
+            "create_new rejects a pre-existing path"
+        );
+        // The original file is untouched (the write never happened).
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "pre-existing"
+        );
+
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
 
     #[test]
     fn authed_url_injects_token_into_https() {

@@ -201,6 +201,22 @@ impl GitHubClient for OctocrabGitHub {
         Ok(comment.id.0 as i64)
     }
 
+    async fn update_comment(
+        &self,
+        repo: &RepoRef,
+        comment_id: i64,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        tracing::info!(owner = %repo.owner, name = %repo.name, comment_id, "updating comment");
+        self.installation(repo.installation_id)
+            .await?
+            .issues(&repo.owner, &repo.name)
+            .update_comment(octocrab::models::CommentId(comment_id as u64), body)
+            .await
+            .map_err(|e| anyhow::anyhow!("updating comment {comment_id}: {e}"))?;
+        Ok(())
+    }
+
     async fn submit_review(
         &self,
         repo: &RepoRef,

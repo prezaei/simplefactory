@@ -387,7 +387,16 @@ pub async fn post_comment(
 
     match record::idempotency_claim(&state.pool, auth.work_item_id, "comment", key).await? {
         IdempotencyClaim::Done(v) => {
-            tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "post_comment: deduped (no-op)");
+            // Spec: a re-run with the same dedupe_key UPDATES the same comment rather
+            // than suppressing the new body. Parse the stored comment id and update it
+            // in place; return the original (stable) result so the comment id is
+            // unchanged across re-runs.
+            if let Some(comment_id) = v.get("comment_id").and_then(Value::as_i64) {
+                state.gh.update_comment(&repo, comment_id, body).await?;
+                tracing::info!(work_item = %auth.work_item_id, comment_id, "post_comment: updated existing comment on re-run");
+            } else {
+                tracing::warn!(work_item = %auth.work_item_id, dedupe_key = key, "post_comment: stored result has no comment_id; cannot update");
+            }
             Ok(v)
         }
         IdempotencyClaim::Pending => {
@@ -397,7 +406,15 @@ pub async fn post_comment(
             )))
         }
         IdempotencyClaim::Won => {
-            let comment_id = state.gh.post_comment(&repo, comment_target, body).await?;
+            let comment_id = match state.gh.post_comment(&repo, comment_target, body).await {
+                Ok(id) => id,
+                Err(e) => {
+                    // The side effect failed: release the claim so the next retry can
+                    // re-claim immediately rather than waiting out the stale window.
+                    release_claim(state, auth, "comment", key).await;
+                    return Err(ToolError::Internal(e));
+                }
+            };
             let result = json!({ "comment_id": comment_id });
             record::idempotency_complete(&state.pool, auth.work_item_id, "comment", key, &result)
                 .await?;
@@ -445,10 +462,19 @@ pub async fn submit_review(
             )))
         }
         IdempotencyClaim::Won => {
-            let review_id = state
+            let review_id = match state
                 .gh
                 .submit_review(&repo, cr_number, verdict, body)
-                .await?;
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    // Side effect failed: release the claim so the next retry re-claims
+                    // immediately rather than waiting out the stale window.
+                    release_claim(state, auth, "review", key).await;
+                    return Err(ToolError::Internal(e));
+                }
+            };
             let result = json!({ "review_id": review_id });
             record::idempotency_complete(&state.pool, auth.work_item_id, "review", key, &result)
                 .await?;
@@ -546,8 +572,10 @@ pub async fn heartbeat(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
 
 /// Escalate to a human — the single human channel. Idempotent per task under scope
 /// `"escalate"` via the claim-first pattern: the claim winner records the escalation,
-/// posts the question on the subject, moves the work item to `escalated`, then stores
-/// the result. Even when the caller passes NO `dedupe_key` the key defaults to a
+/// posts the question on the subject, and moves the work item to the state mapped from
+/// `reason` (resumable `blocked` for needs-human-input, terminal `escalated`
+/// otherwise), then stores the result. Even when the caller passes NO `dedupe_key`
+/// the key defaults to a
 /// per-task constant, so escalate is idempotent per work item by default — exactly one
 /// escalation row per task no matter how many concurrent or retried calls arrive.
 pub async fn escalate(
@@ -579,6 +607,33 @@ pub async fn escalate(
         IdempotencyClaim::Won => {}
     }
 
+    // The claim is won; from here any failure before idempotency_complete must
+    // release the placeholder so the next retry re-claims immediately. Run the body
+    // in a helper and release on Err.
+    match escalate_won(state, auth, reason, context).await {
+        Ok(result) => {
+            record::idempotency_complete(&state.pool, auth.work_item_id, "escalate", key, &result)
+                .await?;
+            tracing::info!(work_item = %auth.work_item_id, reason, "escalate");
+            Ok(result)
+        }
+        Err(e) => {
+            release_claim(state, auth, "escalate", key).await;
+            Err(e)
+        }
+    }
+}
+
+/// The side-effecting body of [`escalate`], run only by the claim winner. Records
+/// the escalation, posts the human-facing question (best-effort), and moves the work
+/// item to the state mapped from `reason` (resumable `blocked` vs terminal
+/// `escalated`). Any `Err` propagates so the caller releases the idempotency claim.
+async fn escalate_won(
+    state: &ToolsState,
+    auth: &TaskAuth,
+    reason: &str,
+    context: &str,
+) -> ToolResult {
     let repo = resolve_repo(state, auth).await?;
     let item = record::work_item_by_id(&state.pool, auth.work_item_id)
         .await?
@@ -602,16 +657,17 @@ pub async fn escalate(
         None
     };
 
-    let state_changed = record::set_state(&state.pool, auth.work_item_id, State::Escalated).await?;
+    // Map the reason to the work-item state: needs-human-input is resumable (blocked,
+    // re-queued on a human reply via requeue_blocked); the rest are terminal.
+    let target_state = escalation_target_state(reason);
+    let state_changed = record::set_state(&state.pool, auth.work_item_id, target_state).await?;
 
-    let result = json!({
+    Ok(json!({
         "escalation_id": escalation_id.to_string(),
         "delivered_comment_id": delivered,
+        "state": target_state.as_str(),
         "state_changed": state_changed,
-    });
-    record::idempotency_complete(&state.pool, auth.work_item_id, "escalate", key, &result).await?;
-    tracing::info!(work_item = %auth.work_item_id, reason, "escalate");
-    Ok(result)
+    }))
 }
 
 // ===========================================================================
@@ -773,6 +829,36 @@ fn parse_outcome(status: &str) -> std::result::Result<(AttemptStatus, State), To
             )))
         }
     })
+}
+
+/// Best-effort release of an idempotency claim whose side effect failed. Logs on
+/// failure but never propagates: the worst case if the release itself fails is that
+/// the placeholder waits out the stale window before the next retry re-claims it,
+/// which is still eventually-once. We never want a release failure to mask the
+/// original side-effect error.
+async fn release_claim(state: &ToolsState, auth: &TaskAuth, scope: &str, key: &str) {
+    if let Err(e) = record::idempotency_release(&state.pool, auth.work_item_id, scope, key).await {
+        tracing::warn!(
+            work_item = %auth.work_item_id,
+            scope,
+            dedupe_key = key,
+            error = %e,
+            "idempotency: release after side-effect failure failed (will wait out stale window)"
+        );
+    }
+}
+
+/// Map an escalation reason to the resulting work-item state. Needs-human-input is
+/// *resumable*: it parks the item in `blocked` so a human reply re-queues it (via
+/// `requeue_blocked`). The remaining reasons are *terminal*: the item is `escalated`
+/// and never auto-resumes.
+fn escalation_target_state(reason: &str) -> State {
+    match reason {
+        "blocked_input" | "needs_decision" => State::Blocked,
+        // "retries_exhausted" | "loop_cap" | "conflict" (and any future terminal
+        // reason already gated by validate_escalation_reason) → terminal.
+        _ => State::Escalated,
+    }
 }
 
 /// The escalation reasons the record book accepts (its CHECK constraint). Reject
