@@ -159,6 +159,12 @@ pub struct WorkItem {
     pub config_sha: String,
     pub lease_owner: Option<String>,
     pub lease_expires_at: Option<DateTime<Utc>>,
+    /// When the row last changed. For a TERMINAL item this is when it became terminal
+    /// (`record_outcome`/`set_state` stamp `updated_at = now()` on the transition) and
+    /// it is NOT touched by the coordinator's defer path (a defer does not claim the
+    /// item, so nothing writes the row). It is therefore a stable "review completed at"
+    /// anchor the coordinator's bounded-defer grace window is measured from (FIX 4).
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Parameters for a single lease attempt.
@@ -215,7 +221,13 @@ pub async fn upsert_repo(
 
 /// Enqueue a work item. Idempotent: if an active item for the same
 /// (repo, subject, kind) already exists, returns [`EnqueueOutcome::DuplicateActive`].
-pub async fn enqueue(pool: &Pool, item: &NewWorkItem) -> Result<EnqueueOutcome> {
+///
+/// Executor-generic (see [`mark_reacted`]) so the coordinator can enqueue the next
+/// step inside its per-react transaction; existing `&pool` callers are unaffected.
+pub async fn enqueue(
+    executor: impl sqlx::PgExecutor<'_>,
+    item: &NewWorkItem,
+) -> Result<EnqueueOutcome> {
     let row = sqlx::query(
         "INSERT INTO work_items
            (id, repo_id, kind, worker_name, config_sha, trigger, subject_ref, correlation_id,
@@ -236,7 +248,7 @@ pub async fn enqueue(pool: &Pool, item: &NewWorkItem) -> Result<EnqueueOutcome> 
     .bind(item.correlation_id)
     .bind(item.priority)
     .bind(item.available_at)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     let outcome = match row {
@@ -307,7 +319,7 @@ pub async fn lease_next(pool: &Pool, req: &LeaseRequest) -> Result<Option<WorkIt
            FROM next WHERE w.id = next.id
          RETURNING w.id, w.repo_id, w.kind, w.worker_name, w.trigger, w.subject_ref,
                    w.correlation_id, w.state, w.attempt_count, w.loop_count, w.config_sha,
-                   w.lease_owner, w.lease_expires_at",
+                   w.lease_owner, w.lease_expires_at, w.updated_at",
     )
     .bind(req.repo_id)
     .bind(&req.worker_name)
@@ -858,9 +870,21 @@ pub struct ChangeRequest {
     pub factory_state: String,
 }
 
-/// Idempotent-by-work-item CR row. The first call for a work item creates the row
-/// (number stays NULL until the worker opens it on GitHub); a re-dispatch returns
-/// the SAME row, so the CR is never duplicated.
+/// Idempotent-by-head-branch CR row. The CR identity is `(repo_id, head_branch)`
+/// (one CR per branch, deterministic per issue: `factory/issue-N`), NOT the work
+/// item — so the rework loop reuses the same CR row across coder work items. The
+/// first call for a branch creates the row (number stays NULL until the worker opens
+/// it on GitHub); a re-dispatch OR a later REWORK coder pushing the same branch
+/// re-points `work_item_id` to the CURRENT owning coder (preserving the CR number),
+/// so the CR is never duplicated and never collides on `UNIQUE(repo_id, number)`.
+/// `linked_issue` is preserved if the new caller does not supply one.
+///
+/// INVARIANT (see also [`change_request_for_item`]): `work_item_id` on a CR row is "the
+/// most recent coder to own the branch", re-pointed on every rework push — it is NOT a
+/// stable link to the coder that first opened the CR. This is safe because a succeeded
+/// coder is always reacted (in-tx, waking its reviewer) BEFORE any rework coder for the
+/// same issue is enqueued, so the coordinator's by-`work_item_id` CR lookup for a
+/// succeeded coder is never stranded by a later rework coder re-pointing the row.
 pub async fn upsert_change_request_for_item(
     pool: &Pool,
     repo_id: Uuid,
@@ -871,8 +895,20 @@ pub async fn upsert_change_request_for_item(
     let row = sqlx::query(
         "INSERT INTO change_requests (id, repo_id, work_item_id, head_branch, linked_issue)
          VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (work_item_id) WHERE work_item_id IS NOT NULL
-           DO UPDATE SET head_branch = EXCLUDED.head_branch, updated_at = now()
+         ON CONFLICT (repo_id, head_branch)
+           DO UPDATE SET
+             -- A late/retried coder tool call on the same deterministic branch must NOT
+             -- drag a CR that already advanced to a terminal-ish state ('ready', 'merged',
+             -- 'closed') back by stealing its `work_item_id` or bumping `updated_at`. For
+             -- those states the SET is a no-op (row still RETURNED so the contract holds);
+             -- non-terminal rows are re-pointed/refreshed as before (the rework loop).
+             work_item_id = CASE WHEN change_requests.factory_state IN ('ready', 'merged', 'closed')
+                                 THEN change_requests.work_item_id ELSE EXCLUDED.work_item_id END,
+             linked_issue = CASE WHEN change_requests.factory_state IN ('ready', 'merged', 'closed')
+                                 THEN change_requests.linked_issue
+                                 ELSE COALESCE(EXCLUDED.linked_issue, change_requests.linked_issue) END,
+             updated_at   = CASE WHEN change_requests.factory_state IN ('ready', 'merged', 'closed')
+                                 THEN change_requests.updated_at ELSE now() END
          RETURNING id, repo_id, number, head_branch, linked_issue, work_item_id, factory_state",
     )
     .bind(Uuid::now_v7())
@@ -886,16 +922,36 @@ pub async fn upsert_change_request_for_item(
 }
 
 /// Record the CR number once the worker has opened it on GitHub.
+///
+/// Setting the number never DOWNGRADES a terminal-ish CR ('ready', 'merged', 'closed')
+/// back to 'open': a late/retried coder tool call on the same deterministic branch could
+/// otherwise drag a CR that already advanced (e.g. to 'ready' after review approval) back
+/// to 'open'. Terminal-ish states are preserved; only non-terminal CRs move to 'open'.
 pub async fn set_change_request_number(pool: &Pool, cr_id: Uuid, number: i32) -> Result<()> {
-    sqlx::query("UPDATE change_requests SET number = $2, factory_state = 'open', updated_at = now() WHERE id = $1")
-        .bind(cr_id)
-        .bind(number)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE change_requests
+            SET number = $2,
+                factory_state = CASE WHEN factory_state IN ('ready', 'merged', 'closed')
+                                     THEN factory_state ELSE 'open' END,
+                updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(cr_id)
+    .bind(number)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 /// Fetch the CR row for a work item, if one exists.
+///
+/// INVARIANT: a CR row's `work_item_id` is "the most recent coder to own the branch"
+/// (the upsert re-points it on every rework push — see [`upsert_change_request_for_item`]),
+/// NOT a stable 1:1 link to one coder. The coordinator only ever looks a CR up by
+/// `work_item_id` for a SUCCEEDED coder, and a succeeded coder is always reacted (in the
+/// same tx that wakes the reviewer) BEFORE any later rework coder for the same issue is
+/// enqueued — so the succeeded coder's CR lookup can never be stranded by a subsequent
+/// rework coder having re-pointed the row.
 pub async fn change_request_for_item(
     pool: &Pool,
     work_item_id: Uuid,
@@ -1126,7 +1182,7 @@ pub async fn repo_by_id_with_config(
 pub async fn work_item_by_id(pool: &Pool, id: Uuid) -> Result<Option<WorkItem>> {
     let row = sqlx::query(
         "SELECT id, repo_id, kind, worker_name, trigger, subject_ref, correlation_id, state,
-                attempt_count, loop_count, config_sha, lease_owner, lease_expires_at
+                attempt_count, loop_count, config_sha, lease_owner, lease_expires_at, updated_at
            FROM work_items WHERE id = $1",
     )
     .bind(id)
@@ -1194,6 +1250,277 @@ pub async fn count_escalations_for_item(pool: &Pool, work_item_id: Uuid) -> Resu
     )
 }
 
+// ===========================================================================
+// P4: the Coordinator (Manager) loop — react-once, issue/CR state, rework loop,
+// exactly-once escalation.
+// ===========================================================================
+
+/// Terminal work items the coordinator has not yet reacted to (oldest first).
+pub async fn list_unreacted_terminal(pool: &Pool) -> Result<Vec<WorkItem>> {
+    let rows = sqlx::query(
+        "SELECT id, repo_id, kind, worker_name, trigger, subject_ref, correlation_id, state,
+                attempt_count, loop_count, config_sha, lease_owner, lease_expires_at, updated_at
+           FROM work_items
+          WHERE state IN ('succeeded', 'failed', 'escalated') AND NOT reacted
+          ORDER BY updated_at",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(map_work_item).collect()
+}
+
+/// Claim a terminal work item for coordination: set `reacted = true` if it wasn't
+/// already. Returns `true` for the single caller that wins (exactly-once react).
+///
+/// Executor-generic so the coordinator can run this as the claim INSIDE its
+/// per-react transaction (binding the claim and the decision writes atomically),
+/// while existing callers passing `&pool` still work (`&Pool: PgExecutor`).
+pub async fn mark_reacted(
+    executor: impl sqlx::PgExecutor<'_>,
+    work_item_id: Uuid,
+    expected_updated_at: DateTime<Utc>,
+) -> Result<bool> {
+    // Do NOT touch `updated_at`: it records when the item became TERMINAL, and both
+    // `purge_terminal` retention and the coordinator's `WorkItem.updated_at` defer-grace
+    // anchor rely on that meaning. Bumping it on the react claim would make an old
+    // terminal row look newly terminal (retained longer; stale grace window).
+    //
+    // The claim is tied to the EXACT terminal occurrence via `updated_at`: a requeue
+    // (`requeue_for_retry`) revives the row and bumps `updated_at`, so a stale snapshot
+    // listed at the old terminal time can no longer re-claim it even though `reacted`
+    // was reset to false. This closes the double-react race where two replicas list the
+    // same Failed row at T0, one requeues it (reacted=false again), and the other would
+    // otherwise re-run the failed decision on its stale snapshot.
+    let row = sqlx::query(
+        "UPDATE work_items SET reacted = true
+          WHERE id = $1 AND NOT reacted AND updated_at = $2
+         RETURNING id",
+    )
+    .bind(work_item_id)
+    .bind(expected_updated_at)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// Take the per-issue serialization lock for the lifetime of `tx`. Two coordinator
+/// replicas reacting to terminal items for the SAME issue serialize here, so the
+/// per-issue decision (enqueue next / set issue+CR state / escalate) is applied by
+/// one at a time — satisfying the spec's "per-issue decisions serialized with a row
+/// lock on the issue". The lock is a `pg_advisory_xact_lock` keyed on the
+/// `(repo_id, issue_number)` pair, released automatically when `tx` commits or rolls
+/// back.
+pub async fn issue_advisory_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo_id: Uuid,
+    issue_number: i64,
+) -> Result<()> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtext('factory:issue'), hashtext($1::text || ':' || $2::text))",
+    )
+    .bind(repo_id)
+    .bind(issue_number)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Set an issue's factory state (`open` | `in_progress` | `blocked` | `done`).
+/// Executor-generic (see [`mark_reacted`]) so it can run inside the coordinator's
+/// per-react transaction.
+pub async fn set_issue_state(
+    executor: impl sqlx::PgExecutor<'_>,
+    repo_id: Uuid,
+    number: i32,
+    state: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO issues (id, repo_id, number, factory_state) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (repo_id, number) DO UPDATE SET factory_state = EXCLUDED.factory_state, updated_at = now()",
+    )
+    .bind(Uuid::now_v7())
+    .bind(repo_id)
+    .bind(number)
+    .bind(state)
+    .execute(executor)
+    .await?;
+    tracing::info!(%repo_id, issue = number, state, "set issue state");
+    Ok(())
+}
+
+/// Set a change request's factory state. Executor-generic (see [`mark_reacted`]).
+pub async fn set_change_request_state(
+    executor: impl sqlx::PgExecutor<'_>,
+    cr_id: Uuid,
+    factory_state: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE change_requests SET factory_state = $2, updated_at = now() WHERE id = $1")
+        .bind(cr_id)
+        .bind(factory_state)
+        .execute(executor)
+        .await?;
+    tracing::info!(cr = %cr_id, factory_state, "set CR state");
+    Ok(())
+}
+
+/// Conditionally transition a CR's factory state ONLY when it is currently `from`,
+/// returning whether the transition happened. This is the exactly-once idempotency
+/// guard for the approve→ready handoff: the `WHERE factory_state = from` makes the
+/// UPDATE succeed for exactly one caller even if two reacts (or a stale reviewer
+/// race) try to advance the same CR. Executor-generic (see [`mark_reacted`]) so it
+/// runs inside the coordinator's per-react transaction.
+pub async fn set_change_request_state_if(
+    executor: impl sqlx::PgExecutor<'_>,
+    cr_id: Uuid,
+    from: &str,
+    to: &str,
+) -> Result<bool> {
+    let row = sqlx::query(
+        "UPDATE change_requests SET factory_state = $3, updated_at = now()
+          WHERE id = $1 AND factory_state = $2
+         RETURNING id",
+    )
+    .bind(cr_id)
+    .bind(from)
+    .bind(to)
+    .fetch_optional(executor)
+    .await?;
+    let did_transition = row.is_some();
+    tracing::info!(cr = %cr_id, from, to, did_transition, "set CR state (conditional)");
+    Ok(did_transition)
+}
+
+/// Conditionally set a CR's factory state ONLY when it is not in a terminal-ish
+/// state (`ready`/`merged`/`closed`), returning whether the write happened. This
+/// closes the TOCTOU in the review-verdict path: a late or duplicate verdict must
+/// never drag a CR the coordinator has already advanced (e.g. `approved → ready`)
+/// back to `approved`/`changes_requested`. A single atomic UPDATE guarded by
+/// `factory_state NOT IN (...)` replaces a read-then-write, so a racing coordinator
+/// transition in the window between the read and the write can no longer be
+/// clobbered. Executor-generic (see [`mark_reacted`]).
+pub async fn set_change_request_state_if_not_terminal(
+    executor: impl sqlx::PgExecutor<'_>,
+    cr_id: Uuid,
+    to: &str,
+) -> Result<bool> {
+    let row = sqlx::query(
+        "UPDATE change_requests SET factory_state = $2, updated_at = now()
+          WHERE id = $1 AND factory_state NOT IN ('ready', 'merged', 'closed')
+         RETURNING id",
+    )
+    .bind(cr_id)
+    .bind(to)
+    .fetch_optional(executor)
+    .await?;
+    let wrote = row.is_some();
+    tracing::info!(cr = %cr_id, to, wrote, "set CR state (if not terminal)");
+    Ok(wrote)
+}
+
+/// Re-queue a work item for a fresh retry attempt: transition it back to `queued`,
+/// make it immediately available, bump `attempt_count`, clear any lease, and reset
+/// `reacted` so a SUBSEQUENT terminal occurrence of this same row is reacted to
+/// again (the coordinator already reacted to THIS terminal occurrence; the retry is
+/// a new active row-state). Executor-generic (see [`mark_reacted`]) so the
+/// coordinator runs it INSIDE its per-react transaction.
+pub async fn requeue_for_retry(
+    executor: impl sqlx::PgExecutor<'_>,
+    work_item_id: Uuid,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE work_items
+            SET state = 'queued', available_at = now(),
+                attempt_count = attempt_count + 1,
+                lease_owner = NULL, lease_expires_at = NULL,
+                reacted = false, updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(work_item_id)
+    .execute(executor)
+    .await?;
+    tracing::info!(work_item = %work_item_id, "requeued for retry");
+    Ok(())
+}
+
+/// Fetch a change request by its GitHub number.
+pub async fn change_request_by_number(
+    pool: &Pool,
+    repo_id: Uuid,
+    number: i32,
+) -> Result<Option<ChangeRequest>> {
+    let row = sqlx::query(
+        "SELECT id, repo_id, number, head_branch, linked_issue, work_item_id, factory_state
+           FROM change_requests WHERE repo_id = $1 AND number = $2",
+    )
+    .bind(repo_id)
+    .bind(number)
+    .fetch_optional(pool)
+    .await?;
+    row.map(map_change_request).transpose()
+}
+
+/// Increment a CR's review-rework loop count; returns the new value.
+/// Executor-generic (see [`mark_reacted`]).
+pub async fn increment_cr_loop_count(
+    executor: impl sqlx::PgExecutor<'_>,
+    cr_id: Uuid,
+) -> Result<i32> {
+    let n: i32 = sqlx::query_scalar(
+        "UPDATE change_requests SET loop_count = loop_count + 1, updated_at = now()
+          WHERE id = $1 RETURNING loop_count",
+    )
+    .bind(cr_id)
+    .fetch_one(executor)
+    .await?;
+    Ok(n)
+}
+
+/// A CR's current loop count (test/diagnostic helper).
+pub async fn cr_loop_count(pool: &Pool, cr_id: Uuid) -> Result<i32> {
+    Ok(
+        sqlx::query_scalar("SELECT loop_count FROM change_requests WHERE id = $1")
+            .bind(cr_id)
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+/// Record an escalation **exactly once** per `(work_item, reason)`. Returns the
+/// escalation id and whether this call created it (`true`) or it already existed
+/// (`false`) — so a re-dispatch / racing replica never double-escalates.
+///
+/// A single `INSERT … ON CONFLICT DO UPDATE … RETURNING` does both the claim and the
+/// existing-row read: `xmax = 0` is true only for a freshly-inserted row (no prior
+/// tuple version), so `(xmax = 0) AS created` distinguishes an insert from a
+/// conflict-update without a second statement. Because it is one statement it is
+/// `impl PgExecutor` like its siblings; the coordinator runs it INSIDE its per-react
+/// transaction via `&mut **tx`.
+pub async fn create_escalation_idempotent(
+    executor: impl sqlx::PgExecutor<'_>,
+    work_item_id: Uuid,
+    reason: &str,
+    context: &str,
+    delivered_to: Option<&str>,
+) -> Result<(Uuid, bool)> {
+    let row = sqlx::query(
+        "INSERT INTO escalations (id, work_item_id, reason, context, delivered_to)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (work_item_id, reason) DO UPDATE SET context = excluded.context
+         RETURNING id, (xmax = 0) AS created",
+    )
+    .bind(Uuid::now_v7())
+    .bind(work_item_id)
+    .bind(reason)
+    .bind(context)
+    .bind(delivered_to)
+    .fetch_one(executor)
+    .await?;
+    let id: Uuid = row.try_get("id")?;
+    let created: bool = row.try_get("created")?;
+    tracing::info!(%work_item_id, reason, created, "escalation recorded (idempotent)");
+    Ok((id, created))
+}
+
 fn map_change_request(row: sqlx::postgres::PgRow) -> Result<ChangeRequest> {
     Ok(ChangeRequest {
         id: row.try_get("id")?,
@@ -1223,6 +1550,7 @@ fn map_work_item(row: sqlx::postgres::PgRow) -> Result<WorkItem> {
         config_sha: row.try_get("config_sha")?,
         lease_owner: row.try_get("lease_owner")?,
         lease_expires_at: row.try_get("lease_expires_at")?,
+        updated_at: row.try_get("updated_at")?,
     })
 }
 

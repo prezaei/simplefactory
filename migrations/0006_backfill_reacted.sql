@@ -1,0 +1,14 @@
+-- P4 FIX: backfill `reacted` for terminal rows that PRE-DATE the coordinator.
+--
+-- `0004_coordinator.sql` adds `work_items.reacted` with `DEFAULT false`. On an upgraded
+-- database (one that ran P0–P3 and accumulated terminal work items before P4), every
+-- historical succeeded/failed/escalated row would look UN-reacted to the new coordinator,
+-- so its first tick would replay all of them — re-enqueuing coders for old manager
+-- successes and retrying/escalating long-settled failures.
+--
+-- Mark every already-terminal row reacted so only terminal transitions that happen AFTER
+-- P4 (created with the `DEFAULT false`) are ever coordinated. This lives in its own
+-- migration rather than editing 0004 so an already-applied 0004 keeps its checksum (no
+-- `sqlx` version-mismatch on existing databases). On a fresh database the table is empty,
+-- so this is a no-op.
+UPDATE work_items SET reacted = true WHERE state IN ('succeeded', 'failed', 'escalated');

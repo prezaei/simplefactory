@@ -273,6 +273,11 @@ settings:
   default_model: claude-opus-4-8 # model used unless a worker overrides it (optional)
   instructions: |                # repo-wide guidance appended to EVERY worker's prompt (optional)
     This is a Rust workspace — follow AGENTS.md. Prefer small, focused change requests.
+  retry_cap: 3                   # a Failed work item with this many attempts (or more) escalates retries_exhausted instead of retrying (default: 3)
+  loop_cap: 5                    # review-rework cycles before the loop escalates loop_cap instead of dispatching another coder (default: 5)
+  gating_paths:                  # path prefixes whose changes weaken a CR's own gating checks; such a CR is escalated, never marked ready (default: [".github/workflows/"])
+    - ".github/workflows/"
+  escalation_assignee: octo-human # optional GitHub login assigned the linked issue on a ready-for-merge handoff / escalation; when unset, the comment is posted but NO assignment is made (default: unset/none)
 
 limits:
   max_concurrent_workers: 5      # global ceiling across all workers in this repo (platform default: 5)
@@ -441,7 +446,7 @@ Provisioned as **Bicep** (Azure-native, no state backend), across two environmen
 
 ## Defaults (retention, capacity, effort, timeouts)
 
-Starting values. Per-repo `.factory/config.yml` may override the **capacity caps**; the rest are platform defaults.
+Starting values. Per-repo `.factory/config.yml` may override the **capacity caps**, the **retry/loop caps** (`settings.retry_cap` / `settings.loop_cap`), and the **gating paths** (`settings.gating_paths`); the rest are platform defaults. The values in the table below remain the platform defaults when a repo omits these fields.
 
 | Setting | Default | Notes |
 | --- | --- | --- |
@@ -449,8 +454,10 @@ Starting values. Per-repo `.factory/config.yml` may override the **capacity caps
 | Retention — Blob transcripts + checkpoints | **30 days** | Blob lifecycle expiry. |
 | Global concurrency (`limits.max_concurrent_workers`) | **5** | Per repo; overridable. |
 | Per-worker concurrency (`max_concurrent`) | **2** | Default when a worker omits it; overridable. |
-| Failed-attempt retries | **3** | Then escalate. |
-| Per-issue review-rework loop cap | **5** | Coder↔Reviewer cycles; then escalate. |
+| Failed-attempt retries (`settings.retry_cap`) | **3** | Then escalate `retries_exhausted`; per-repo overridable. |
+| Per-issue review-rework loop cap (`settings.loop_cap`) | **5** | Coder↔Reviewer cycles; then escalate `loop_cap`; per-repo overridable. |
+| Gating paths (`settings.gating_paths`) | **`[".github/workflows/"]`** | A CR touching one weakens its own gating checks → escalated, never marked ready; per-repo overridable. |
+| Escalation/handoff assignee (`settings.escalation_assignee`) | **unset (none)** | GitHub login assigned the linked issue on a ready-for-merge handoff / escalation; when unset, the comment is posted but no assignment is made; per-repo overridable. |
 | Deterministic-crash resumes | **3** | Before falling through to a fresh attempt / escalation. |
 | Dispatcher poll interval | **5 s** | Ready-queue scan cadence (backs prompt-pickup-in-minutes). |
 | Worker lease | **15 min** | Extended by heartbeat; sweeper reclaims past expiry. |

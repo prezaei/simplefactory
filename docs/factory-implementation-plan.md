@@ -116,6 +116,8 @@ The real subprocess seams are implemented too: `GitCli` (shallow clone + `--forc
 **Tests:** full happy path (issue→code→review→ready-for-human-merge); changes-requested loop increments and caps; **exactly-once** escalation under re-dispatch; reviewer verdict idempotent; **a change that weakens/disables its own gating checks is rejected → escalated, never marked ready** (PROD "can't weaken its own checks").
 **Exit:** end-to-end issue→merge-handoff works locally for the worked example. **Depends on:** P3.
 
+> **Deferred — Manager closes the issue on the human's merge.** P4's exit is the ready-for-human-**merge** handoff: it marks the CR `ready`, comments, and assigns the linked issue to a human, leaving the issue OPEN (`in_progress`). Actually **closing the issue on merge** requires ingesting GitHub's `pull_request closed/merged` webhook so the Manager can observe the merge; that ingestion is **not built in P4** (deferred to a later capability). Until then the issue intentionally stays open after handoff rather than being marked `done`.
+
 ## P5 — Resilience (crash-resume, sweeper, bounds, config pinning)
 
 **Goal:** the reliability guarantees the product spec leads with.
