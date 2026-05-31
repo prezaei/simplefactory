@@ -438,7 +438,7 @@ Run the exact-login / current-HEAD check:
 ```bash
 HEAD=$(gh pr view {{PR_NUMBER}} --json headRefOid -q .headRefOid)
 gh api --paginate repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
-  --jq "[.[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\" and .state != \"PENDING\")] | length"   # must be >= 1
+  --jq ".[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\" and .state != \"PENDING\") | .id" | wc -l   # one .id per matching review across ALL pages, then count lines — must be >= 1. (Do NOT use `[...] | length`: with --paginate, --jq runs PER PAGE, so length is a per-page count, not the total.)
 ```
 
 On GitHub Enterprise, add `--hostname <host>` to the `gh api` calls, where `<host>` is `state.ghe_hostname` (non-null).
@@ -535,7 +535,8 @@ When true, run the exact-login / current-HEAD assertion and ABORT the merge (exi
 ```bash
 HEAD=$(gh pr view {{PR_NUMBER}} --json headRefOid -q .headRefOid)
 COUNT=$(gh api --paginate repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
-  --jq "[.[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\" and .state != \"PENDING\")] | length")
+  --jq ".[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\" and .state != \"PENDING\") | .id" | wc -l | tr -d ' ')
+# count lines (one .id per matching review) across ALL pages — NOT `[...] | length`, which with --paginate is computed per page (wrong total on >30-review PRs).
 # --paginate: the reviews endpoint caps at 30/page — without it the Copilot review can be on a later page and be missed.
 # .state != "PENDING": skip unsubmitted draft reviews; only submitted reviews (COMMENTED/APPROVED/CHANGES_REQUESTED/DISMISSED) satisfy the gate.
 # COUNT must be >= 1. If 0, the reviewer has not reviewed the current HEAD —
