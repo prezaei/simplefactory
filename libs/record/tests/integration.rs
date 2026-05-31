@@ -204,16 +204,23 @@ async fn purge_removes_only_old_terminal_items() {
         .unwrap();
     assert_eq!(record::count_for_repo(&pool, repo).await.unwrap(), 2);
 
-    // purge_terminal is global; assert its effect scoped to THIS repo so other
-    // tests' terminal rows don't perturb the count.
-    // Nothing in this repo is older than an hour, so the repo is untouched.
+    // purge_terminal is global; a future/now cutoff would nuke OTHER parallel
+    // tests' briefly-terminal rows (e.g. an item transiting through `failed`),
+    // causing cross-test flakes. So backdate only THIS test's succeeded row and
+    // purge with a PAST cutoff that catches just it.
     record::purge_terminal(&pool, Utc::now() - chrono::Duration::hours(1))
         .await
         .unwrap();
     assert_eq!(record::count_for_repo(&pool, repo).await.unwrap(), 2);
 
-    // Purge terminal up to now: the succeeded item goes, the active one stays.
-    record::purge_terminal(&pool, Utc::now() + chrono::Duration::minutes(1))
+    // Age the succeeded item ~10 days, then purge older-than-1-day: it goes, the
+    // active one stays, and no other test's recent terminal rows are at risk.
+    sqlx::query("UPDATE work_items SET updated_at = now() - interval '10 days' WHERE id = $1")
+        .bind(done)
+        .execute(&pool)
+        .await
+        .unwrap();
+    record::purge_terminal(&pool, Utc::now() - chrono::Duration::days(1))
         .await
         .unwrap();
     assert_eq!(record::count_for_repo(&pool, repo).await.unwrap(), 1);
