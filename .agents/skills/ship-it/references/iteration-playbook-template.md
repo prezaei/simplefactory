@@ -164,7 +164,7 @@ Once both agents complete, evaluate results. Take the **FIRST matching** action:
 
 **Comments always take priority.** Reviewers post at any time — addressing feedback promptly shows respect for their time and prevents comment pile-up across iterations. Note that even when the Copilot gate applies (`{{COPILOT_AVAILABLE}}` is true), NEW comments (including any from the Copilot review itself, under login "Copilot") and any unresolved review thread are still triaged first via row 1 before any merge is considered.
 
-**`CHANGES_REQUESTED` does NOT block merge.** If all reviewer comments have been triaged (addressed, rejected with rationale, or skipped), the PR is merge-ready regardless of `reviewDecision`. Reviewers often don't re-review promptly, and waiting burns iterations for no reason. The `--admin` merge flag bypasses this GitHub status. The real gate is: have we seen and addressed every comment?
+**`CHANGES_REQUESTED` does NOT block merge.** If all reviewer comments have been triaged (addressed, rejected with rationale, or skipped), the PR is merge-ready regardless of `reviewDecision`. Reviewers often don't re-review promptly, and waiting burns iterations for no reason. Admin merge privileges (which the REST merge endpoint honors from the caller's token) bypass a `CHANGES_REQUESTED` review state. The real gate is: have we seen and addressed every comment?
 
 ---
 
@@ -519,7 +519,7 @@ gh api --paginate repos/{{REPO}}/pulls/{{PR_NUMBER}}/comments
 Re-fetch ALL comments right now (the REST comments endpoint caps at 30/page — `--paginate` is REQUIRED so a reviewer comment past the first page is not silently merged over). CI can take many minutes — reviewers often post during that window. If there are ANY comments whose IDs are not in `triaged_comment_ids`, do NOT merge. Go back to Step 3b to triage them first.
 
 ### Gate 3 — All comments addressed
-Verify that every comment ID from the PR is present in `triaged_comment_ids`. If there are untriaged comments, go back to Step 3b. `reviewDecision: CHANGES_REQUESTED` is NOT a blocker — reviewers often don't re-review promptly, and the `--admin` merge bypasses this GitHub status. The real safety check is Gate 2 (fresh comment re-check).
+Verify that every comment ID from the PR is present in `triaged_comment_ids`. If there are untriaged comments, go back to Step 3b. `reviewDecision: CHANGES_REQUESTED` is NOT a blocker — reviewers often don't re-review promptly, and admin merge privileges (via the REST merge endpoint) bypass this GitHub status. The real safety check is Gate 2 (fresh comment re-check).
 
 ### Gate 4 — PR still open and mergeable
 ```bash
@@ -549,10 +549,18 @@ Additionally, every NEW inline comment from that HEAD review must already be tri
 
 ### Execute Merge
 
-Only after all applicable gates pass:
+Only after all applicable gates pass, merge via the REST API (NOT `gh pr merge`, which checks out the base branch locally and fails in a multi-worktree layout — see SKILL.md → [Executing the Merge](../SKILL.md#executing-the-merge)). The REST endpoint merges entirely server-side and honors the caller's admin privileges automatically:
 ```bash
-gh pr merge {{PR_NUMBER}} --admin --squash --delete-branch
+# On GitHub Enterprise, add `--hostname <host>` to the `gh api` call, where `<host>` is `state.ghe_hostname` (non-null).
+gh api --method PUT repos/{{REPO}}/pulls/{{PR_NUMBER}}/merge -f merge_method=squash
+# Response: {"sha": "...", "merged": true, "message": "..."}
 ```
+Branch deletion is usually handled by the merge (GitHub auto-deletes on squash-merge when the repo is configured for it). If the repo does NOT auto-delete, delete the branch explicitly:
+```bash
+# On GitHub Enterprise, add `--hostname <host>` to the `gh api` call, where `<host>` is `state.ghe_hostname` (non-null).
+gh api --method DELETE repos/{{REPO}}/git/refs/heads/{{BRANCH}}
+```
+A 422 "Reference does not exist" response from the DELETE means the branch was already deleted — treat as success.
 
 ### Post-Merge
 

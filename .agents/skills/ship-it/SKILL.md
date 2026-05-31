@@ -2,7 +2,7 @@
 name: ship-it
 description: |
   Autonomous PR iteration loop: addresses review comments, waits for CI, iterates
-  until green with no unresolved threads, then admin-merges with --squash --delete-branch.
+  until green with no unresolved threads, then squash-merges (using admin merge privileges) and deletes the branch.
   Takes an existing PR number as input. Designed for autonomous execution after
   fix, feature-dev, or similar skills create a PR.
   Uses an agent swarm — all iteration work is delegated to agents so main context stays clean.
@@ -167,7 +167,7 @@ Run these checks, then hand off to agents. Abort with a clear error if any fail.
    - If BOTH 6a and 6b returned empty (or 404), there is genuinely no required-check configuration → `required_checks: []`.
 
    **When `required_checks` is empty, CI is not gated:**
-   - The merge gate is reviewer comments + `--admin` merge. CI is informational.
+   - The merge gate is reviewer comments + an admin-privileged merge (via the REST endpoint). CI is informational.
    - Do NOT wait for any check — pending checks don't block, and neither do failing checks. The team's merge signal is human review, not CI. If they wanted CI gated, they'd have configured it.
    - Report this explicitly in the "Ship It started" message: "No required checks configured on `<base>` — CI is informational only. Will merge once all review comments are addressed."
 
@@ -311,10 +311,10 @@ When in doubt, escalate. A false-escalation wastes a notification; a false-auto-
 | Merge conflicts — mechanical only (lockfiles, generated stubs, imports) | Rebase onto base, resolve, force-push-with-lease, continue |
 | Merge conflicts — substantive (overlapping logic) | Abort rebase, escalate to user with conflict summary, cancel cron |
 | Check conclusion is `ACTION_REQUIRED` | Do NOT treat as a single outcome. Fetch the check's `output.title` via `gh api repos/.../commits/<sha>/check-runs` and classify (see Guardrails) |
-| All comments addressed but reviewer hasn't re-reviewed | Merge anyway — `--admin` bypasses `CHANGES_REQUESTED` |
+| All comments addressed but reviewer hasn't re-reviewed | Merge anyway — admin merge privileges (via the REST endpoint) bypass `CHANGES_REQUESTED` |
 | New comments at merge time | Go back to triage, do NOT merge |
 | `gh pr merge` fails with "'main' is already used by worktree" | Use the REST API directly (see [Executing the Merge](#executing-the-merge)). `gh pr merge` tries to checkout the base branch locally; that fails when this repo has sibling worktrees. |
-| `--admin` merge fails with permissions error | Report error — may lack admin rights on the branch |
+| Merge fails with a permissions error | Report error — may lack admin rights on the branch |
 | Rate limiting | Back off with 10s delays |
 
 ## Executing the Merge
@@ -368,7 +368,7 @@ A 422 "Reference does not exist" response from the DELETE means the branch was a
 
   The cost of treating `ACTION_REQUIRED` as a single "waiting" state is catastrophic: the cron polls forever while the PR is actually blocked on a conflict or a decision the user can fix in seconds.
 - **Requeue CI on infrastructure/flaky failures** — when a CI failure is diagnosed as infrastructure/flaky (not a code issue), requeue the failed run instead of just waiting. On GitHub Actions: `gh run rerun <run-id> --failed`. Stale red CI won't auto-retry.
-- **Merge when all comments are addressed** — `CHANGES_REQUESTED` is not a blocker if every comment has been triaged (addressed, rejected with rationale, or skipped). Reviewers often don't re-review promptly; `--admin` bypasses this GitHub status.
+- **Merge when all comments are addressed** — `CHANGES_REQUESTED` is not a blocker if every comment has been triaged (addressed, rejected with rationale, or skipped). Reviewers often don't re-review promptly; admin merge privileges (via the REST merge endpoint) bypass this GitHub status.
 - **Never merge without a fresh comment re-check** — always re-fetch right before merge.
 - **Never modify files outside the PR's diff scope.**
 - **Never delete or rewrite git history** — only add new commits.
