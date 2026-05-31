@@ -516,14 +516,34 @@ async fn decide_manager_succeeded(
     item: &WorkItem,
     config: &Config,
 ) -> anyhow::Result<PostCommit> {
-    let Some(coder) = worker_with_role(config, Role::Coder) else {
-        tracing::warn!(work_item = %item.id, "no coder worker in config; cannot delegate");
-        return Ok(PostCommit::None);
-    };
     // The manager's subject is the issue it triaged.
     let Subject::Issue(issue) = parse_subject(&item.subject_ref)? else {
         tracing::warn!(work_item = %item.id, subject = %item.subject_ref, "manager subject is not an issue; cannot delegate");
         return Ok(PostCommit::None);
+    };
+
+    // The react claim is already committed in this tx; a missing coder means the issue
+    // would be consumed with no retry path (a later config fix can't recover it). So
+    // escalate (needs_decision) instead of silently no-opping — visible/actionable
+    // rather than stranded. Exactly-once via the idempotent escalation, like the other
+    // escalation paths. Target the issue (the manager's subject).
+    let Some(coder) = worker_with_role(config, Role::Coder) else {
+        let (comment_target, assign_issue) = escalation_target(item, None);
+        let post = escalate(
+            tx,
+            item,
+            Escalation {
+                comment_target,
+                assign_issue,
+                reason: "needs_decision",
+                context: format!(
+                    "no coder worker configured for this repo; cannot delegate issue#{issue}"
+                ),
+            },
+        )
+        .await?;
+        tracing::warn!(work_item = %item.id, issue, "no coder worker in config; escalated instead of stranding issue");
+        return Ok(post);
     };
 
     let issue = issue_i32(item, issue)?;
@@ -549,10 +569,9 @@ async fn decide_coder_succeeded(
     config: &Config,
     cr: Option<ChangeRequest>,
 ) -> anyhow::Result<PostCommit> {
-    let Some(reviewer) = worker_with_role(config, Role::Reviewer) else {
-        tracing::warn!(work_item = %item.id, "no reviewer worker in config; cannot request review");
-        return Ok(PostCommit::None);
-    };
+    // No CR (or no number) yet is a benign no-op: there is genuinely nothing to review
+    // (the coder hasn't opened/numbered a CR), and a later tick can pick it up. This is
+    // NOT a strand.
     let Some(cr) = cr else {
         tracing::info!(work_item = %item.id, "coder succeeded but no CR row yet; nothing to review");
         return Ok(PostCommit::None);
@@ -560,6 +579,30 @@ async fn decide_coder_succeeded(
     let Some(number) = cr.number else {
         tracing::info!(work_item = %item.id, "coder's CR has no number yet; nothing to review");
         return Ok(PostCommit::None);
+    };
+
+    // There IS a CR to review but no reviewer worker is configured: the react claim is
+    // already committed, so silently no-opping would strand the CR (no review, no retry,
+    // no escalation) — a later config fix can't recover it. Escalate (needs_decision)
+    // instead. Exactly-once via the idempotent escalation; target the CR / its linked
+    // issue, consistent with the other CR escalation paths.
+    let Some(reviewer) = worker_with_role(config, Role::Reviewer) else {
+        let (comment_target, assign_issue) = escalation_target(item, Some(&cr));
+        let post = escalate(
+            tx,
+            item,
+            Escalation {
+                comment_target,
+                assign_issue,
+                reason: "needs_decision",
+                context: format!(
+                    "no reviewer worker configured; cannot wake review for cr#{number}"
+                ),
+            },
+        )
+        .await?;
+        tracing::warn!(work_item = %item.id, cr_number = number, "no reviewer worker in config; escalated instead of stranding CR");
+        return Ok(post);
     };
 
     let subject = Subject::ChangeRequest(number as i64).as_ref_string();
@@ -705,7 +748,8 @@ async fn apply_approval(
             // the transport layer. `run_post_commit` only delivers this body.
             let body = format!(
                 "Factory: change request #{cr_number} is approved and all checks are green. \
-                 Ready for a human to merge; the linked issue is closed once you merge."
+                 Ready for a human to review and merge. The linked issue stays open; close \
+                 it yourself after merging (automatic closure on merge is not yet available)."
             );
             tracing::info!(work_item = %item.id, cr_number, "reviewer approved: CR marked ready for human merge; issue left in_progress");
             Ok(PostCommit::ReadyHandoff {

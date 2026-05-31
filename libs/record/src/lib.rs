@@ -1495,6 +1495,12 @@ pub async fn cr_loop_count(pool: &Pool, cr_id: Uuid) -> Result<i32> {
 /// conflict-update without a second statement. Because it is one statement it is
 /// `impl PgExecutor` like its siblings; the coordinator runs it INSIDE its per-react
 /// transaction via `&mut **tx`.
+///
+/// On conflict the existing row is left **unchanged** — the `DO UPDATE` is a no-op
+/// self-assign (`work_item_id = excluded.work_item_id`) chosen only so the row is
+/// returned (a `DO NOTHING` would return no row). The original `context` is preserved,
+/// matching the already-delivered human-facing escalation; the second call is a pure
+/// no-op success (`created = false`).
 pub async fn create_escalation_idempotent(
     executor: impl sqlx::PgExecutor<'_>,
     work_item_id: Uuid,
@@ -1505,7 +1511,7 @@ pub async fn create_escalation_idempotent(
     let row = sqlx::query(
         "INSERT INTO escalations (id, work_item_id, reason, context, delivered_to)
          VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (work_item_id, reason) DO UPDATE SET context = excluded.context
+         ON CONFLICT (work_item_id, reason) DO UPDATE SET work_item_id = excluded.work_item_id
          RETURNING id, (xmax = 0) AS created",
     )
     .bind(Uuid::now_v7())

@@ -1336,6 +1336,149 @@ mod acceptance {
         );
     }
 
+    /// Store a config for `repo` from a raw `yaml`, returning nothing. Used by the
+    /// missing-next-role tests, which need a config that deliberately OMITS a role.
+    async fn set_config_yaml(pool: &record::Pool, repo: Uuid, yaml: &str) {
+        let cfg = factory_config::parse(yaml).expect("valid config yaml");
+        let cfg_json = serde_json::to_value(&cfg).unwrap();
+        record::set_repo_config(pool, repo, &cfg_json, "p4-sha")
+            .await
+            .unwrap();
+    }
+
+    /// FIX 3: a manager succeeds but the repo config has NO coder worker. The react
+    /// claim is already committed, so silently no-opping would STRAND the issue (no
+    /// retry, no escalation, unrecoverable by a later config fix). The coordinator must
+    /// ESCALATE (needs_decision) exactly once instead — one row, one comment, one
+    /// assignment — and must NOT delegate (no coder item, issue not moved to
+    /// in_progress).
+    #[tokio::test]
+    async fn manager_succeeded_with_no_coder_escalates_not_strands() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let serial = P4_SERIAL.lock().await;
+        drain_terminal(&pool).await;
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-p4-nocoder"), 1)
+            .await
+            .unwrap();
+        // Manager-ONLY config: no coder role exists to delegate to.
+        let yaml = "version: 1\n\
+             settings:\n  label: factory\n  escalation_assignee: octo-human\n\
+             limits:\n  max_concurrent_workers: 5\n\
+             workers:\n  - name: manager\n    role: manager\n    on: [issue_labeled]\n";
+        set_config_yaml(&pool, repo, yaml).await;
+        let gh = Arc::new(FakeGitHub::new());
+
+        let manager_id =
+            enqueue_item(&pool, repo, record::Kind::Manager, "manager", "issue#7").await;
+        mark_succeeded(&pool, manager_id).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        // Exactly one needs_decision escalation against the manager item.
+        let escalations: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'needs_decision' AND work_item_id = $1",
+        )
+        .bind(manager_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(escalations, 1, "exactly one needs_decision escalation");
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one escalation assignment"
+        );
+        // The issue is NOT delegated: no coder item, issue not moved to in_progress.
+        assert!(
+            find_item(&pool, repo, record::Kind::Coder, "issue#7")
+                .await
+                .is_none(),
+            "no coder is enqueued when none is configured"
+        );
+        assert_ne!(
+            issue_state(&pool, repo, 7).await.as_deref(),
+            Some("in_progress"),
+            "the issue is not moved to in_progress when it could not be delegated"
+        );
+        drop(serial);
+    }
+
+    /// FIX 4: a coder succeeds and opened a CR, but the repo config has NO reviewer
+    /// worker. Silently no-opping would STRAND the CR (no review, no retry, no
+    /// escalation). The coordinator must ESCALATE (needs_decision) exactly once instead
+    /// — one row, one comment, one assignment (the CR's linked issue) — and must NOT
+    /// enqueue a reviewer.
+    #[tokio::test]
+    async fn coder_succeeded_with_no_reviewer_escalates_not_strands() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let serial = P4_SERIAL.lock().await;
+        drain_terminal(&pool).await;
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-p4-noreviewer"), 1)
+            .await
+            .unwrap();
+        // Manager + coder, but NO reviewer role to wake for the opened CR.
+        let yaml = "version: 1\n\
+             settings:\n  label: factory\n  escalation_assignee: octo-human\n\
+             limits:\n  max_concurrent_workers: 5\n\
+             workers:\n\
+             \x20 - name: manager\n    role: manager\n    on: [issue_labeled]\n\
+             \x20 - name: bug-fixer\n    role: coder\n    on: [manager]\n";
+        set_config_yaml(&pool, repo, yaml).await;
+        let gh = Arc::new(FakeGitHub::new());
+        let state = tools_state(&pool, gh.clone());
+
+        // A coder opens a CR on issue#1 (open_cr links the CR to issue 1), then succeeds.
+        let (cr_number, _cr_row) = open_cr(&pool, repo, "bug-fixer", &state, "needs review").await;
+        let coder_id = find_item(&pool, repo, record::Kind::Coder, "issue#1")
+            .await
+            .expect("the CR-opening coder item exists");
+        mark_succeeded(&pool, coder_id).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        // Exactly one needs_decision escalation against the coder item.
+        let escalations: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'needs_decision' AND work_item_id = $1",
+        )
+        .bind(coder_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(escalations, 1, "exactly one needs_decision escalation");
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one escalation assignment (the CR's linked issue)"
+        );
+        // No reviewer was enqueued for the CR.
+        assert!(
+            find_item(
+                &pool,
+                repo,
+                record::Kind::Reviewer,
+                &format!("cr#{cr_number}")
+            )
+            .await
+            .is_none(),
+            "no reviewer is enqueued when none is configured"
+        );
+        drop(serial);
+    }
+
     /// Like the happy/gating tests, but the gating prefix is a CUSTOM, non-default
     /// path (`ci/`) declared via `settings.gating_paths`. A CR touching `ci/…` must be
     /// escalated as a conflict and NEVER marked ready — proving gating is config-driven,

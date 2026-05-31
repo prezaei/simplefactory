@@ -443,6 +443,59 @@ async fn escalate_is_idempotent_and_escalates_the_item() {
 }
 
 #[tokio::test]
+async fn escalate_same_item_reason_distinct_keys_is_idempotent_not_db_error() {
+    // FIX 1 regression: migration 0004 added a UNIQUE (work_item_id, reason) index.
+    // Two escalate calls for the SAME (work_item, reason) but with DISTINCT dedupe_keys
+    // BYPASS the task-level idempotency claim (different keys → both win their claim),
+    // so they both reach the record writer. The writer must be idempotent per
+    // (work_item, reason): the second call is a controlled no-op success (created=false),
+    // NOT a DB unique-violation. Exactly one escalation row, exactly one comment.
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#137", FakeGitHub::new()).await;
+
+    let (s1, b1) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "escalate",
+        json!({ "reason": "conflict", "context": "merge conflict", "dedupe_key": "first" }),
+    )
+    .await;
+    let (s2, b2) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "escalate",
+        json!({ "reason": "conflict", "context": "merge conflict again", "dedupe_key": "second" }),
+    )
+    .await;
+    // Neither call errors — the second is a controlled tool result, not a 500.
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "second (item,reason) escalate must not DB-error"
+    );
+
+    // Same escalation id returned both times (the record-layer idempotency).
+    assert_eq!(b1["escalation_id"], b2["escalation_id"]);
+    // The second call is a no-op: it delivered no comment and changed no state.
+    assert_eq!(b2["delivered_comment_id"], serde_json::Value::Null);
+    assert_eq!(b2["state_changed"], false);
+
+    // Exactly ONE escalation row and exactly ONE comment for the (item, reason).
+    assert_eq!(
+        record::count_escalations_for_item(&pool, fx.work_item_id)
+            .await
+            .unwrap(),
+        1,
+        "two same-(item,reason) escalates file exactly one escalation row"
+    );
+    assert_eq!(count_calls(&fx.gh, "post_comment"), 1);
+}
+
+#[tokio::test]
 async fn escalate_is_idempotent_per_task_without_a_dedupe_key() {
     let Some(pool) = pool_or_skip().await else {
         eprintln!("SKIP: DATABASE_URL not set");
