@@ -11,3 +11,6 @@ serde_yaml.workspace = true
 thiserror.workspace = true
 cron.workspace = true
 chrono.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

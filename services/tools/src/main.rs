@@ -101,6 +101,14 @@ impl factory_github::GitHubClient for UnconfiguredGitHub {
     ) -> anyhow::Result<()> {
         Err(no_creds("update_comment"))
     }
+    async fn assign_issue(
+        &self,
+        _repo: &factory_github::RepoRef,
+        _issue_number: i64,
+        _assignee: &str,
+    ) -> anyhow::Result<()> {
+        Err(no_creds("assign_issue"))
+    }
     async fn submit_review(
         &self,
         _repo: &factory_github::RepoRef,

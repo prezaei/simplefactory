@@ -97,6 +97,15 @@ impl CheckConclusion {
             CheckConclusion::Neutral => "neutral",
         }
     }
+
+    /// Whether this conclusion counts as "green" for marking a CR ready. GitHub treats
+    /// neutral/skipped checks as passing, so `Success` and `Neutral` are green; `Failure`
+    /// and `Pending` are not. This is the SINGLE source of truth for the green definition
+    /// (FIX 6): the octocrab rollup and the coordinator's gate both delegate here, so the
+    /// definition can never drift between the two crates.
+    pub fn is_green(self) -> bool {
+        matches!(self, CheckConclusion::Success | CheckConclusion::Neutral)
+    }
 }
 
 /// Per-check conclusions plus the overall rollup for a ref.
@@ -104,6 +113,37 @@ impl CheckConclusion {
 pub struct CheckSummary {
     pub overall: CheckConclusion,
     pub checks: Vec<(String, CheckConclusion)>,
+}
+
+impl CheckSummary {
+    /// Roll a set of per-check conclusions up into an overall conclusion + summary. This
+    /// is the SINGLE source of truth for the rollup (FIX 6): both the real octocrab client
+    /// (`OctocrabGitHub::check_status`) and `FakeGitHub` build summaries through here so the
+    /// empty-is-green semantics (FIX 2) hold identically in production and in tests.
+    ///
+    /// Rollup rule: any `Failure` → `Failure`; else any `Pending` → `Pending`; else
+    /// `Success`. The empty set (zero checks) therefore rolls up to `Success` — a ref with
+    /// no checks has nothing non-green, which matches GitHub treating a PR with no required
+    /// checks as mergeable (FIX 2). The narrow window where checks have been registered on
+    /// GitHub but no `check_run` object has materialized yet is accepted as green here; the
+    /// repo's branch protection plus the human merge step are the merge-time backstop.
+    pub fn rollup(checks: Vec<(String, CheckConclusion)>) -> CheckSummary {
+        let any_failure = checks
+            .iter()
+            .any(|(_, c)| matches!(c, CheckConclusion::Failure));
+        let any_pending = checks
+            .iter()
+            .any(|(_, c)| matches!(c, CheckConclusion::Pending));
+        let overall = if any_failure {
+            CheckConclusion::Failure
+        } else if any_pending {
+            CheckConclusion::Pending
+        } else {
+            // Every present check is green, OR there are no checks at all — both green.
+            CheckConclusion::Success
+        };
+        CheckSummary { overall, checks }
+    }
 }
 
 /// The outbound GitHub operations Factory performs. All are idempotent where the
@@ -138,6 +178,17 @@ pub trait GitHubClient: Send + Sync {
         target: CommentTarget,
         body: &str,
     ) -> anyhow::Result<i64>;
+
+    /// Assign an issue (or change request — PR numbers are issue numbers on GitHub)
+    /// to a user. Used by the coordinator to hand work to a human on escalation or
+    /// ready-for-merge handoff. Idempotent on GitHub (assigning an existing assignee
+    /// is a no-op).
+    async fn assign_issue(
+        &self,
+        repo: &RepoRef,
+        issue_number: i64,
+        assignee: &str,
+    ) -> anyhow::Result<()>;
 
     /// Update an existing comment's body (used by `post_comment`'s idempotent re-run:
     /// the same dedupe_key updates the same comment rather than creating a new one).
@@ -182,6 +233,9 @@ struct FakeState {
     files: HashMap<(String, String), String>,
     /// Seeded check summaries, keyed by ref string.
     checks: HashMap<String, CheckSummary>,
+    /// Seeded change-request file lists, keyed by CR number. Defaults to a single
+    /// non-gating file when unset (see `read_change_request`).
+    cr_files: HashMap<i64, Vec<String>>,
     /// PR number assigned per head branch (idempotency).
     pr_by_branch: HashMap<String, i64>,
     next_pr: i64,
@@ -244,6 +298,14 @@ impl FakeGitHub {
         self
     }
 
+    /// Seed the file list `read_change_request` reports for a CR number. Used to
+    /// exercise the coordinator's can't-weaken-own-gating-checks guard (a CR whose
+    /// files touch `.github/workflows/`).
+    pub fn with_cr_files(self, cr_number: i64, files: Vec<String>) -> Self {
+        self.state.lock().unwrap().cr_files.insert(cr_number, files);
+        self
+    }
+
     /// The mutating calls recorded so far (for assertions).
     pub fn calls(&self) -> Vec<String> {
         self.state.lock().unwrap().pub_calls.clone()
@@ -290,11 +352,19 @@ impl GitHubClient for FakeGitHub {
         _repo: &RepoRef,
         number: i64,
     ) -> anyhow::Result<ChangeRequestView> {
+        let files = self
+            .state
+            .lock()
+            .unwrap()
+            .cr_files
+            .get(&number)
+            .cloned()
+            .unwrap_or_else(|| vec!["src/lib.rs".to_owned()]);
         Ok(ChangeRequestView {
             number,
             head_sha: format!("sha-{number}"),
             diff: "--- fake diff ---".to_owned(),
-            files: vec!["src/lib.rs".to_owned()],
+            files,
             reviews: vec![],
             checks: CheckSummary {
                 overall: CheckConclusion::Success,
@@ -358,6 +428,21 @@ impl GitHubClient for FakeGitHub {
         Ok(())
     }
 
+    async fn assign_issue(
+        &self,
+        _repo: &RepoRef,
+        issue_number: i64,
+        assignee: &str,
+    ) -> anyhow::Result<()> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(e) = Self::take_injected_failure(&mut s, "assign_issue") {
+            return Err(e);
+        }
+        s.pub_calls
+            .push(format!("assign_issue #{issue_number} -> {assignee}"));
+        Ok(())
+    }
+
     async fn submit_review(
         &self,
         _repo: &RepoRef,
@@ -383,6 +468,9 @@ impl GitHubClient for FakeGitHub {
             CheckRef::Sha(s) => s,
             CheckRef::ChangeRequest(n) => format!("sha-{n}"),
         };
+        // An unseeded ref has no check runs registered. It rolls up through the SHARED
+        // rollup (FIX 6) so the empty-is-green semantics (FIX 2) match production exactly:
+        // zero checks → Success, so a no-CI repo is handed off rather than wedged forever.
         Ok(self
             .state
             .lock()
@@ -390,10 +478,7 @@ impl GitHubClient for FakeGitHub {
             .checks
             .get(&key)
             .cloned()
-            .unwrap_or(CheckSummary {
-                overall: CheckConclusion::Pending,
-                checks: vec![],
-            }))
+            .unwrap_or_else(|| CheckSummary::rollup(vec![])))
     }
 
     async fn get_file(
@@ -462,5 +547,69 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    // FIX B: the rollup is the PURE function the live `check_status` feeds the UNION of
+    // check-run conclusions AND commit-status conclusions into. These cover the union
+    // semantics without any network: an empty Checks API is NOT green when a failing
+    // status exists, and the merged list rolls up correctly. Conclusions are tagged by
+    // origin (a `check:`/`status:` context prefix) only for readability; `rollup` treats
+    // every entry uniformly.
+
+    fn check(name: &str, c: CheckConclusion) -> (String, CheckConclusion) {
+        (format!("check:{name}"), c)
+    }
+
+    fn status(ctx: &str, c: CheckConclusion) -> (String, CheckConclusion) {
+        (format!("status:{ctx}"), c)
+    }
+
+    #[test]
+    fn rollup_empty_checks_and_empty_statuses_is_success() {
+        // Genuinely no gating (zero checks AND zero statuses) → mergeable on GitHub.
+        let summary = CheckSummary::rollup(vec![]);
+        assert_eq!(summary.overall, CheckConclusion::Success);
+        assert!(summary.checks.is_empty());
+    }
+
+    #[test]
+    fn rollup_empty_checks_with_failing_status_is_failure() {
+        // The exact bug FIX B closes: no check runs, but a failing legacy status → Failure
+        // (NOT green just because the Checks API was empty).
+        let summary = CheckSummary::rollup(vec![status("ci/legacy", CheckConclusion::Failure)]);
+        assert_eq!(summary.overall, CheckConclusion::Failure);
+        assert_eq!(summary.checks.len(), 1, "the status context is retained");
+    }
+
+    #[test]
+    fn rollup_empty_checks_with_pending_status_is_pending() {
+        let summary = CheckSummary::rollup(vec![status("ci/legacy", CheckConclusion::Pending)]);
+        assert_eq!(summary.overall, CheckConclusion::Pending);
+        assert_eq!(summary.checks.len(), 1);
+    }
+
+    #[test]
+    fn rollup_passing_check_with_failing_status_is_failure() {
+        // A green check run cannot mask a failing status: any Failure in the union wins.
+        let summary = CheckSummary::rollup(vec![
+            check("build", CheckConclusion::Success),
+            status("ci/legacy", CheckConclusion::Failure),
+        ]);
+        assert_eq!(summary.overall, CheckConclusion::Failure);
+        assert_eq!(
+            summary.checks.len(),
+            2,
+            "both the check-run name and the status context are kept for telemetry"
+        );
+    }
+
+    #[test]
+    fn rollup_passing_check_with_passing_status_is_success() {
+        let summary = CheckSummary::rollup(vec![
+            check("build", CheckConclusion::Success),
+            status("ci/legacy", CheckConclusion::Success),
+        ]);
+        assert_eq!(summary.overall, CheckConclusion::Success);
+        assert_eq!(summary.checks.len(), 2);
     }
 }

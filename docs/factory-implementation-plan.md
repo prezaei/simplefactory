@@ -25,6 +25,7 @@
 | **P2 GitHub + Intake** | Events in, opt-in gating | A labelled issue creates exactly one `work_item`; webhook dedupe verified |
 | **P3 Vertical slice (Coder→CR)** | First Coder→CR run (integration proof) | An injected coder work item yields a real change request, locally (labelled-issue→Coder needs P4) |
 | **P4 Coordinator + Reviewer** | Full decide/delegate/review loop | issue → code → review → human-merge handoff works; loop cap + escalation enforced |
+| **P4.5 Per-role worker lifecycle** | Manager-triage + Reviewer-verdict workers (not Coder-shaped) | a manager/reviewer work item runs its role via Claude and produces **no** change request; only the coder opens a CR |
 | **P5 Resilience** | Crash-resume, sweeper, bounds, config pinning | Kill a worker mid-run → it resumes the same session; all bounds tested |
 | **P6 Dashboard** | Live read-only view | SSE stream reflects state within seconds |
 | **P7 Azure productionization** | Deploy to dev + prod | Bicep-provisioned dev env runs the full loop on Azure |
@@ -42,7 +43,7 @@
 - `docker-compose.yml`: Postgres 16 + Azurite (Blob emulator); `.env` wiring; gitignore `.ship-it/` and local state.
 - GitHub Actions CI: `cargo fmt --check && cargo clippy -- -D warnings && cargo test` + build images; integration-test job spins up the compose services.
 - `migrations/` directory wired to `sqlx migrate` + the CI migration gate.
-- **Author the full end-to-end acceptance suite, up front, as stubs.** One named E2E test per behavior the specs promise — at minimum: worked-example happy path (labelled issue → Manager → Coder → CR → Reviewer approve → human-merge handoff → issue closed); changes-requested rework loop + loop-cap escalation; needs-human-input (blocked → human comment → resume same session); crash-resume (worker killed mid-run → resumes); no-double-starts under concurrent coordinators; capacity caps never exceeded (per-worker + global); exactly-once escalation under re-dispatch; opt-in gating (unlabelled issue → nothing); can't-weaken-own-checks → escalated; invalid config → rejected, last-good kept; retention aging. Each is a **compiling, named, `#[ignore]`d stub** (skeleton + `todo!()`/pending assertions) driving the public entry points against the local stack (Claude Code faked at the seam for determinism). This is the **acceptance backbone**: it pins the whole contract now, and every later phase's exit becomes "the E2E stubs it owns are un-ignored and green."
+- **Author the full end-to-end acceptance suite, up front, as stubs.** One named E2E test per behavior the specs promise — at minimum: worked-example happy path (labelled issue → Manager → Coder → CR → Reviewer approve → human-merge handoff; post-merge issue closure is a later capability); changes-requested rework loop + loop-cap escalation; needs-human-input (blocked → human comment → resume same session); crash-resume (worker killed mid-run → resumes); no-double-starts under concurrent coordinators; capacity caps never exceeded (per-worker + global); exactly-once escalation under re-dispatch; opt-in gating (unlabelled issue → nothing); can't-weaken-own-checks → escalated; invalid config → rejected, last-good kept; retention aging. Each is a **compiling, named, `#[ignore]`d stub** (skeleton + `todo!()`/pending assertions) driving the public entry points against the local stack (Claude Code faked at the seam for determinism). This is the **acceptance backbone**: it pins the whole contract now, and every later phase's exit becomes "the E2E stubs it owns are un-ignored and green."
 
 **Tests:** config parse/validate (valid + every invalid case), prompt-layering composition, telemetry smoke (spans emitted); **plus the full E2E acceptance suite authored as `#[ignore]`d stubs** — compiling and named, not yet passing.
 **Exit:** CI green; `docker-compose up` healthy; `cargo test` covers `config` + `telemetry`; the full E2E acceptance suite exists as compiling, ignored stubs (CI runs them as ignored, so the list can't silently rot).
@@ -73,7 +74,7 @@
 **Tasks**
 - `libs/github` (**inbound**): webhook **HMAC verification** (constant-time) + typed events — issue labelled, CR opened/updated, `review_requested`, `pull_request_review` → changes-requested, **issue_comment**, push. *(Done.)*
 - `services/intake` (Axum): verify signature → reject requests missing the GitHub identity headers → dedupe on delivery id → filter by opt-in `label` → enqueue `work_item` (pinning current `config_sha`). Fast 2xx; all work async off the queue. **Lost-event-safe:** a delivery id is recorded only *after* successful processing, and "not ready" outcomes (repo not connected / no config) are left unrecorded so a GitHub redelivery re-drives them. Every ingest writes an `events` audit row. *(Done.)*
-- **Enqueue policy — manager-first.** On `issue_labeled`, Intake enqueues a single **Manager** work item; coders/reviewers/testers are woken downstream by the Manager (`manager` trigger) or by their own CR/comment triggers — never by `issue_labeled` directly. (This resolves the spec's config-vs-worked-example ambiguity; P0 config validation enforces it.) *(Done.)*
+- **Enqueue policy — manager-first.** On `issue_labeled`, Intake enqueues a single **Manager** work item; coders/reviewers/testers are enqueued downstream by the Coordinator as the manager-first next step (via the `manager` trigger) or fire on their own CR/comment triggers — never on `issue_labeled` directly. (The Manager worker doesn't dispatch; its success drives the Coordinator.) (This resolves the spec's config-vs-worked-example ambiguity; P0 config validation enforces it.) *(Done.)*
 - `services/intake` scheduler loop: full cron parsing (`libs/config`), read each repo's config timers, and fire due `schedule` work **exactly once across replicas** via a per-`(repo,worker)` advisory lock that re-checks `schedule_state.last_fired` (work-item idempotency is the backstop). *(Done.)*
 - **blocked→queued transition:** an `issue_comment` on a tracked blocked item flips it to `queued` (`available_at=now()`). *(Done.)*
 - Resolve only **active** repos (suspended/removed never produce work); `webhook_deliveries` retention purge helper (the dedupe table is load-bearing, so it must be prunable). *(Done.)*
@@ -105,16 +106,35 @@ The real subprocess seams are implemented too: `GitCli` (shallow clone + `--forc
 
 ## P4 — Coordinator + Reviewer (full loop)
 
-**Goal:** the manager decides/delegates and review closes the loop to a human merge.
+**Goal:** the **Coordinator** decides/delegates and review closes the loop to a human merge.
 
 **Tasks**
-- `services/coordinator` (Manager): react to completions → assign Coder, wake Reviewer on new CR, hand approved+green CR to a human, close the loop, or escalate. Per-issue decisions serialized by an issue row-lock; enqueue next-steps idempotently.
+- `services/coordinator` (the Coordinator): react to completions → assign Coder, wake Reviewer on new CR, hand approved+green CR to a human, close the loop, or escalate. Per-issue decisions serialized by an issue row-lock; enqueue next-steps idempotently.
 - Reviewer flow: event-driven on `cr_opened`; Tools added here — `read_change_request` (diff + threads), `submit_review` (with `dedupe_key`), `get_check_status`.
 - **Bounded loops:** `loop_count` increments on changes-requested rework; escalate at cap.
 - **Escalation:** `escalate` tool (with `dedupe_key`) → comment + assign issue + `escalations` row; the single human channel.
 
 **Tests:** full happy path (issue→code→review→ready-for-human-merge); changes-requested loop increments and caps; **exactly-once** escalation under re-dispatch; reviewer verdict idempotent; **a change that weakens/disables its own gating checks is rejected → escalated, never marked ready** (PROD "can't weaken its own checks").
 **Exit:** end-to-end issue→merge-handoff works locally for the worked example. **Depends on:** P3.
+
+> **Deferred — Coordinator closes the issue on the human's merge.** P4's exit is the ready-for-human-**merge** handoff: it marks the CR `ready`, comments, and assigns the linked issue to a human, leaving the issue OPEN (`in_progress`). Actually **closing the issue on merge** requires ingesting GitHub's `pull_request closed/merged` webhook so the Coordinator can observe the merge; that ingestion is **not built in P4** (deferred to a later capability). Until then the issue intentionally stays open after handoff rather than being marked `done`.
+
+## P4.5 — Per-role worker lifecycle (Manager triage + Reviewer verdict)
+
+**Goal:** make the worker do the **right thing per agent role**. P3 built the **Coder** lifecycle end-to-end (clone → Claude edits → push branch → open/update CR → record). P4 built the **Coordinator's** reactive side and added the reviewer's *Tools* (`read_change_request`, `submit_review`, `get_check_status`). But the worker harness (`run_task`) is still **Coder-shaped for every role** — so a **Manager** or **Reviewer** work item, when leased, would run Claude correctly and then wrongly **push an empty branch and open a spurious change request** the Coordinator never expects. This step closes that gap.
+
+> **Naming:** "Manager" is two different things. The **Coordinator** service (P4) is deterministic Rust — it reacts to outcomes and never calls a model. The **Manager *role*** is an AI worker that triages an issue via Claude. This step is about the **worker roles**; the Coordinator is unchanged.
+
+**Tasks**
+- `services/worker`: make `run_task` **role-aware** (branch on `task.role` from `get_task`) — the branch covers **manager / coder / reviewer**; **`tester` is reserved/unsupported for now**. `tester` is accepted as a valid role (`validate_role` in `services/worker` admits all four), but it has **no P4.5 lifecycle**, so reaching the run path with a `tester` (or any unknown) role is an explicit **unsupported/no-op rejected loudly at the seam** — never given a coder-style default:
+  - **Coder** (unchanged): clone → Claude edits → push branch → `open_or_update_change_request` → `record_outcome`.
+  - **Reviewer**: read the CR (`read_change_request`) → Claude reviews → `submit_review` verdict (e.g. `approve` / `request_changes`) → `record_outcome`. **No** branch push, **no** CR.
+  - **Manager**: read the issue (`read_issue`) → Claude triages. On an **actionable** issue: optionally `post_comment` a triage note, then `record_outcome` `succeeded` — and only a *succeeded* Manager item makes the Coordinator assign a Coder. On a **non-actionable** issue: `escalate` (a terminal escalated outcome; the Coordinator parks it and does **not** assign a Coder). Either way: **no** clone-edit-push, **no** CR. (No label-mutating Tool exists in the Tools surface, so triage acts via comments/escalation, not labels; a manager may not need a clone at all — keep it lean.)
+- Role-default prompts: the per-role base prompt and the composition order (role default → repo-wide → per-worker) **already exist** — `role_default_prompt` + `compose_prompt` in `services/tools` (shipped in P3). P4.5 just **reuses/verifies** them for the manager and reviewer roles (and confirms each role's default prompt fits its new no-CR lifecycle); it does NOT add new prompt-composition.
+- Keep all worker effects mediated by Tools (the existing trust boundary); no new direct Postgres/Blob access.
+
+**Tests:** per-role worker lifecycle against the fakes — a **manager** run produces **no** CR and records success (→ Coordinator assigns a coder); a **reviewer** run calls `submit_review` with a verdict and opens **no** CR; the **coder** path is unchanged (still opens a CR); an unknown role still fails loudly at the seam. Extend the P4 happy-path E2E so the manager and reviewer legs use the **real role lifecycle** rather than hand-injected items/CRs.
+**Exit:** the full agent loop runs with correct per-role worker behavior — labelled issue → **manager triages** → Coordinator assigns coder → **coder opens CR** → **reviewer submits a verdict** → Coordinator hands off — with exactly one CR (the coder's) and no spurious branches. **Depends on:** P4.
 
 ## P5 — Resilience (crash-resume, sweeper, bounds, config pinning)
 

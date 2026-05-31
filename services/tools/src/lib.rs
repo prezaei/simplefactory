@@ -236,11 +236,11 @@ pub async fn get_task(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
     let (repo_ident, repo_config) = record::repo_by_id_with_config(&state.pool, auth.repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repo {} not found", auth.repo_id))?;
-    let repo = RepoRef {
-        owner: repo_ident.owner,
-        name: repo_ident.name,
-        installation_id: repo_ident.installation_id,
-    };
+    let repo = RepoRef::new(
+        repo_ident.owner,
+        repo_ident.name,
+        repo_ident.installation_id,
+    );
 
     // Compose the worker's prompt from the repo's stored config: the built-in role
     // default, then the repo-wide instructions, then the matching worker's.
@@ -328,10 +328,13 @@ pub async fn read_change_request(
     }))
 }
 
-/// Open (or update) the change request for this task. Idempotent two ways: the
-/// record-book row is keyed by work item (one CR per task, survives re-dispatch),
-/// and the GitHub PR is keyed by head branch (re-open returns the same number).
-/// The number from GitHub is recorded back onto the record-book row.
+/// Open (or update) the change request for this task. Idempotent two ways, BOTH keyed
+/// by the deterministic head branch (`factory/issue-N`): the record-book CR row's
+/// identity is `(repo_id, head_branch)` (one CR per branch — a re-dispatch OR a later
+/// rework coder pushing the same branch reuses the SAME row, re-pointing its
+/// `work_item_id` to the current owning coder), and the GitHub PR is also keyed by head
+/// branch (re-open returns the same number). The number from GitHub is recorded back
+/// onto the record-book row.
 pub async fn open_or_update_change_request(
     state: &ToolsState,
     auth: &TaskAuth,
@@ -343,7 +346,8 @@ pub async fn open_or_update_change_request(
 ) -> ToolResult {
     let repo = resolve_repo(state, auth).await?;
 
-    // One CR row per work item — a re-dispatch returns the SAME row.
+    // One CR row per head branch — a re-dispatch OR a rework coder pushing the same
+    // (deterministic) branch reuses the SAME row, re-pointing it to this work item.
     let cr_row = record::upsert_change_request_for_item(
         &state.pool,
         auth.repo_id,
@@ -456,6 +460,7 @@ pub async fn submit_review(
             .gh
             .submit_review(&repo, cr_number, verdict, body)
             .await?;
+        record_verdict_cr_state(state, auth, cr_number, verdict).await?;
         tracing::info!(work_item = %auth.work_item_id, cr_number, verdict = verdict.as_str(), "submit_review (no dedupe)");
         return Ok(json!({ "review_id": review_id }));
     };
@@ -472,6 +477,7 @@ pub async fn submit_review(
                 .submit_review(&repo, cr_number, verdict, body)
                 .await
                 .map_err(ToolError::Internal)?;
+            record_verdict_cr_state(state, auth, cr_number, verdict).await?;
             tracing::info!(work_item = %auth.work_item_id, cr_number, verdict = verdict.as_str(), "submit_review");
             Ok(json!({ "review_id": review_id }))
         },
@@ -481,6 +487,46 @@ pub async fn submit_review(
         },
     )
     .await
+}
+
+/// Reflect a review verdict onto the change request's factory state so the
+/// coordinator can react: approve → `approved`, request_changes →
+/// `changes_requested`, comment → no state change. No-op if the CR row isn't
+/// tracked yet (number not recorded).
+async fn record_verdict_cr_state(
+    state: &ToolsState,
+    auth: &TaskAuth,
+    cr_number: i64,
+    verdict: ReviewVerdict,
+) -> Result<(), ToolError> {
+    let new_state = match verdict {
+        ReviewVerdict::Approve => "approved",
+        ReviewVerdict::RequestChanges => "changes_requested",
+        ReviewVerdict::Comment => return Ok(()),
+    };
+    let cr_number = i32::try_from(cr_number)
+        .map_err(|_| ToolError::BadRequest(format!("invalid cr_number {cr_number}")))?;
+    if let Some(cr) = record::change_request_by_number(&state.pool, auth.repo_id, cr_number).await?
+    {
+        // Don't clobber a CR the coordinator has already advanced past review: once a
+        // CR is `ready`/`merged`/`closed` a late or duplicate verdict must not drag it
+        // back to `approved`/`changes_requested` (that would re-open a settled handoff).
+        // The guard is an ATOMIC conditional UPDATE (`... WHERE factory_state NOT IN
+        // ('ready','merged','closed')`), NOT a read-then-write: the coordinator can move
+        // a CR `approved → ready` in the window between a read and the write, so a
+        // read-and-check would TOCTOU-clobber `ready`. The conditional write writes only
+        // when the CR is still in an overwritable state.
+        let wrote =
+            record::set_change_request_state_if_not_terminal(&state.pool, cr.id, new_state).await?;
+        if !wrote {
+            tracing::info!(
+                work_item = %auth.work_item_id,
+                cr_number,
+                "submit_review: CR already past review; not overwriting its factory state"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Read required-check status for either a CR number or an explicit sha. Exactly
@@ -580,6 +626,13 @@ pub async fn heartbeat(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
 /// row, no second comment, and the state stays as the first escalation left it. A
 /// caller who genuinely needs to distinguish multiple escalations may pass an explicit
 /// `dedupe_key`, which is honored as the claim key instead of the default.
+///
+/// Escalation is ALSO idempotent at the record layer per `(work_item, reason)`: the
+/// DB holds a UNIQUE (work_item_id, reason) index, so even an explicit distinct
+/// `dedupe_key` that wins a fresh task claim cannot create a second escalation row for
+/// the same `(work_item, reason)`. In that case the write is a no-op success
+/// (`created = false`): the original row/context is preserved, no second comment is
+/// posted, and the work-item state is left as the first escalation set it.
 pub async fn escalate(
     state: &ToolsState,
     auth: &TaskAuth,
@@ -631,8 +684,36 @@ async fn escalate_won(
         .await?
         .ok_or_else(|| anyhow::anyhow!("work item {} not found", auth.work_item_id))?;
 
-    let escalation_id =
-        record::create_escalation(&state.pool, auth.work_item_id, reason, context, None).await?;
+    // Escalation is idempotent per (work_item, reason): the DB carries a UNIQUE
+    // (work_item_id, reason) index (migration 0004), so a second escalate for the same
+    // (work_item, reason) — e.g. via a distinct caller `dedupe_key` that bypasses the
+    // task-level idempotency claim above — is a no-op success (`created = false`), not a
+    // DB unique-violation. On conflict the original escalation row (and its context) is
+    // preserved, matching the already-delivered human-facing question.
+    let (escalation_id, created) =
+        record::create_escalation_idempotent(&state.pool, auth.work_item_id, reason, context, None)
+            .await?;
+
+    // A repeat (work_item, reason) escalation already has a delivered question and a
+    // settled work-item state; do not post a second comment or re-set the state.
+    if !created {
+        tracing::info!(
+            work_item = %auth.work_item_id,
+            reason,
+            %escalation_id,
+            "escalate: idempotent no-op (escalation already exists for this work_item+reason)"
+        );
+        let item_state = record::work_item_by_id(&state.pool, auth.work_item_id)
+            .await?
+            .map(|w| w.state)
+            .unwrap_or(item.state);
+        return Ok(json!({
+            "escalation_id": escalation_id.to_string(),
+            "delivered_comment_id": Option::<String>::None,
+            "state": item_state.as_str(),
+            "state_changed": false,
+        }));
+    }
 
     // Post the human-facing question on the subject (best-effort delivery target).
     let delivered = if let Some(target) = subject_comment_target(&item.subject_ref) {
@@ -746,33 +827,21 @@ async fn resolve_repo(state: &ToolsState, auth: &TaskAuth) -> anyhow::Result<Rep
     let r = record::repo_by_id(&state.pool, auth.repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repo {} not found", auth.repo_id))?;
-    Ok(RepoRef {
-        owner: r.owner,
-        name: r.name,
-        installation_id: r.installation_id,
-    })
-}
-
-/// Map a [`Subject`] to its [`CommentTarget`].
-fn subject_to_comment_target(subject: Subject) -> CommentTarget {
-    match subject {
-        Subject::Issue(n) => CommentTarget::Issue(n),
-        Subject::ChangeRequest(n) => CommentTarget::ChangeRequest(n),
-    }
+    Ok(RepoRef::new(r.owner, r.name, r.installation_id))
 }
 
 /// Map a `subject_ref` to the comment target used for escalation questions.
 fn subject_comment_target(subject_ref: &str) -> Option<CommentTarget> {
     Subject::from_str(subject_ref)
         .ok()
-        .map(subject_to_comment_target)
+        .map(Subject::comment_target)
 }
 
 /// Parse a `post_comment` target argument (`issue#N` / `cr#N`). An unparseable
 /// target is a bad request (HTTP 400).
 fn parse_comment_target(target: &str) -> std::result::Result<CommentTarget, ToolError> {
     Subject::from_str(target)
-        .map(subject_to_comment_target)
+        .map(Subject::comment_target)
         .map_err(|_| {
             ToolError::BadRequest(format!(
                 "post_comment: target must be 'issue#N' or 'cr#N', got {target:?}"

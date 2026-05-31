@@ -2,7 +2,7 @@
 name: ship-it
 description: |
   Autonomous PR iteration loop: addresses review comments, waits for CI, iterates
-  until green with no unresolved threads, then admin-merges with --squash --delete-branch.
+  until green with no unresolved threads, then squash-merges (using admin merge privileges) and deletes the branch.
   Takes an existing PR number as input. Designed for autonomous execution after
   fix, feature-dev, or similar skills create a PR.
   Uses an agent swarm — all iteration work is delegated to agents so main context stays clean.
@@ -66,6 +66,8 @@ This applies to the main context AND to all sub-agents (Lead Agent, CI Fix Agent
 | `--max-rounds N` | 20 | Maximum iteration rounds before giving up |
 | `--required-checks <name>[,<name>...]` | (auto from branch protection) | Override the required-check list. Use on no-branch-protection repos to still enforce specific checks, or to override branch protection when you know a particular required check is broken. Pass an empty string (`--required-checks ""`) to explicitly require nothing. |
 
+> **Copilot review is automatic, not a flag.** Whenever Copilot is available on the repo, Ship It always requests the Copilot reviewer and waits for its review on the current HEAD before merging (see [Phase 1](#phase-1-pre-flight-main-context) step 6 and [Step 3d / Gate 5 in the playbook](references/iteration-playbook-template.md)). On repos where Copilot is not installed/assignable, the gate is skipped automatically — Ship It never hangs waiting for a review that can't happen.
+
 ---
 
 ## Architecture: Agent Swarm
@@ -100,7 +102,7 @@ Cron fires -> same Lead Agent flow ---+
 
 Run these checks, then hand off to agents. Abort with a clear error if any fail.
 
-1. **Parse arguments**: Extract PR number from args. Extract `--max-rounds N` (default 20). Extract `--required-checks` (comma-separated; explicit empty string = no checks required).
+1. **Parse arguments**: Extract PR number from args. Extract `--max-rounds N` (default 20). Extract `--required-checks` (comma-separated; explicit empty string = no checks required). (There is no Copilot flag — the Copilot review gate is automatic and gated on availability; see step 6.)
 2. **Determine PR number**: from argument, or `gh pr view --json number -q .number`
 3. **Validate PR state**:
    ```bash
@@ -126,8 +128,8 @@ Run these checks, then hand off to agents. Abort with a clear error if any fail.
    **Step 6a — Classic branch protection:**
 
    ```bash
-   # Add `--hostname <host>` on GHE. Auto-detect from step 5.
-   gh api [--hostname <host>] repos/<owner>/<repo>/branches/<base_branch>/protection \
+   # On GitHub Enterprise, add `--hostname <host>` (the value detected in step 5) to the `gh api` call.
+   gh api repos/<owner>/<repo>/branches/<base_branch>/protection \
      --jq '.required_status_checks.contexts // []' 2>&1
    ```
 
@@ -141,7 +143,8 @@ Run these checks, then hand off to agents. Abort with a clear error if any fail.
    **Step 6b — Rulesets (new GitHub mechanism):**
 
    ```bash
-   gh api [--hostname <host>] repos/<owner>/<repo>/rules/branches/<base_branch> \
+   # On GitHub Enterprise, add `--hostname <host>` (the value detected in step 5) to the `gh api` call.
+   gh api repos/<owner>/<repo>/rules/branches/<base_branch> \
      --jq '[.[] | select(.type == "required_status_checks") | (.parameters.required_status_checks // []) | .[].context]' 2>&1
    ```
 
@@ -164,7 +167,7 @@ Run these checks, then hand off to agents. Abort with a clear error if any fail.
    - If BOTH 6a and 6b returned empty (or 404), there is genuinely no required-check configuration → `required_checks: []`.
 
    **When `required_checks` is empty, CI is not gated:**
-   - The merge gate is reviewer comments + `--admin` merge. CI is informational.
+   - The merge gate is reviewer comments + an admin-privileged merge (via the REST endpoint). CI is informational.
    - Do NOT wait for any check — pending checks don't block, and neither do failing checks. The team's merge signal is human review, not CI. If they wanted CI gated, they'd have configured it.
    - Report this explicitly in the "Ship It started" message: "No required checks configured on `<base>` — CI is informational only. Will merge once all review comments are addressed."
 
@@ -173,14 +176,30 @@ Run these checks, then hand off to agents. Abort with a clear error if any fail.
    **Escape hatch:** the user can invoke with `--required-checks <name1>,<name2>` (see Arguments) to override the resolved list — useful when both 6a and 6b are empty but specific checks should still be enforced.
 
    Record the resolved list in `state.json` as `required_checks`.
+
+   **Always probe for Copilot availability and request the reviewer now** (no flag — this is default behavior). Attempt to request the fixed Copilot reviewer login during pre-flight so the review actually gets triggered, then record whether Copilot is usable on this repo:
+
+   ```bash
+   # On GitHub Enterprise, add `--hostname <host>` (the value detected in step 5) to the `gh api` call.
+   gh api --method POST \
+     repos/<owner>/<repo>/pulls/<number>/requested_reviewers \
+     -f "reviewers[]=copilot-pull-request-reviewer[bot]"
+   ```
+
+   - **If it SUCCEEDS** (Copilot newly requested, already a requested reviewer, or has already reviewed) → set state `copilot_available: true`. The merge gate (playbook Step 3d / Gate 5) will wait for a Copilot review on the current HEAD.
+   - **If it FAILS** (e.g. HTTP 422 — Copilot is not installed/assignable on this repo) → set state `copilot_available: false` and log: `"Copilot reviewer unavailable on this repo; proceeding without the Copilot gate"`. Do NOT block, do NOT abort — the gate is simply skipped for this run. This is the "if available" requirement: Ship It never hangs on a repo without Copilot.
+
+   The reviewer login `copilot-pull-request-reviewer[bot]` is fixed (used for the `reviews` API check — query it with `gh api --paginate .../pulls/<N>/reviews` and require `state != "PENDING"` so a 30-per-page truncation or an unsubmitted draft never breaks the gate). Note the gotcha: inline review **comments** from Copilot appear under login `"Copilot"` (not the bot slug) in the REST comments API — see the playbook's comment-fetch step.
 7. **Create workspace**: `mkdir -p .ship-it/pr-<number>`
 8. **Write state file** via Bash (NOT Write tool — see State File I/O rule above):
    ```bash
-   printf '%s' '{"pr_number": <number>, "repo": "<owner/repo>", "ghe_hostname": "<hostname or null>", "branch": "<headRefName>", "base_branch": "<baseRefName>", "required_checks": [<list from step 6>], "max_rounds": <max_rounds>, "iteration": 0, "cron_id": null, "triaged_comment_ids": [], "ci_fix_attempts": {}, "rebase_attempts": 0, "status": "in_progress", "history": []}' > .ship-it/pr-<number>/state.json
+   printf '%s' '{"pr_number": <number>, "repo": "<owner/repo>", "ghe_hostname": "<hostname or null>", "branch": "<headRefName>", "base_branch": "<baseRefName>", "required_checks": [<list from step 6>], "copilot_available": <true|false>, "max_rounds": <max_rounds>, "iteration": 0, "cron_id": null, "triaged_comment_ids": [], "ci_fix_attempts": {}, "rebase_attempts": 0, "status": "in_progress", "history": []}' > .ship-it/pr-<number>/state.json
    ```
    Set `ghe_hostname` to the value from step 5 if it is not `github.com`; otherwise `null`. Sub-agents read this and pass `--hostname` on every `gh api` call.
+   **Unset values must be the JSON literal `null` (unquoted), never the string `"null"`.** The placeholders above are shown quoted (e.g. `"<hostname or null>"`) for readability — when a value is absent, emit bare `null` (e.g. `"ghe_hostname": null`) so `jq` reads it as null, not the four-character string `"null"`. Same rule for any other field whose value can be absent.
+   Set `copilot_available` to the boolean resolved by the availability probe in step 6 (`true` if the reviewer request succeeded / Copilot is assignable, `false` if it failed — e.g. 422). When `false`, the Copilot merge gate is skipped and behavior matches the pre-Copilot version.
 9. **Write iteration playbook** — `.ship-it/pr-<number>/playbook.md`:
-   Read the template at `references/iteration-playbook-template.md` (relative to this skill directory) and fill in all `{{PLACEHOLDER}}` values with the actual PR details. Write the result to the playbook path. This playbook is the self-contained instruction set that each iteration agent executes.
+   Read the template at `references/iteration-playbook-template.md` (relative to this skill directory) and fill in all `{{PLACEHOLDER}}` values with the actual PR details. Write the result to the playbook path. This playbook is the self-contained instruction set that each iteration agent executes. The `{{COPILOT_AVAILABLE}}` placeholder is filled from the `copilot_available` state field (`true`/`false`); when `false` the Copilot gate is skipped, preserving the old behavior.
 10. **Create cron job**:
     ```
     CronCreate(
@@ -194,7 +213,7 @@ Run these checks, then hand off to agents. Abort with a clear error if any fail.
     ```
     Agent(subagent_type="general-purpose", prompt="You are the Ship It Lead Agent. Read and follow the iteration playbook at .ship-it/pr-<number>/playbook.md — it contains all instructions for one iteration cycle. Read .ship-it/pr-<number>/state.json for current state. Execute exactly one iteration, update the state file, and exit.")
     ```
-12. **Report to user**: "Ship It started for PR #N. Iterating every 3 minutes. I'll report back when it's merged or if something blocks."
+12. **Report to user**: "Ship It started for PR #N. Iterating every 3 minutes. I'll report back when it's merged or if something blocks." When `copilot_available` is `true`, add: "Copilot review requested — will wait for it on the current HEAD before merging." When `copilot_available` is `false`, add: "Copilot reviewer unavailable on this repo; proceeding without the Copilot gate."
 
 **Main context is now done.** All further work happens in agents via the cron loop.
 
@@ -292,10 +311,10 @@ When in doubt, escalate. A false-escalation wastes a notification; a false-auto-
 | Merge conflicts — mechanical only (lockfiles, generated stubs, imports) | Rebase onto base, resolve, force-push-with-lease, continue |
 | Merge conflicts — substantive (overlapping logic) | Abort rebase, escalate to user with conflict summary, cancel cron |
 | Check conclusion is `ACTION_REQUIRED` | Do NOT treat as a single outcome. Fetch the check's `output.title` via `gh api repos/.../commits/<sha>/check-runs` and classify (see Guardrails) |
-| All comments addressed but reviewer hasn't re-reviewed | Merge anyway — `--admin` bypasses `CHANGES_REQUESTED` |
+| All comments addressed but reviewer hasn't re-reviewed | Merge anyway — admin merge privileges (via the REST endpoint) bypass `CHANGES_REQUESTED` |
 | New comments at merge time | Go back to triage, do NOT merge |
 | `gh pr merge` fails with "'main' is already used by worktree" | Use the REST API directly (see [Executing the Merge](#executing-the-merge)). `gh pr merge` tries to checkout the base branch locally; that fails when this repo has sibling worktrees. |
-| `--admin` merge fails with permissions error | Report error — may lack admin rights on the branch |
+| Merge fails with a permissions error | Report error — may lack admin rights on the branch |
 | Rate limiting | Back off with 10s delays |
 
 ## Executing the Merge
@@ -311,7 +330,8 @@ This is because `gh pr merge` tries to checkout and update the base branch local
 **Always use the REST API** — it does the merge entirely server-side with no local git manipulation:
 
 ```bash
-gh api [--hostname <host>] --method PUT \
+# On GitHub Enterprise, add `--hostname <host>` to the `gh api` call, where `<host>` is `state.ghe_hostname` (non-null).
+gh api --method PUT \
   repos/<owner>/<repo>/pulls/<N>/merge \
   -f merge_method=squash
 # Response: {"sha": "...", "merged": true, "message": "..."}
@@ -322,7 +342,8 @@ gh api [--hostname <host>] --method PUT \
 Branch deletion is typically handled by the merge (GitHub auto-deletes on squash-merge when configured). If the PR's repo doesn't auto-delete, explicitly:
 
 ```bash
-gh api [--hostname <host>] --method DELETE \
+# On GitHub Enterprise, add `--hostname <host>` to the `gh api` call, where `<host>` is `state.ghe_hostname` (non-null).
+gh api --method DELETE \
   repos/<owner>/<repo>/git/refs/heads/<branch>
 ```
 
@@ -332,9 +353,11 @@ A 422 "Reference does not exist" response from the DELETE means the branch was a
 
 - **Never force-push to `main` or any protected/release branch.** The ONLY time force-push is allowed is the rebase flow on the PR's own feature branch, and it MUST use `--force-with-lease` so a concurrent reviewer push is never clobbered. See [Merge Conflict Handling](#merge-conflict-handling).
 - **NEVER merge unless CI is green for the HEAD commit** — every required check (from `state.required_checks`) must show SUCCESS, NEUTRAL, or SKIPPED for the exact HEAD SHA. If a required check is absent, pending, or shows results for a stale commit, DO NOT merge — exit the iteration and wait. This is the single most important guardrail.
+- **When `copilot_available` is true** (the default on Copilot-enabled repos), NEVER merge unless `copilot-pull-request-reviewer[bot]` has *submitted* a review (`state != "PENDING"` — a PENDING draft does not count) whose `commit_id` equals the exact current HEAD SHA AND every new comment from that review is triaged. PAGINATE both APIs with `--paginate` (the reviews API AND the comments API each cap at 30/page — without pagination the Copilot review/comment can be on a later page and silently missed) and check review-thread resolution via GraphQL (loop the `reviewThreads` cursor to cover ALL threads) — see the playbook. The Copilot-on-HEAD check is computed in the playbook's [Step 3d](references/iteration-playbook-template.md) (wait-check) and [Step 4 Gate 5](references/iteration-playbook-template.md) (merge gate). A review on a superseded commit does NOT count; a pushed fix resets the gate to the new HEAD (re-request the reviewer). When Copilot is unavailable on the repo (`copilot_available: false`), this gate is skipped and behavior is unchanged.
 - **`ACTION_REQUIRED` is a bucket code, not a diagnosis.** Never interpret it in isolation. The same conclusion covers at least three different real states: (1) the check was *skipped because the branch has merge conflicts with the base* (title: `"Skipped due to merge conflicts"`), (2) the check is *waiting for a human to approve the pipeline run* (ADO PR pipelines on GHE do this for external contributors), (3) the check is a *compliance gate asking for a human click* (e.g. GHE `GitOps/GitHubPop` with title `"Proof of presence"`). **Always** fetch `output.title` and `output.summary` from the Check Runs API before classifying:
   ```bash
-  gh api [--hostname <host>] repos/<owner>/<repo>/commits/<head_sha>/check-runs \
+  # On GitHub Enterprise, add `--hostname <host>` to the `gh api` call, where `<host>` is `state.ghe_hostname` (non-null).
+  gh api repos/<owner>/<repo>/commits/<head_sha>/check-runs \
     --jq '.check_runs[] | select(.name=="<name>") | {conclusion, title: .output.title, summary: .output.summary}'
   ```
   Classify by title:
@@ -345,7 +368,7 @@ A 422 "Reference does not exist" response from the DELETE means the branch was a
 
   The cost of treating `ACTION_REQUIRED` as a single "waiting" state is catastrophic: the cron polls forever while the PR is actually blocked on a conflict or a decision the user can fix in seconds.
 - **Requeue CI on infrastructure/flaky failures** — when a CI failure is diagnosed as infrastructure/flaky (not a code issue), requeue the failed run instead of just waiting. On GitHub Actions: `gh run rerun <run-id> --failed`. Stale red CI won't auto-retry.
-- **Merge when all comments are addressed** — `CHANGES_REQUESTED` is not a blocker if every comment has been triaged (addressed, rejected with rationale, or skipped). Reviewers often don't re-review promptly; `--admin` bypasses this GitHub status.
+- **Merge when all comments are addressed** — `CHANGES_REQUESTED` is not a blocker if every comment has been triaged (addressed, rejected with rationale, or skipped). Reviewers often don't re-review promptly; admin merge privileges (via the REST merge endpoint) bypass this GitHub status.
 - **Never merge without a fresh comment re-check** — always re-fetch right before merge.
 - **Never modify files outside the PR's diff scope.**
 - **Never delete or rewrite git history** — only add new commits.

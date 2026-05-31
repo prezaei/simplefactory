@@ -36,6 +36,34 @@ pub struct Settings {
     pub default_model: Option<String>,
     /// Guidance appended to every worker's prompt.
     pub instructions: Option<String>,
+    /// Path prefixes whose changes alter the very checks that gate a merge. A CR
+    /// touching any of these "weakens its own gating" and can never be marked ready
+    /// (it is escalated as a conflict instead). Defaults to `[".github/workflows/"]`
+    /// (GitHub Actions workflow definitions); a repo can extend it (e.g. `"ci/"`).
+    /// `serde(default)` so a config jsonb stored before this field existed still
+    /// deserializes (back-compat for already-connected repos).
+    #[serde(default = "default_gating_paths")]
+    pub gating_paths: Vec<String>,
+    /// Retry ceiling: a Failed work item with this many attempts (or more) escalates
+    /// `retries_exhausted` instead of being re-queued for another attempt. Per-repo
+    /// (consistent with `gating_paths`); defaults to 3. `serde(default)` for back-compat
+    /// with config jsonb stored before this field existed.
+    #[serde(default = "default_retry_cap")]
+    pub retry_cap: u32,
+    /// Review-rework ceiling: at this many changes-requested cycles the loop escalates
+    /// `loop_cap` instead of dispatching yet another coder. Per-repo; defaults to 5.
+    /// `serde(default)` for back-compat with older stored config jsonb.
+    #[serde(default = "default_loop_cap")]
+    pub loop_cap: u32,
+    /// The GitHub login a ready-for-merge handoff / escalation assigns the linked issue
+    /// to. OPTIONAL: when unset (`None`) the coordinator posts the handoff/escalation
+    /// comment but performs NO assignment (a hardcoded placeholder user would be rejected
+    /// by GitHub on repos where it isn't assignable, after the react has already
+    /// committed). When `Some`, it must be a non-empty, trimmed login (validated at
+    /// [`parse`]). Defaults to unset. `serde(default)` so config jsonb stored before this
+    /// field existed still deserializes (back-compat for already-connected repos).
+    #[serde(default)]
+    pub escalation_assignee: Option<String>,
 }
 
 /// Global capacity limits.
@@ -90,6 +118,10 @@ pub enum ConfigError {
     UnsupportedVersion(u32),
     #[error("limits.max_concurrent_workers must be greater than 0")]
     NonPositiveGlobalCap,
+    #[error("settings.retry_cap must be greater than 0")]
+    NonPositiveRetryCap,
+    #[error("settings.loop_cap must be greater than 0")]
+    NonPositiveLoopCap,
     #[error("worker '{0}': max_concurrent must be greater than 0")]
     NonPositiveWorkerCap(String),
     #[error("duplicate worker name '{0}'")]
@@ -104,6 +136,10 @@ pub enum ConfigError {
     MultipleIssueLabeledSubscribers { first: String, second: String },
     #[error("worker '{0}': instructions_file must be a non-empty path")]
     EmptyInstructionsFile(String),
+    #[error("settings.escalation_assignee must be a non-empty, trimmed GitHub login when set")]
+    EmptyEscalationAssignee,
+    #[error("settings.gating_paths entries must each be a non-empty, trimmed path prefix")]
+    EmptyGatingPath,
 }
 
 /// Parse and validate a `.factory/config.yml` document.
@@ -115,6 +151,37 @@ pub fn parse(yaml: &str) -> Result<Config, ConfigError> {
     }
     if raw.limits.max_concurrent_workers == 0 {
         return Err(ConfigError::NonPositiveGlobalCap);
+    }
+    if raw.settings.retry_cap == 0 {
+        return Err(ConfigError::NonPositiveRetryCap);
+    }
+    if raw.settings.loop_cap == 0 {
+        return Err(ConfigError::NonPositiveLoopCap);
+    }
+    // An escalation_assignee, when set, must be a real (non-empty, trimmed) login.
+    // A blank/whitespace value would assign to no one yet suppress the unset-skip path.
+    let escalation_assignee = match &raw.settings.escalation_assignee {
+        Some(a) => {
+            let trimmed = a.trim();
+            if trimmed.is_empty() {
+                return Err(ConfigError::EmptyEscalationAssignee);
+            }
+            Some(trimmed.to_owned())
+        }
+        None => None,
+    };
+    // Each gating-path prefix must be a real (non-empty, trimmed) prefix. An empty `""`
+    // entry would make `is_gating_path` (a `path.starts_with(prefix)` test) match EVERY
+    // changed file, so every approved CR would be escalated as a gating conflict and no
+    // handoff could ever happen. Trim each entry and reject blanks so one stray list item
+    // can't silently disable all handoffs.
+    let mut gating_paths = Vec::with_capacity(raw.settings.gating_paths.len());
+    for p in &raw.settings.gating_paths {
+        let trimmed = p.trim();
+        if trimmed.is_empty() {
+            return Err(ConfigError::EmptyGatingPath);
+        }
+        gating_paths.push(trimmed.to_owned());
     }
 
     let mut seen = HashSet::new();
@@ -177,6 +244,10 @@ pub fn parse(yaml: &str) -> Result<Config, ConfigError> {
             label: raw.settings.label,
             default_model: raw.settings.default_model,
             instructions: raw.settings.instructions,
+            gating_paths,
+            retry_cap: raw.settings.retry_cap,
+            loop_cap: raw.settings.loop_cap,
+            escalation_assignee,
         },
         limits: Limits {
             max_concurrent_workers: raw.limits.max_concurrent_workers,
@@ -287,6 +358,14 @@ struct RawSettings {
     default_model: Option<String>,
     #[serde(default)]
     instructions: Option<String>,
+    #[serde(default = "default_gating_paths")]
+    gating_paths: Vec<String>,
+    #[serde(default = "default_retry_cap")]
+    retry_cap: u32,
+    #[serde(default = "default_loop_cap")]
+    loop_cap: u32,
+    #[serde(default)]
+    escalation_assignee: Option<String>,
 }
 
 impl Default for RawSettings {
@@ -295,6 +374,10 @@ impl Default for RawSettings {
             label: default_label(),
             default_model: None,
             instructions: None,
+            gating_paths: default_gating_paths(),
+            retry_cap: default_retry_cap(),
+            loop_cap: default_loop_cap(),
+            escalation_assignee: None,
         }
     }
 }
@@ -348,6 +431,25 @@ fn default_label() -> String {
 }
 
 fn default_global_cap() -> u32 {
+    5
+}
+
+/// The default set of gating-check path prefixes: GitHub Actions workflow
+/// definitions. A CR touching any of these alters the checks that gate its own
+/// merge, so it can never be marked ready (see [`Settings::gating_paths`]).
+fn default_gating_paths() -> Vec<String> {
+    vec![".github/workflows/".to_owned()]
+}
+
+/// The platform-default retry ceiling (`settings.retry_cap`): a Failed work item with
+/// this many attempts (or more) escalates rather than being re-queued.
+fn default_retry_cap() -> u32 {
+    3
+}
+
+/// The platform-default review-rework ceiling (`settings.loop_cap`): at this many
+/// changes-requested cycles the loop escalates instead of dispatching another coder.
+fn default_loop_cap() -> u32 {
     5
 }
 
@@ -407,6 +509,93 @@ workers:
         assert_eq!(cfg.settings.label, "factory");
         assert_eq!(cfg.limits.max_concurrent_workers, 5);
         assert!(cfg.workers.is_empty());
+        // The gating-paths default applies when `settings.gating_paths` is omitted.
+        assert_eq!(
+            cfg.settings.gating_paths,
+            vec![".github/workflows/".to_owned()]
+        );
+        // The retry/loop caps default when omitted (the platform defaults).
+        assert_eq!(cfg.settings.retry_cap, 3);
+        assert_eq!(cfg.settings.loop_cap, 5);
+        // escalation_assignee defaults to unset (no hardcoded human).
+        assert_eq!(cfg.settings.escalation_assignee, None);
+    }
+
+    #[test]
+    fn reads_escalation_assignee_trimmed() {
+        let cfg = parse(
+            "version: 1\nsettings:\n  label: factory\n  escalation_assignee: \"  octo-human  \"\n",
+        )
+        .expect("config with escalation_assignee should parse");
+        assert_eq!(
+            cfg.settings.escalation_assignee,
+            Some("octo-human".to_owned()),
+            "a set escalation_assignee is read and trimmed"
+        );
+    }
+
+    #[test]
+    fn rejects_blank_escalation_assignee() {
+        let err =
+            parse("version: 1\nsettings:\n  label: factory\n  escalation_assignee: \"   \"\n");
+        assert!(matches!(err, Err(ConfigError::EmptyEscalationAssignee)));
+    }
+
+    #[test]
+    fn rejects_blank_gating_path() {
+        // An empty/whitespace gating prefix would make is_gating_path match every file
+        // (path.starts_with("") is always true), escalating every approved CR as a
+        // gating conflict — so a blank entry must be rejected at parse.
+        let err = parse(
+            "version: 1\nsettings:\n  label: factory\n  gating_paths: [\".github/workflows/\", \"   \"]\n",
+        );
+        assert!(matches!(err, Err(ConfigError::EmptyGatingPath)));
+    }
+
+    #[test]
+    fn reads_gating_paths_trimmed() {
+        let cfg = parse(
+            "version: 1\nsettings:\n  label: factory\n  gating_paths: [\"  .github/workflows/  \"]\n",
+        )
+        .expect("config with a gating_path should parse");
+        assert_eq!(
+            cfg.settings.gating_paths,
+            vec![".github/workflows/".to_owned()],
+            "a gating_path is read and trimmed"
+        );
+    }
+
+    #[test]
+    fn reads_custom_retry_and_loop_caps() {
+        let cfg = parse("version: 1\nsettings:\n  label: factory\n  retry_cap: 7\n  loop_cap: 9\n")
+            .expect("config with custom caps should parse");
+        assert_eq!(cfg.settings.retry_cap, 7, "a custom retry_cap is read");
+        assert_eq!(cfg.settings.loop_cap, 9, "a custom loop_cap is read");
+    }
+
+    #[test]
+    fn rejects_zero_retry_cap() {
+        let err = parse("version: 1\nsettings:\n  label: factory\n  retry_cap: 0\n");
+        assert!(matches!(err, Err(ConfigError::NonPositiveRetryCap)));
+    }
+
+    #[test]
+    fn rejects_zero_loop_cap() {
+        let err = parse("version: 1\nsettings:\n  label: factory\n  loop_cap: 0\n");
+        assert!(matches!(err, Err(ConfigError::NonPositiveLoopCap)));
+    }
+
+    #[test]
+    fn reads_custom_gating_paths() {
+        let cfg = parse(
+            "version: 1\nsettings:\n  label: factory\n  gating_paths:\n    - \"ci/\"\n    - \".github/workflows/\"\n",
+        )
+        .expect("config with custom gating_paths should parse");
+        assert_eq!(
+            cfg.settings.gating_paths,
+            vec!["ci/".to_owned(), ".github/workflows/".to_owned()],
+            "a custom gating_paths list is read verbatim"
+        );
     }
 
     #[test]
@@ -503,6 +692,28 @@ workers:
             Err(ConfigError::NonManagerIssueLabeled { worker, role })
                 if worker == "c" && role == Role::Coder
         ));
+    }
+
+    #[test]
+    fn config_jsonb_without_gating_paths_still_deserializes() {
+        // Back-compat: a config stored as jsonb before `gating_paths` existed must
+        // still read back (the field defaults), so already-connected repos don't break.
+        let stored = serde_json::json!({
+            "version": 1,
+            "settings": { "label": "factory", "default_model": null, "instructions": null },
+            "limits": { "max_concurrent_workers": 5 },
+            "workers": []
+        });
+        let cfg: Config = serde_json::from_value(stored).expect("old jsonb deserializes");
+        assert_eq!(
+            cfg.settings.gating_paths,
+            vec![".github/workflows/".to_owned()]
+        );
+        // The retry/loop caps also default for jsonb stored before they existed.
+        assert_eq!(cfg.settings.retry_cap, 3);
+        assert_eq!(cfg.settings.loop_cap, 5);
+        // escalation_assignee defaults to unset for jsonb stored before it existed.
+        assert_eq!(cfg.settings.escalation_assignee, None);
     }
 
     #[test]

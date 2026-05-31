@@ -48,6 +48,19 @@ pub struct RepoRef {
     pub installation_id: i64,
 }
 
+impl RepoRef {
+    /// Construct a [`RepoRef`] from its three identity fields. The single place
+    /// callers (coordinator, tools) build a `RepoRef` from a stored repo identity,
+    /// so the field mapping lives here rather than being repeated at each seam.
+    pub fn new(owner: impl Into<String>, name: impl Into<String>, installation_id: i64) -> Self {
+        RepoRef {
+            owner: owner.into(),
+            name: name.into(),
+            installation_id,
+        }
+    }
+}
+
 /// What a webhook event refers to, for subject-keying work items.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Subject {
@@ -61,6 +74,15 @@ impl Subject {
         match self {
             Subject::Issue(n) => format!("issue#{n}"),
             Subject::ChangeRequest(n) => format!("cr#{n}"),
+        }
+    }
+
+    /// The [`CommentTarget`] for this subject. The single place a subject maps to a
+    /// comment target, shared by the coordinator and the tools service.
+    pub fn comment_target(self) -> CommentTarget {
+        match self {
+            Subject::Issue(n) => CommentTarget::Issue(n),
+            Subject::ChangeRequest(n) => CommentTarget::ChangeRequest(n),
         }
     }
 }
