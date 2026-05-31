@@ -24,12 +24,18 @@ use serde_json::{json, Value};
 /// A tool-call error split by who is at fault, so the HTTP layer can map it to the
 /// right status: a [`ToolError::BadRequest`] is the caller's fault (malformed or
 /// invalid arguments) and becomes a `400` with the message echoed back; a
-/// [`ToolError::Internal`] is Factory's fault (DB / GitHub / blob I/O) and becomes a
-/// `500` with a generic body, the real error logged server-side.
+/// [`ToolError::Conflict`] is a transient idempotency race (another caller holds the
+/// claim while its side effect is in flight) and becomes a `409` so the caller
+/// retries; a [`ToolError::Internal`] is Factory's fault (DB / GitHub / blob I/O) and
+/// becomes a `500` with a generic body, the real error logged server-side.
 #[derive(Debug)]
 pub enum ToolError {
     /// Invalid or missing arguments — the caller must fix the request (HTTP 400).
     BadRequest(String),
+    /// A retryable conflict: a concurrent caller holds the idempotency claim while
+    /// its side effect is in flight. The caller should retry (HTTP 409); the message
+    /// is echoed back so the client knows it is in-progress, not a hard failure.
+    Conflict(String),
     /// An internal failure (DB, GitHub, blob, …) — not the caller's fault (HTTP 500).
     Internal(anyhow::Error),
 }
@@ -38,6 +44,7 @@ impl std::fmt::Display for ToolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ToolError::BadRequest(msg) => write!(f, "{msg}"),
+            ToolError::Conflict(msg) => write!(f, "{msg}"),
             ToolError::Internal(e) => write!(f, "{e}"),
         }
     }
@@ -562,14 +569,18 @@ pub async fn heartbeat(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
     Ok(json!({ "lease_expires_at": expires }))
 }
 
-/// Escalate to a human — the single human channel. Idempotent per task under scope
-/// `"escalate"` via the claim-first pattern: the claim winner records the escalation,
-/// posts the question on the subject, and moves the work item to the state mapped from
-/// `reason` (resumable `blocked` for needs-human-input, terminal `escalated`
-/// otherwise), then stores the result. Even when the caller passes NO `dedupe_key`
-/// the key defaults to a
-/// per-task constant, so escalate is idempotent per work item by default — exactly one
-/// escalation row per task no matter how many concurrent or retried calls arrive.
+/// Escalate to a human — the single human channel. Idempotent per task+reason under
+/// scope `"escalate"` via the claim-first pattern: the claim winner records the
+/// escalation, posts the question on the subject, and moves the work item to the state
+/// mapped from `reason` (resumable `blocked` for needs-human-input, terminal
+/// `escalated` otherwise), then stores the result. When the caller passes NO
+/// `dedupe_key` the key defaults to the `reason` string (NOT a per-task constant): so
+/// re-escalating the SAME reason is idempotent (exactly one escalation row, state
+/// unchanged), while escalating a DIFFERENT reason later (e.g. `blocked_input` then
+/// `retries_exhausted`) creates a NEW escalation and applies that reason's
+/// reason→state mapping. Using a constant default would conflate distinct reasons:
+/// the second, different reason would hit `Done` and silently no-op, leaving the work
+/// item in the wrong state.
 pub async fn escalate(
     state: &ToolsState,
     auth: &TaskAuth,
@@ -581,9 +592,10 @@ pub async fn escalate(
     // front with a clear message rather than surfacing a DB constraint error.
     validate_escalation_reason(reason)?;
 
-    // One escalation per task: when the caller omits a dedupe_key, fall back to a
-    // per-task constant so escalate is idempotent per work item by default.
-    let key = dedupe_key.unwrap_or(ESCALATE_DEFAULT_KEY);
+    // When the caller omits a dedupe_key, default it to the reason: re-escalating the
+    // same reason is idempotent, but a different reason creates a new escalation and
+    // applies its own reason→state mapping (a constant default would conflate them).
+    let key = dedupe_key.unwrap_or(reason);
 
     idempotent(
         state,
@@ -656,11 +668,6 @@ async fn escalate_won(
 
 /// Default heartbeat lease extension (15 minutes), per the spec.
 const HEARTBEAT_TTL_SECS: f64 = 900.0;
-
-/// The dedupe key used for `escalate` when the caller supplies none. Escalation is
-/// "one per task", so the default key is a per-task constant — every escalate for a
-/// work item shares this slot and only the first runs the side effect.
-const ESCALATE_DEFAULT_KEY: &str = "task";
 
 /// The built-in, role-specific base prompt. Repo-wide and per-worker instructions
 /// are layered on top of this by [`compose_prompt`].
@@ -822,13 +829,42 @@ where
     match record::idempotency_claim(&state.pool, auth.work_item_id, scope, key).await? {
         IdempotencyClaim::Done(stored) => on_redo(stored).await,
         IdempotencyClaim::Pending => {
+            // A concurrent caller holds the claim while its side effect is in flight.
+            // This is a transient race, not a hard failure: classify it as a retryable
+            // Conflict (HTTP 409) so the caller retries rather than treating it as 500.
             tracing::info!(work_item = %auth.work_item_id, scope, dedupe_key = key, "idempotency: claim pending; ask caller to retry");
-            Err(ToolError::Internal(anyhow::anyhow!("{in_progress_msg}")))
+            Err(ToolError::Conflict(in_progress_msg.to_owned()))
         }
         IdempotencyClaim::Won => match run().await {
             Ok(result) => {
-                record::idempotency_complete(&state.pool, auth.work_item_id, scope, key, &result)
-                    .await?;
+                // The side effect SUCCEEDED. Record its result so later callers dedupe.
+                // If idempotency_complete fails, we must NOT return via `?`: that would
+                // strand the 'null' placeholder, wedging every retry as Pending for the
+                // full stale window (CLAIM_STALE_SECS), after which the stale-reclaim
+                // re-runs the side effect — a DUPLICATE. Instead release the claim so a
+                // retry re-claims immediately.
+                //
+                // Residual tradeoff: because the side effect already ran but its result
+                // was never recorded, a retry that re-claims will run the side effect a
+                // SECOND time (a duplicate). This is the irreducible dual-write window
+                // between the external side effect and our record book — there is no way
+                // to make "do the side effect" and "record that we did it" atomic across
+                // two systems. Releasing here trades the old failure mode (wedge for
+                // CLAIM_STALE_SECS, THEN silently double-fire) for a faster, logged one
+                // (retry MAY double-fire), which is strictly better: bounded and visible.
+                if let Err(e) = record::idempotency_complete(
+                    &state.pool,
+                    auth.work_item_id,
+                    scope,
+                    key,
+                    &result,
+                )
+                .await
+                {
+                    tracing::warn!(work_item = %auth.work_item_id, scope, error = %e, "idempotency_complete failed after side effect; releasing claim (a retry may duplicate the side effect)");
+                    release_claim(state, auth, scope, key).await;
+                    return Err(ToolError::Internal(e.into()));
+                }
                 Ok(result)
             }
             Err(e) => {
@@ -994,6 +1030,12 @@ async fn handle_tool(
             tracing::warn!(tool = tool.as_str(), work_item = %auth.work_item_id, error = %msg, "tool rejected bad request");
             error_response(StatusCode::BAD_REQUEST, &msg)
         }
+        // A retryable conflict (idempotency race): 409 with the in-progress message
+        // echoed back so the caller knows to retry rather than treat it as a failure.
+        Err(ToolCallError::Tool(ToolError::Conflict(msg))) => {
+            tracing::info!(tool = tool.as_str(), work_item = %auth.work_item_id, error = %msg, "tool conflict; caller should retry");
+            error_response(StatusCode::CONFLICT, &msg)
+        }
         // An internal failure is Factory's fault: 500 with a generic body; the real
         // error is logged server-side, never leaked to the caller.
         Err(ToolCallError::Tool(ToolError::Internal(e))) => {
@@ -1005,10 +1047,11 @@ async fn handle_tool(
 
 /// Outcome of running a tool through the audited choke point: either an
 /// infrastructure failure writing the audit row, or a failure inside the tool
-/// itself. The HTTP layer maps `Audit` → 500, `Tool(BadRequest)` → 400, and
-/// `Tool(Internal)` → 500; the MCP layer maps `Audit` → a JSON-RPC internal error,
-/// `Tool(BadRequest)` → JSON-RPC invalid-params, and `Tool(Internal)` → an `isError`
-/// content result.
+/// itself. The HTTP layer maps `Audit` → 500, `Tool(BadRequest)` → 400,
+/// `Tool(Conflict)` → 409, and `Tool(Internal)` → 500; the MCP layer maps `Audit` → a
+/// JSON-RPC internal error, `Tool(BadRequest)` → JSON-RPC invalid-params,
+/// `Tool(Conflict)` → a JSON-RPC error with a retryable code, and `Tool(Internal)` →
+/// an `isError` content result.
 pub enum ToolCallError {
     /// Writing the mandatory audit event failed; the call did not run.
     Audit(anyhow::Error),

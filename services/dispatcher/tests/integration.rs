@@ -7,11 +7,15 @@
 
 use factory_config as config;
 use factory_dispatcher::{dispatch_once, FakeLauncher};
+use factory_github::FakeGitHub;
 use factory_record as record;
 use record::{Kind, NewWorkItem};
 use uuid::Uuid;
 
 const TOOLS_URL: &str = "http://tools.local:8080";
+
+/// The installation id every seeded repo is registered under.
+const INSTALLATION_ID: i64 = 12345;
 
 /// `dispatch_once` is *global*: it walks every configured repo in the shared test
 /// DB and a single call may lease another concurrently-seeded test's items. To
@@ -59,16 +63,32 @@ workers:
     )
 }
 
+/// What `seed` returns: the repo and its identity plus the enqueued work items.
+struct Seeded {
+    repo_id: Uuid,
+    owner: String,
+    name: String,
+    worker_name: String,
+    work_ids: Vec<Uuid>,
+}
+
+impl Seeded {
+    /// The HTTPS clone URL the dispatcher builds for this repo.
+    fn repo_url(&self) -> String {
+        format!("https://github.com/{}/{}.git", self.owner, self.name)
+    }
+}
+
 /// Create a repo, store the parsed config, and enqueue `n` coder work items
-/// triggered by "manager". Returns (repo_id, config_sha, worker_name, work_item_ids).
-async fn seed(pool: &record::Pool, n: usize) -> (Uuid, String, String, Vec<Uuid>) {
+/// triggered by "manager".
+async fn seed(pool: &record::Pool, n: usize) -> Seeded {
     let suffix = Uuid::now_v7();
     let owner = format!("owner-{suffix}");
     let name = format!("repo-{suffix}");
     let worker_name = format!("coder-{suffix}");
     let label = format!("factory-{suffix}");
 
-    let repo_id = record::upsert_repo(pool, &owner, &name, 12345)
+    let repo_id = record::upsert_repo(pool, &owner, &name, INSTALLATION_ID)
         .await
         .expect("upsert_repo");
 
@@ -103,7 +123,13 @@ async fn seed(pool: &record::Pool, n: usize) -> (Uuid, String, String, Vec<Uuid>
         }
     }
     assert_eq!(ids.len(), n, "enqueued exactly {n} items");
-    (repo_id, config_sha, worker_name, ids)
+    Seeded {
+        repo_id,
+        owner,
+        name,
+        worker_name,
+        work_ids: ids,
+    }
 }
 
 /// Test 1: a single pass launches exactly the per-worker cap (2), opens 2
@@ -117,11 +143,14 @@ async fn dispatch_launches_up_to_per_worker_cap() {
     };
     // Serialize the dispatch pass so no other test's pass leases our items.
     let _guard = DISPATCH_GUARD.lock().await;
-    let (repo_id, _sha, worker_name, work_ids) = seed(&pool, 3).await;
+    let seeded = seed(&pool, 3).await;
+    let repo_id = seeded.repo_id;
+    let work_ids = &seeded.work_ids;
     let lease_owner = format!("disp-{}", Uuid::now_v7());
 
     let launcher = FakeLauncher::new();
-    dispatch_once(&pool, &launcher, TOOLS_URL, &lease_owner)
+    let gh = FakeGitHub::new();
+    dispatch_once(&pool, &launcher, &gh, TOOLS_URL, &lease_owner)
         .await
         .expect("dispatch_once");
 
@@ -135,8 +164,15 @@ async fn dispatch_launches_up_to_per_worker_cap() {
     for rec in &launched {
         assert_eq!(rec.repo_id, repo_id);
         assert_eq!(rec.role, Kind::Coder);
-        assert_eq!(rec.worker_name, worker_name);
+        assert_eq!(rec.worker_name, seeded.worker_name);
         assert_eq!(rec.tools_url, TOOLS_URL);
+        // The launch carries the clone URL and the minted installation token.
+        assert_eq!(rec.repo_url, seeded.repo_url());
+        assert_eq!(
+            rec.install_token,
+            format!("ghs_fake_install_{INSTALLATION_ID}"),
+            "install token is the one the fake GitHub minted for this installation"
+        );
         assert!(
             work_ids.contains(&rec.work_item_id),
             "launched a seeded work item"
@@ -145,7 +181,7 @@ async fn dispatch_launches_up_to_per_worker_cap() {
 
     // Exactly 2 attempts opened across the seeded items.
     let mut attempts = 0i64;
-    for id in &work_ids {
+    for id in work_ids.iter() {
         attempts +=
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM attempts WHERE work_item_id = $1")
                 .bind(id)
@@ -157,7 +193,7 @@ async fn dispatch_launches_up_to_per_worker_cap() {
 
     // Exactly 2 task tokens minted across the seeded items.
     let mut tokens = 0i64;
-    for id in &work_ids {
+    for id in work_ids.iter() {
         tokens += sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM task_tokens WHERE work_item_id = $1",
         )
@@ -179,11 +215,12 @@ async fn second_pass_launches_nothing_while_cap_bound() {
     };
     // Serialize the dispatch pass so no other test's pass leases our items.
     let _guard = DISPATCH_GUARD.lock().await;
-    let (repo_id, _sha, _worker_name, _ids) = seed(&pool, 3).await;
+    let repo_id = seed(&pool, 3).await.repo_id;
     let lease_owner = format!("disp-{}", Uuid::now_v7());
 
     let launcher = FakeLauncher::new();
-    dispatch_once(&pool, &launcher, TOOLS_URL, &lease_owner)
+    let gh = FakeGitHub::new();
+    dispatch_once(&pool, &launcher, &gh, TOOLS_URL, &lease_owner)
         .await
         .expect("first dispatch");
     assert_eq!(
@@ -194,7 +231,7 @@ async fn second_pass_launches_nothing_while_cap_bound() {
 
     // The 2 leased items stay in-flight (leased/running), so the per-worker cap
     // is still bound on the second pass — no further work can be leased.
-    dispatch_once(&pool, &launcher, TOOLS_URL, &lease_owner)
+    dispatch_once(&pool, &launcher, &gh, TOOLS_URL, &lease_owner)
         .await
         .expect("second dispatch");
     assert_eq!(
@@ -215,11 +252,14 @@ async fn tokens_are_scoped_to_their_own_task() {
     };
     // Serialize the dispatch pass so no other test's pass leases our items.
     let _guard = DISPATCH_GUARD.lock().await;
-    let (repo_id, _sha, _worker_name, work_ids) = seed(&pool, 3).await;
+    let seeded = seed(&pool, 3).await;
+    let repo_id = seeded.repo_id;
+    let work_ids = &seeded.work_ids;
     let lease_owner = format!("disp-{}", Uuid::now_v7());
 
     let launcher = FakeLauncher::new();
-    dispatch_once(&pool, &launcher, TOOLS_URL, &lease_owner)
+    let gh = FakeGitHub::new();
+    dispatch_once(&pool, &launcher, &gh, TOOLS_URL, &lease_owner)
         .await
         .expect("dispatch_once");
     assert_eq!(launches_for_repo(&launcher, repo_id).len(), 2);

@@ -581,6 +581,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "factory-config",
+ "factory-github",
  "factory-record",
  "factory-telemetry",
  "serde_json",

@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use factory_dispatcher::{dispatch_once, DockerLauncher};
+use factory_github::OctocrabGitHub;
 use uuid::Uuid;
 
 /// How often the dispatcher scans the queue for leasable work.
@@ -33,6 +34,17 @@ async fn main() -> anyhow::Result<()> {
 
     let launcher = DockerLauncher::new(image.clone());
 
+    // The dispatcher mints a per-launch installation token via the GitHub App. If
+    // the App credentials are absent we keep the loop alive but skip every tick:
+    // a missing token means we cannot safely launch a worker (it could not clone).
+    let gh = match OctocrabGitHub::from_env() {
+        Ok(client) => Some(client),
+        Err(e) => {
+            tracing::warn!(error = %e, "GitHub App credentials absent; dispatch ticks will be skipped until configured");
+            None
+        }
+    };
+
     tracing::info!(
         %lease_owner,
         worker_image = %image,
@@ -44,7 +56,11 @@ async fn main() -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(DISPATCH_TICK);
     loop {
         ticker.tick().await;
-        match dispatch_once(&pool, &launcher, &tools_url, &lease_owner).await {
+        let Some(gh) = gh.as_ref() else {
+            tracing::warn!("skipping dispatch tick: GitHub App credentials are not configured");
+            continue;
+        };
+        match dispatch_once(&pool, &launcher, gh, &tools_url, &lease_owner).await {
             Ok(n) if n > 0 => tracing::info!(launched = n, "dispatch tick launched workers"),
             Ok(_) => tracing::info!("dispatch tick launched nothing"),
             Err(e) => tracing::error!(error = %e, "dispatch tick failed"),

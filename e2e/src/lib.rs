@@ -431,9 +431,16 @@ mod acceptance {
         // shared DB, so we scope our assertion to THIS work item: it is launched
         // exactly once, and we capture its minted raw token.
         let launcher = CapturingLauncher::default();
-        factory_dispatcher::dispatch_once(&pool, &launcher, "http://tools.test", "e2e")
-            .await
-            .unwrap();
+        let dispatch_gh = factory_github::FakeGitHub::new();
+        factory_dispatcher::dispatch_once(
+            &pool,
+            &launcher,
+            &dispatch_gh,
+            "http://tools.test",
+            "e2e",
+        )
+        .await
+        .unwrap();
         let specs = launcher.captured.lock().expect("lock").clone();
         let mine: Vec<_> = specs
             .iter()
@@ -443,6 +450,18 @@ mod acceptance {
         let spec = mine[0];
         assert_eq!(spec.role, record::Kind::Coder);
         assert_eq!(spec.worker_name, worker_name);
+        // The launch carries the clone URL and a minted installation token the worker
+        // needs to clone/push — neither is empty.
+        assert!(!spec.repo_url.is_empty(), "launch spec carries a clone URL");
+        assert!(
+            spec.repo_url.starts_with("https://github.com/"),
+            "clone URL is an https github url: {}",
+            spec.repo_url
+        );
+        assert!(
+            !spec.install_token.is_empty(),
+            "launch spec carries a minted install token"
+        );
         let raw_token = spec.raw_token.clone();
 
         // Build the Tools service the worker would call, with the captured token's

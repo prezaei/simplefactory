@@ -235,7 +235,6 @@ fn load_config() -> anyhow::Result<HarnessConfig> {
         tools_url: env_var("FACTORY_TOOLS_URL")?,
         task_token: env_var("FACTORY_TASK_TOKEN")?,
         workdir,
-        head_branch: env_var("FACTORY_HEAD_BRANCH")?,
     })
 }
 

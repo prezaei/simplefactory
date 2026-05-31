@@ -34,6 +34,10 @@ const PARSE_ERROR: i64 = -32700;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
+/// A server-defined (implementation) JSON-RPC error code signalling a retryable
+/// idempotency conflict — the MCP equivalent of the REST layer's HTTP 409. Server
+/// error codes live in the reserved -32000..=-32099 range; we pick -32009 for it.
+const CONFLICT_RETRYABLE: i64 = -32009;
 
 /// The MCP protocol revision this server implements.
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -181,6 +185,13 @@ async fn handle_tools_call(
             // layer's 400.
             tracing::warn!(tool = tool.as_str(), error = %msg, "mcp: tools/call invalid params");
             rpc_error_response(id, INVALID_PARAMS, &format!("Invalid params: {msg}"))
+        }
+        Err(ToolCallError::Tool(ToolError::Conflict(msg))) => {
+            // A retryable idempotency conflict, mirroring the REST layer's 409: a
+            // JSON-RPC error with a server-defined retryable code so the client retries
+            // rather than treating it as a hard failure.
+            tracing::info!(tool = tool.as_str(), error = %msg, "mcp: tools/call conflict (retryable)");
+            rpc_error_response(id, CONFLICT_RETRYABLE, &format!("Conflict (retry): {msg}"))
         }
         Err(ToolCallError::Tool(ToolError::Internal(e))) => {
             // MCP convention: an internal tool failure is a result with isError, so

@@ -470,6 +470,100 @@ async fn escalate_is_idempotent_per_task_without_a_dedupe_key() {
 }
 
 #[tokio::test]
+async fn escalate_same_reason_twice_without_key_is_idempotent_and_keeps_state() {
+    // FIX 5: the default dedupe_key is the reason, so re-escalating the SAME reason
+    // (no key) is idempotent — exactly one escalation row, state unchanged.
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#1300", FakeGitHub::new()).await;
+
+    let args = json!({ "reason": "blocked_input", "context": "need a key" });
+    let (s1, b1) = http_call(fx.state.clone(), &fx.raw_token, "escalate", args.clone()).await;
+    let (s2, b2) = http_call(fx.state.clone(), &fx.raw_token, "escalate", args).await;
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(s2, StatusCode::OK);
+    // Same escalation id, exactly one row, exactly one comment.
+    assert_eq!(b1["escalation_id"], b2["escalation_id"]);
+    assert_eq!(
+        record::count_escalations_for_item(&pool, fx.work_item_id)
+            .await
+            .unwrap(),
+        1,
+        "same reason twice files exactly one escalation"
+    );
+    assert_eq!(count_calls(&fx.gh, "post_comment"), 1);
+    // State unchanged: blocked_input parks the item at blocked both times.
+    let item = record::work_item_by_id(&pool, fx.work_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.state, State::Blocked);
+}
+
+#[tokio::test]
+async fn escalate_different_reasons_without_key_file_separately_and_apply_state() {
+    // FIX 5: with a constant default key, a SECOND escalate with a DIFFERENT reason
+    // would hit Done and silently no-op, leaving the wrong state. Defaulting the key
+    // to the reason fixes this: blocked_input → Blocked, then a LATER
+    // retries_exhausted on the SAME item creates a new escalation and moves it to
+    // Escalated (terminal). blocked is non-terminal, so blocked→escalated is allowed.
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#1301", FakeGitHub::new()).await;
+
+    // First: blocked_input parks the item at blocked.
+    let (s1, b1) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "escalate",
+        json!({ "reason": "blocked_input", "context": "need a decision" }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(b1["state"], "blocked");
+    let item = record::work_item_by_id(&pool, fx.work_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.state, State::Blocked);
+
+    // Later: a DIFFERENT reason (retries_exhausted) must NOT be deduped away — it
+    // creates a new escalation and moves the item to Escalated (terminal).
+    let (s2, b2) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "escalate",
+        json!({ "reason": "retries_exhausted", "context": "gave up" }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(b2["state"], "escalated");
+    // DISTINCT escalation ids and exactly TWO escalation rows.
+    assert_ne!(b1["escalation_id"], b2["escalation_id"]);
+    assert_eq!(
+        record::count_escalations_for_item(&pool, fx.work_item_id)
+            .await
+            .unwrap(),
+        2,
+        "distinct reasons file two escalations"
+    );
+    // The item ends terminal (escalated), not stuck at blocked.
+    let item = record::work_item_by_id(&pool, fx.work_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        item.state,
+        State::Escalated,
+        "the second, different reason applied its terminal state"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_escalate_files_exactly_one_escalation() {
     let Some(pool) = pool_or_skip().await else {
         eprintln!("SKIP: DATABASE_URL not set");
@@ -480,7 +574,8 @@ async fn concurrent_escalate_files_exactly_one_escalation() {
     // Spawn several concurrent escalate calls for the SAME task with NO dedupe_key.
     // The claim-first pattern guarantees exactly one side effect; the losers either
     // observe the recorded result (200) or are told to retry while the winner's side
-    // effect is in flight (500). Either way, only ONE escalation/comment is created.
+    // effect is in flight (409, a retryable conflict — never 500). Either way, only
+    // ONE escalation/comment is created.
     let mut handles = Vec::new();
     for _ in 0..6 {
         let state = fx.state.clone();
@@ -496,7 +591,11 @@ async fn concurrent_escalate_files_exactly_one_escalation() {
         }));
     }
     for h in handles {
-        let _ = h.await.unwrap();
+        let (status, _) = h.await.unwrap();
+        assert!(
+            status == StatusCode::OK || status == StatusCode::CONFLICT,
+            "loser is a retryable 409 conflict, never 500; got {status}"
+        );
     }
 
     // EXACTLY ONE escalation row, EXACTLY ONE GitHub comment.
@@ -530,7 +629,8 @@ async fn concurrent_post_comment_with_key_posts_exactly_once() {
     let fx = fixture_with(&pool, "issue#133", FakeGitHub::new()).await;
 
     // Concurrent post_comment with the SAME dedupe_key: the claim winner posts once,
-    // losers either return the stored result or are told to retry — never a 2nd post.
+    // losers either return the stored result (200) or are told to retry (409, a
+    // retryable conflict — never 500) — never a 2nd post.
     let mut handles = Vec::new();
     for _ in 0..6 {
         let state = fx.state.clone();
@@ -546,7 +646,11 @@ async fn concurrent_post_comment_with_key_posts_exactly_once() {
         }));
     }
     for h in handles {
-        let _ = h.await.unwrap();
+        let (status, _) = h.await.unwrap();
+        assert!(
+            status == StatusCode::OK || status == StatusCode::CONFLICT,
+            "loser is a retryable 409 conflict, never 500; got {status}"
+        );
     }
 
     assert_eq!(
@@ -1267,7 +1371,8 @@ async fn concurrent_submit_review_with_key_submits_exactly_once() {
     let fx = fixture_with(&pool, "cr#404", FakeGitHub::new()).await;
 
     // Concurrent submit_review with the SAME dedupe_key: exactly one review under
-    // concurrency (winner submits; losers return the stored result or retry).
+    // concurrency (winner submits; losers return the stored result (200) or are told
+    // to retry (409, a retryable conflict — never 500)).
     let mut handles = Vec::new();
     for _ in 0..6 {
         let state = fx.state.clone();
@@ -1283,7 +1388,11 @@ async fn concurrent_submit_review_with_key_submits_exactly_once() {
         }));
     }
     for h in handles {
-        let _ = h.await.unwrap();
+        let (status, _) = h.await.unwrap();
+        assert!(
+            status == StatusCode::OK || status == StatusCode::CONFLICT,
+            "loser is a retryable 409 conflict, never 500; got {status}"
+        );
     }
 
     assert_eq!(

@@ -60,13 +60,35 @@ impl OctocrabGitHub {
 
     /// Build an installation-scoped client (authenticates as the installation).
     async fn installation(&self, installation_id: i64) -> anyhow::Result<octocrab::Octocrab> {
+        let installation_id = installation_id_u64(installation_id)?;
         let app = self.app_client()?;
         let (client, _token) = app
-            .installation_and_token(octocrab::models::InstallationId(installation_id as u64))
+            .installation_and_token(octocrab::models::InstallationId(installation_id))
             .await
             .map_err(|e| anyhow::anyhow!("minting installation client: {e}"))?;
         Ok(client)
     }
+}
+
+/// Guard the `installation_id` before casting it to the `u64` octocrab expects. A
+/// non-positive id is never valid (installation ids are positive) and an unchecked
+/// `as u64` would silently wrap a negative value into a huge id; reject it with a
+/// clear error instead.
+fn installation_id_u64(installation_id: i64) -> anyhow::Result<u64> {
+    if installation_id <= 0 {
+        return Err(anyhow::anyhow!(
+            "invalid installation_id: {installation_id}"
+        ));
+    }
+    u64::try_from(installation_id)
+        .map_err(|_| anyhow::anyhow!("invalid installation_id: {installation_id}"))
+}
+
+/// Guard an externally-supplied GitHub object number / id (issue, PR, comment)
+/// before casting it to the `u64` octocrab expects. A negative value would wrap
+/// under an unchecked `as u64`; reject it with a clear error instead.
+fn id_u64(n: i64) -> anyhow::Result<u64> {
+    u64::try_from(n).map_err(|_| anyhow::anyhow!("invalid id: {n}"))
 }
 
 /// Marker for the one operation that cannot be wired cleanly against octocrab
@@ -80,9 +102,10 @@ fn unwired(op: &str) -> anyhow::Error {
 impl GitHubClient for OctocrabGitHub {
     async fn installation_token(&self, installation_id: i64) -> anyhow::Result<String> {
         tracing::info!(installation_id, "minting GitHub installation token");
+        let installation_id = installation_id_u64(installation_id)?;
         let app = self.app_client()?;
         let (_client, token) = app
-            .installation_and_token(octocrab::models::InstallationId(installation_id as u64))
+            .installation_and_token(octocrab::models::InstallationId(installation_id))
             .await
             .map_err(|e| anyhow::anyhow!("minting installation token: {e}"))?;
         Ok(token.expose_secret().to_owned())
@@ -94,7 +117,7 @@ impl GitHubClient for OctocrabGitHub {
             .installation(repo.installation_id)
             .await?
             .issues(&repo.owner, &repo.name)
-            .get(number as u64)
+            .get(id_u64(number)?)
             .await
             .map_err(|e| anyhow::anyhow!("reading issue #{number}: {e}"))?;
         Ok(IssueView {
@@ -115,7 +138,7 @@ impl GitHubClient for OctocrabGitHub {
             .installation(repo.installation_id)
             .await?
             .pulls(&repo.owner, &repo.name)
-            .get(number as u64)
+            .get(id_u64(number)?)
             .await
             .map_err(|e| anyhow::anyhow!("reading change request #{number}: {e}"))?;
         let head_sha = pr.head.sha.clone();
@@ -195,7 +218,7 @@ impl GitHubClient for OctocrabGitHub {
             .installation(repo.installation_id)
             .await?
             .issues(&repo.owner, &repo.name)
-            .create_comment(number as u64, body)
+            .create_comment(id_u64(number)?, body)
             .await
             .map_err(|e| anyhow::anyhow!("posting comment on #{number}: {e}"))?;
         Ok(comment.id.0 as i64)
@@ -211,7 +234,7 @@ impl GitHubClient for OctocrabGitHub {
         self.installation(repo.installation_id)
             .await?
             .issues(&repo.owner, &repo.name)
-            .update_comment(octocrab::models::CommentId(comment_id as u64), body)
+            .update_comment(octocrab::models::CommentId(id_u64(comment_id)?), body)
             .await
             .map_err(|e| anyhow::anyhow!("updating comment {comment_id}: {e}"))?;
         Ok(())
@@ -232,10 +255,11 @@ impl GitHubClient for OctocrabGitHub {
             "submitting review",
         );
         let client = self.installation(repo.installation_id).await?;
+        let number_u64 = id_u64(number)?;
         // The review must pin the head commit it reviewed.
         let pr = client
             .pulls(&repo.owner, &repo.name)
-            .get(number as u64)
+            .get(number_u64)
             .await
             .map_err(|e| anyhow::anyhow!("reading change request #{number} for review: {e}"))?;
         let head_sha = pr.head.sha.clone();
@@ -251,7 +275,7 @@ impl GitHubClient for OctocrabGitHub {
         #[allow(deprecated)]
         let review = client
             .pulls(&repo.owner, &repo.name)
-            .pull_number(number as u64)
+            .pull_number(number_u64)
             .reviews()
             .create_review(head_sha, body, event, vec![])
             .await

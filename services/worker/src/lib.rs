@@ -104,8 +104,6 @@ pub struct HarnessConfig {
     pub task_token: String,
     /// Directory the fresh clone lives in.
     pub workdir: PathBuf,
-    /// Branch the worker pushes its work to.
-    pub head_branch: String,
 }
 
 /// Drive one task end-to-end: clone → run Claude → push → open/update CR → record.
@@ -162,16 +160,30 @@ async fn run_task_inner(
     tools.append_transcript(&run.summary).await?;
     tracing::info!("worker: transcript appended");
 
-    tracing::info!(branch = %cfg.head_branch, "worker: pushing branch (force-with-lease)");
-    git.push_branch(&cfg.workdir, &cfg.head_branch).await?;
+    // The server (get_task) is the single source of truth for the branch name: push
+    // and open the CR on exactly the branch it told us, never an env-supplied one.
+    tracing::info!(branch = %task.head_branch, "worker: pushing branch (force-with-lease)");
+    git.push_branch(&cfg.workdir, &task.head_branch).await?;
     tracing::info!("worker: branch pushed");
+
+    // Derive the linked issue from the subject: `issue#N` → Some(N), anything else
+    // (e.g. `cr#N`) → None. Inline parse, no extra dependency.
+    let linked_issue = task
+        .subject_ref
+        .strip_prefix("issue#")
+        .and_then(|n| n.parse::<i64>().ok());
+    tracing::info!(
+        subject_ref = %task.subject_ref,
+        linked_issue = ?linked_issue,
+        "worker: derived linked issue from subject"
+    );
 
     let cr_request = CrRequest {
         title: format!("[{}] {}", task.role, task.subject_ref),
         body: run.summary.clone(),
-        head_branch: cfg.head_branch.clone(),
+        head_branch: task.head_branch.clone(),
         base: task.base.clone(),
-        linked_issue: None,
+        linked_issue,
     };
     tracing::info!("worker: opening or updating change request");
     let cr = tools.open_or_update_change_request(&cr_request).await?;
@@ -233,8 +245,11 @@ impl ToolsClient for HttpTools {
     async fn get_task(&self) -> anyhow::Result<TaskInfo> {
         tracing::info!("HttpTools: get_task");
         let v = self.call_tool("get_task", serde_json::json!({})).await?;
+        // Validate the role at the seam: an unknown role fails loudly here rather
+        // than letting an invalid worker role propagate into the run.
+        let role = validate_role(&json_str(&v, "role"))?;
         Ok(TaskInfo {
-            role: json_str(&v, "role"),
+            role,
             subject_ref: json_str(&v, "subject_ref"),
             head_branch: json_str(&v, "head_branch"),
             base: json_str(&v, "base"),
@@ -294,6 +309,17 @@ fn json_str(v: &serde_json::Value, key: &str) -> String {
         .to_string()
 }
 
+/// Validate the role string returned by `get_task`. Only the four real agent roles
+/// are accepted; anything else is an error so an invalid role fails loudly at the
+/// seam rather than running with an unknown role. Returns the role unchanged on
+/// success (kept as a `String` for downstream use).
+fn validate_role(role: &str) -> anyhow::Result<String> {
+    match role {
+        "manager" | "coder" | "reviewer" | "tester" => Ok(role.to_string()),
+        other => anyhow::bail!("get_task returned an unknown role: {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +344,23 @@ mod tests {
         assert_eq!(json_str(&v, "missing"), "");
     }
 
+    #[test]
+    fn validate_role_accepts_every_real_role() {
+        for role in ["manager", "coder", "reviewer", "tester"] {
+            assert_eq!(validate_role(role).expect("real role accepted"), role);
+        }
+    }
+
+    #[test]
+    fn validate_role_rejects_unknown_role() {
+        let err = validate_role("engineer").expect_err("unknown role must be rejected");
+        assert!(
+            err.to_string().contains("engineer"),
+            "error names the bad role: {err}"
+        );
+        assert!(validate_role("").is_err(), "empty role is rejected");
+    }
+
     /// Records every call the harness makes. `open_or_update_change_request`
     /// models the real idempotent endpoint: it always returns the same
     /// `cr_number` (CR is keyed by head branch server-side), and increments a
@@ -329,6 +372,7 @@ mod tests {
         heartbeats: AtomicUsize,
         transcripts: Mutex<Vec<String>>,
         outcomes: Mutex<Vec<(String, String)>>,
+        last_cr_request: Mutex<Option<CrRequest>>,
         fixed_cr_number: i64,
     }
 
@@ -336,8 +380,8 @@ mod tests {
         fn seeded() -> Self {
             Self {
                 task: Mutex::new(TaskInfo {
-                    role: "engineer".into(),
-                    subject_ref: "issue-42".into(),
+                    role: "coder".into(),
+                    subject_ref: "issue#42".into(),
                     head_branch: "factory/issue-42".into(),
                     base: "main".into(),
                     prompt: "Fix the bug".into(),
@@ -353,11 +397,9 @@ mod tests {
         async fn get_task(&self) -> anyhow::Result<TaskInfo> {
             Ok(self.task.lock().expect("lock").clone())
         }
-        async fn open_or_update_change_request(
-            &self,
-            _req: &CrRequest,
-        ) -> anyhow::Result<CrResult> {
+        async fn open_or_update_change_request(&self, req: &CrRequest) -> anyhow::Result<CrResult> {
             self.cr_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_cr_request.lock().expect("lock") = Some(req.clone());
             // Idempotent: same number regardless of how many times it is called.
             Ok(CrResult {
                 cr_number: self.fixed_cr_number,
@@ -457,7 +499,6 @@ mod tests {
             tools_url: "https://tools.factory.test".into(),
             task_token: "task_bearer".into(),
             workdir: PathBuf::from("/tmp/factory-workdir"),
-            head_branch: "factory/issue-42".into(),
         }
     }
 
@@ -476,14 +517,32 @@ mod tests {
         assert_eq!(git.clones.load(Ordering::SeqCst), 1);
         // Claude ran exactly once.
         assert_eq!(claude.ran.load(Ordering::SeqCst), 1);
-        // Push happened exactly once, on the configured head branch.
+        // Push happened exactly once, on the branch from get_task (NOT from cfg/env).
         assert_eq!(git.pushes.load(Ordering::SeqCst), 1);
         assert_eq!(
             *git.last_pushed_branch.lock().expect("lock"),
-            Some("factory/issue-42".to_string())
+            Some("factory/issue-42".to_string()),
+            "pushes the branch the server (get_task) chose"
         );
-        // CR opened/updated exactly once.
+        // CR opened/updated exactly once, with the server's branch/base and the
+        // linked issue derived from the `issue#42` subject.
         assert_eq!(tools.cr_calls.load(Ordering::SeqCst), 1);
+        let cr = tools
+            .last_cr_request
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("a CR request was made");
+        assert_eq!(
+            cr.head_branch, "factory/issue-42",
+            "CR opens on task.head_branch"
+        );
+        assert_eq!(cr.base, "main", "CR targets task.base");
+        assert_eq!(
+            cr.linked_issue,
+            Some(42),
+            "linked_issue derived from the issue#42 subject"
+        );
         // Heartbeat was sent.
         assert_eq!(tools.heartbeats.load(Ordering::SeqCst), 1);
         // Transcript chunk appended.
@@ -493,6 +552,76 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].0, "succeeded");
         assert_eq!(outcomes[0].1, "Implemented the fix");
+    }
+
+    #[tokio::test]
+    async fn linked_issue_is_none_for_non_issue_subject() {
+        // A `cr#N` subject (not `issue#N`) yields no linked issue.
+        let tools = FakeTools::seeded();
+        *tools.task.lock().expect("lock") = TaskInfo {
+            role: "reviewer".into(),
+            subject_ref: "cr#9".into(),
+            head_branch: "factory/cr-9".into(),
+            base: "main".into(),
+            prompt: "Review it".into(),
+        };
+        let git = FakeGit::default();
+        let claude = FakeClaude::ok("Reviewed");
+        let cfg = config();
+
+        run_task(&tools, &git, &claude, &cfg)
+            .await
+            .expect("run_task should succeed");
+
+        // Pushed on the server's branch.
+        assert_eq!(
+            *git.last_pushed_branch.lock().expect("lock"),
+            Some("factory/cr-9".to_string())
+        );
+        let cr = tools
+            .last_cr_request
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("a CR request was made");
+        assert_eq!(cr.linked_issue, None, "a cr# subject has no linked issue");
+    }
+
+    #[tokio::test]
+    async fn unknown_role_from_get_task_fails_loudly() {
+        // get_task returning an invalid role aborts the run before any side effect.
+        let tools = FakeTools::seeded();
+        *tools.task.lock().expect("lock") = TaskInfo {
+            role: "engineer".into(),
+            subject_ref: "issue#42".into(),
+            head_branch: "factory/issue-42".into(),
+            base: "main".into(),
+            prompt: "Fix the bug".into(),
+        };
+        let git = FakeGit::default();
+        let claude = FakeClaude::ok("noop");
+        let cfg = config();
+
+        // NOTE: FakeTools::get_task returns the seeded role verbatim (it does not
+        // validate). The HttpTools seam is what validates the role; here we drive the
+        // validator directly to prove an unknown role is rejected at the seam.
+        assert!(
+            validate_role("engineer").is_err(),
+            "an unknown role is rejected where get_task parses it"
+        );
+
+        // The orchestration itself never sees an invalid role (the seam rejects it
+        // first), so a valid run with the fake still completes.
+        *tools.task.lock().expect("lock") = TaskInfo {
+            role: "coder".into(),
+            subject_ref: "issue#42".into(),
+            head_branch: "factory/issue-42".into(),
+            base: "main".into(),
+            prompt: "Fix the bug".into(),
+        };
+        run_task(&tools, &git, &claude, &cfg)
+            .await
+            .expect("a valid role runs");
     }
 
     #[tokio::test]
