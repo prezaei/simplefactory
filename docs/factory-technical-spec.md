@@ -101,9 +101,9 @@ The **deterministic** orchestrator — **never** calls a model. Reacts to comple
 
 ### Worker harness + Claude Code (Container Apps Job)
 The throwaway workroom. The Rust harness:
-1. Mints/receives a short-lived **GitHub installation token**, does a **fresh shallow clone** of the repo.
+1. Mints/receives a short-lived **GitHub installation token**; for a code-producing role (the **Coder**) it does a **fresh shallow clone** of the repo. A **Manager** or **Reviewer**, which only reads issue/CR data via Tools and produces no commits (see [Worker lifecycle by role](#worker-lifecycle-by-role)), may skip the clone — the worktree is role-dependent.
 2. Launches **Claude Code headless** with the task prompt and the Factory **MCP** endpoint configured as its tool server.
-3. **Continuously checkpoints** Claude Code's session state (session id / transcript) + the working-tree state to **Blob** (see [Crash-resume](#key-workflows)).
+3. **Continuously checkpoints** Claude Code's session state (session id / transcript) + the working-tree state (when a worktree is in use) to **Blob** (see [Crash-resume](#key-workflows)).
 4. On success, the harness performs the **role's terminal action** via Factory Tools (see below), records the outcome, and exits; the job is destroyed.
 
 The worker has **no** direct Postgres or Blob credentials — everything goes through Factory Tools (the one exception being model calls straight to Anthropic). Outbound internet is open (builds fetch packages); the trusted-tenant model is assumed per the product spec's non-goals.
@@ -377,7 +377,7 @@ The worker's only channel to Factory, exposed by the Tools service as a **remote
 
 ## Key workflows
 
-**Issue → merged change (the worked example).** Webhook → Intake writes a Manager-role work item → Dispatcher leases it → the Manager worker triages; on its success the **Coordinator** assigns a Coder (enqueues a coder work item, comments via Tools) → Dispatcher starts a Container Apps Job → Worker clones, runs Claude Code (tests-first, then code), opens a CR via Tools, records success → the **Coordinator** (reacting to completion) + the new-CR webhook wake a Reviewer job → Reviewer verdict via Tools → on *changes requested*, the **Coordinator** re-enqueues a Coder against the same CR (counts toward the per-issue loop cap); on *approved* + required checks green, the **Coordinator** marks ready and hands to a human to merge → human merges → the **Coordinator** closes the issue. *(Caveat: automatic issue-closure-on-merge is a **deferred** capability — it needs merge-webhook (`pull_request closed/merged`) ingestion so the Coordinator can observe the merge; until that lands the issue stays open after the ready-for-merge handoff.)*
+**Issue → merged change (the worked example).** Webhook → Intake writes a Manager-role work item → Dispatcher leases it → the Manager worker triages; on its success the **Coordinator** assigns a Coder (enqueues a coder work item, comments via Tools) → Dispatcher starts a Container Apps Job → Worker clones, runs Claude Code (tests-first, then code), opens a CR via Tools, records success → the **Coordinator** (reacting to completion) + the new-CR webhook wake a Reviewer job → Reviewer verdict via Tools → on *changes requested*, the **Coordinator** re-enqueues a Coder against the same CR (counts toward the per-issue loop cap); on *approved* + required checks green, the **Coordinator** marks the CR **ready** and hands the linked issue to a human to merge (the issue stays `in_progress`) → a human merges. *(Issue-closure-on-merge is a **deferred** capability — it needs merge-webhook (`pull_request closed/merged`) ingestion for the Coordinator to observe the merge; until that lands the issue is **not** auto-closed — it stays open after the ready-for-merge handoff.)*
 
 **No-double-starts.** Every pickup is a single `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)` transaction; the row's lease columns are set atomically. Two dispatcher replicas can never lease the same row.
 
