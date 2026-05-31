@@ -1,0 +1,15 @@
+[package]
+name = "factory-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The end-to-end acceptance suite. In P0 these are compiling `#[ignore]`d stubs
+# that pin the whole contract up front; each later phase un-ignores and makes
+# green the tests its mechanism satisfies. The count of still-ignored tests is
+# the project's burndown to done.
+
+[dependencies]
+
+[dev-dependencies]

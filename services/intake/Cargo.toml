@@ -1,0 +1,14 @@
+[package]
+name = "factory-intake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "factory-intake"
+path = "src/main.rs"
+
+[dependencies]
+factory-telemetry.workspace = true
+tracing.workspace = true
