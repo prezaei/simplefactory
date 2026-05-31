@@ -21,7 +21,7 @@ Hosting target: **everything runs on Azure, using Azure-native services.** Facto
 | Build / deploy | **Azure Container Registry** + **GitHub Actions** | Code lives on GitHub; Actions runs the Rust gates and deploys to Azure. |
 | Long-lived services | **Azure Container Apps** services, **N replicas** | Always-on with replica redundancy; concurrency-safe via Postgres arbitration. |
 | Dashboard | **React/TypeScript SPA** + **Rust (Axum) API**, SSE/WebSocket for live view | Rich UI; eventually-consistent stream off the record book. |
-| Factory Tools (worker → Factory) | **MCP server** | Claude Code's native tool path; clean contract for read-ticket / comment / query-record-book / write-transcript. |
+| Factory Tools (worker → Factory) | **MCP server** (remote, HTTP/SSE) | Claude Code's native tool path; clean contract for read-ticket / open-CR / comment / review / write-transcript / escalate. |
 | Worker trust boundary | Worker reaches Factory **only** via Tools/MCP with a per-task token; **no** direct Postgres/Blob | Tightest least-privilege; every worker effect is mediated and logged. |
 | Webhook intake | Direct **HTTPS endpoint → Postgres** (signature-verified) | Keeps Postgres the single source of truth; no extra broker. |
 | Timers | **In-app scheduler** enqueues due work into Postgres | Schedule lives with the repo config; one system everywhere. |
@@ -107,7 +107,7 @@ The throwaway workroom. The Rust harness:
 The worker has **no** direct Postgres or Blob credentials — everything goes through Factory Tools (the one exception being model calls straight to Anthropic). Outbound internet is open (builds fetch packages); the trusted-tenant model is assumed per the product spec's non-goals.
 
 ### Factory Tools (MCP server)
-Axum-hosted MCP server exposing the worker's only channel to Factory: read the ticket/diff, leave a comment, query the record book ("how was something like this done?"), append to the transcript, record outcome, heartbeat the lease, raise an escalation. Authenticates the per-task token, enforces that a token may only act on its own task/repo, and writes every call to the record book + audit log. Tools (not the worker) own writes to Postgres/Blob.
+Axum-hosted MCP server exposing the worker's only channel to Factory: read the ticket/diff, open/update the change request, leave a comment, submit a review, read check status, append to the transcript, record outcome, heartbeat the lease, raise an escalation. A worker sees only its own task's context (no cross-task lookup). Authenticates the per-task token, enforces that a token may only act on its own task/repo, and writes every call to the record book + audit log. Tools (not the worker) own writes to Postgres/Blob. Full surface in [Factory Tools (MCP) surface](#factory-tools-mcp-surface).
 
 ### Lease sweeper
 Periodically finds leases past expiry (crashed or hung workers — "stuck workers are caught"), marks the attempt failed, revokes the task token, and returns the work item for a fresh attempt (subject to the retry/loop caps).
@@ -117,16 +117,241 @@ React/TS SPA over the Axum Dashboard API. Live view via SSE/WebSocket fed from t
 
 ## Data model
 
-Postgres, managed with `sqlx` migrations. Sketch (not exhaustive):
+Postgres, managed with `sqlx` migrations. All ids are **UUIDv7** (time-ordered, minted app-side). Enums are **text + CHECK** (cheap to evolve, map cleanly to Rust enums via sqlx).
 
-- **`repos`** — installation id, owner/name, latest `.factory/config.yml` snapshot, status.
-- **`work_items`** (the to-do list / queue) — `id`, `repo_id`, `kind` (manager·coder·reviewer·tester), `trigger` (issue·cr·timer·manager), `subject_ref` (issue/CR number), `state` (`queued`→`leased`→`running`→`succeeded`/`failed`/`blocked`/`escalated`), `lease_owner`, `lease_expires_at`, `attempt_count`, `loop_count`, `available_at`, timestamps. Indexed for the `SKIP LOCKED` pickup.
-- **`attempts`** — one row per worker execution: `work_item_id`, `job_execution_id`, `status`, `checkpoint_uri` (Blob), `transcript_uri` (Blob), `started_at`/`ended_at`.
-- **`issues`** / **`change_requests`** — tracked code-host objects + their Factory state, for idempotent reuse ("safe to redo" updates the *same* CR/comment).
-- **`escalations`** — `work_item_id`, reason, context, delivered-to (issue comment + assignee), state.
-- **`events`** (audit trail) — append-only: who/what/when for every decision, tool call, state transition.
+```sql
+CREATE TABLE repos (
+    id               uuid PRIMARY KEY,
+    installation_id  bigint NOT NULL,             -- GitHub App installation
+    owner            text NOT NULL,
+    name             text NOT NULL,
+    config           jsonb,                       -- last VALID .factory/config.yml (parsed)
+    config_sha       text,                        -- commit/blob sha of the applied config
+    status           text NOT NULL DEFAULT 'active'
+                       CHECK (status IN ('active','suspended','removed')),
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (owner, name)
+);
 
-Idempotency: a worker that re-runs finds the existing CR/comment via `change_requests`/`issues` and updates it rather than creating duplicates.
+CREATE TABLE work_items (                          -- the durable to-do list / queue
+    id               uuid PRIMARY KEY,
+    repo_id          uuid NOT NULL REFERENCES repos(id),
+    kind             text NOT NULL CHECK (kind IN ('manager','coder','reviewer','tester')),
+    worker_name      text NOT NULL,               -- which configured worker
+    trigger          text NOT NULL CHECK (trigger IN
+                       ('issue_labeled','cr_opened','cr_updated','cr_changes_requested',
+                        'review_requested','schedule','manager')),
+    subject_ref      text NOT NULL,               -- "issue#123" | "cr#456"
+    correlation_id   uuid NOT NULL,               -- threads telemetry across the lifecycle
+    state            text NOT NULL DEFAULT 'queued'
+                       CHECK (state IN ('queued','leased','running','blocked',
+                                        'succeeded','failed','escalated')),
+    priority         int  NOT NULL DEFAULT 0,
+    available_at     timestamptz NOT NULL DEFAULT now(),  -- delayed visibility / backoff
+    lease_owner      text,                         -- dispatcher replica / job execution
+    lease_expires_at timestamptz,
+    attempt_count    int  NOT NULL DEFAULT 0,      -- failed-attempt retries
+    loop_count       int  NOT NULL DEFAULT 0,      -- review-rework cycles
+    payload          jsonb NOT NULL DEFAULT '{}',  -- trigger details
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now()
+);
+
+-- Idempotent enqueue: at most one ACTIVE item per (repo, subject, kind).
+-- Terminal rows don't block a later re-run.
+CREATE UNIQUE INDEX work_items_active_uniq ON work_items (repo_id, subject_ref, kind)
+    WHERE state IN ('queued','leased','running','blocked');
+
+-- SKIP LOCKED pickup: ready, unleased items, oldest-first.
+CREATE INDEX work_items_pickup ON work_items (repo_id, kind, priority DESC, available_at)
+    WHERE state = 'queued';
+
+CREATE TABLE attempts (                            -- one row per worker execution
+    id               uuid PRIMARY KEY,
+    work_item_id     uuid NOT NULL REFERENCES work_items(id),
+    job_execution_id text,                         -- Container Apps Job execution
+    session_id       text,                         -- Claude Code session id for --resume
+    checkpoint_uri   text,                         -- Blob: session + worktree snapshot
+    transcript_uri   text,                         -- Blob: full transcript
+    status           text NOT NULL DEFAULT 'running'
+                       CHECK (status IN ('running','succeeded','failed','blocked','reclaimed')),
+    summary          text,
+    started_at       timestamptz NOT NULL DEFAULT now(),
+    ended_at         timestamptz
+);
+CREATE INDEX attempts_by_item ON attempts (work_item_id);
+
+CREATE TABLE issues (
+    id            uuid PRIMARY KEY,
+    repo_id       uuid NOT NULL REFERENCES repos(id),
+    number        int  NOT NULL,
+    factory_state text NOT NULL DEFAULT 'open'
+                    CHECK (factory_state IN ('open','in_progress','blocked','done')),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (repo_id, number)
+);
+
+CREATE TABLE change_requests (                     -- enables idempotent CR reuse
+    id            uuid PRIMARY KEY,
+    repo_id       uuid NOT NULL REFERENCES repos(id),
+    number        int,                             -- null until opened
+    head_branch   text NOT NULL,
+    linked_issue  int,
+    work_item_id  uuid REFERENCES work_items(id),  -- owning task → re-run updates the SAME CR
+    factory_state text NOT NULL DEFAULT 'draft'
+                    CHECK (factory_state IN ('draft','open','changes_requested',
+                                             'approved','ready','merged','closed')),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (repo_id, number)
+);
+
+CREATE TABLE escalations (
+    id           uuid PRIMARY KEY,
+    work_item_id uuid NOT NULL REFERENCES work_items(id),
+    reason       text NOT NULL CHECK (reason IN
+                   ('retries_exhausted','loop_cap','needs_decision','blocked_input','conflict')),
+    context      text NOT NULL,
+    delivered_to text,                             -- "issue#123 @alice"
+    state        text NOT NULL DEFAULT 'open' CHECK (state IN ('open','resolved')),
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    resolved_at  timestamptz
+);
+
+CREATE TABLE events (                              -- append-only audit trail
+    id             uuid PRIMARY KEY,
+    repo_id        uuid REFERENCES repos(id),
+    work_item_id   uuid REFERENCES work_items(id),
+    correlation_id uuid,
+    actor          text NOT NULL,    -- 'intake'|'dispatcher'|'manager'|'worker:<name>'|'tool:<name>'|'human:<login>'
+    action         text NOT NULL,    -- machine-readable verb
+    detail         jsonb NOT NULL DEFAULT '{}',
+    at             timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX events_by_item ON events (work_item_id, at);
+CREATE INDEX events_by_corr ON events (correlation_id, at);
+
+CREATE TABLE webhook_deliveries (                  -- dedupe redelivered webhooks
+    delivery_id  text PRIMARY KEY,                 -- X-GitHub-Delivery
+    received_at  timestamptz NOT NULL DEFAULT now()
+);
+```
+
+**Atomic pickup (no double-starts).** The dispatcher leases in one statement; `SKIP LOCKED` lets many replicas pick concurrently without colliding:
+
+```sql
+WITH next AS (
+  SELECT id FROM work_items
+  WHERE state = 'queued' AND available_at <= now() AND repo_id = $1 AND kind = $2
+  ORDER BY priority DESC, available_at
+  FOR UPDATE SKIP LOCKED
+  LIMIT 1
+)
+UPDATE work_items w
+   SET state='leased', lease_owner=$3, lease_expires_at = now() + $4::interval, updated_at = now()
+  FROM next WHERE w.id = next.id
+RETURNING w.*;
+```
+
+**Capacity caps** are enforced in the same transaction: the dispatcher only leases when `count(state IN ('leased','running')) per (repo_id, kind) < per-worker cap` and the global running count `< limits.max_concurrent_workers`.
+
+**Idempotency.** `change_requests.work_item_id` ties a CR to its task, so a re-run's `open_or_update_change_request` finds and updates the *same* CR; `post_comment` dedupes via `dedupe_key`. The partial unique index prevents duplicate live work items.
+
+**Retention.** A scheduled purge job deletes terminal `work_items` (+ their `attempts`, `escalations`, `events`) older than the bounded period; Blob lifecycle rules expire the linked transcripts/checkpoints. No archive tables — purge in place.
+
+## The `.factory/config.yml` schema
+
+The per-repo team file. Version-controlled in the user's repo, re-read automatically on every push that touches it. With no file there are no workers and Factory does nothing on the repo.
+
+```yaml
+# .factory/config.yml — defines your Factory team.
+version: 1
+
+settings:
+  label: factory                 # opt-in label; Factory acts only on work carrying it (default: factory)
+  default_model: claude-opus-4-8 # model used unless a worker overrides it (optional)
+  instructions: |                # repo-wide guidance appended to EVERY worker's prompt (optional)
+    This is a Rust workspace — follow AGENTS.md. Prefer small, focused change requests.
+
+limits:
+  max_concurrent_workers: 10     # global ceiling across all workers in this repo
+
+workers:
+  - name: bug-fixer
+    role: coder                  # manager | coder | reviewer | tester
+    on:                          # declarative trigger list
+      - issue_labeled            # an issue gains the opt-in label
+      - cr_changes_requested     # a reviewer asked for changes (the rework loop)
+    max_concurrent: 3
+    model: claude-opus-4-8       # optional per-worker model override
+    instructions: |              # optional; appended to the role's default prompt
+      Always add regression tests. Touch only the module named in the issue.
+
+  - name: pr-reviewer
+    role: reviewer
+    on: [cr_opened, cr_updated]
+    max_concurrent: 2
+    instructions_file: .factory/prompts/reviewer.md   # alternative: a version-controlled prompt file
+
+  - name: nightly-maintenance
+    role: coder
+    on:
+      - schedule: "0 2 * * *"    # cron (UTC)
+    max_concurrent: 1
+    instructions_file: .factory/prompts/nightly.md
+
+  - name: manager
+    role: manager
+    on: [issue_labeled, cr_opened, manager]
+    max_concurrent: 1
+```
+
+**Worker model.** `workers:` is a named list; each entry binds a `name` to a `role` (`manager` | `coder` | `reviewer` | `tester`), its triggers, and its caps. The named-list form (vs fixed role blocks) allows multiple workers of the same role (e.g. a `bug-fixer` and a `refactorer`, both coders) and future roles without a schema change.
+
+**Trigger vocabulary** (`on:`):
+
+| Trigger | Fires when |
+| --- | --- |
+| `issue_labeled` | an issue gains the opt-in label |
+| `cr_opened` | a change request is opened |
+| `cr_updated` | new commits pushed to a tracked CR |
+| `cr_changes_requested` | a reviewer requested changes (drives the rework loop) |
+| `review_requested` | review explicitly requested on a CR |
+| `schedule: "<cron>"` | a timer fires (UTC); enqueued by the in-app scheduler |
+| `manager` | the Manager dispatches this worker as a next step |
+
+**Prompt overrides** (the key per-repo customization). Each worker's effective prompt is composed, in order:
+1. the **role default** prompt (shipped with Factory),
+2. `settings.instructions` (repo-wide, optional),
+3. the worker's `instructions` (inline) **or** `instructions_file` (a path to a version-controlled markdown file in the repo).
+
+Later layers append to earlier ones, so a repo can shape behavior without forking Factory. `instructions_file` lets teams maintain rich, reviewed prompts as normal repo files.
+
+**Per-worker tunables:** `on`, `max_concurrent`, `model` (optional), `instructions`/`instructions_file` (optional).
+
+**Validation & safety.** On each change Factory parses and validates the file before applying it: `version` recognized, every `role` valid, every `cron` parseable, caps positive integers, any `instructions_file` resolvable. **Invalid config is rejected atomically** — Factory keeps the last good config, leaves a comment describing the error, and changes nothing else (fail-safe). The opt-in `label` still gates all action regardless of worker config.
+
+## Factory Tools (MCP) surface
+
+The worker's only channel to Factory, exposed by the Tools service as a **remote MCP server over HTTP/SSE**. At job start the dispatcher injects the Tools endpoint URL and a **per-task token**; Claude Code is configured with that MCP server. The token identifies the task, repo, and role; the server resolves all three and authorizes every call against the task's own repo. **All tools are available to every role** — the role is recorded on each call (and the role's prompt steers correct use), but tools are not per-role-gated. Every call is written to the record book + `events` audit log.
+
+| Tool | Purpose | Key args | Returns |
+| --- | --- | --- | --- |
+| `get_task` | Fetch this work item: role, instructions (composed prompt context), and subject context | — | role, subject ref, issue body or CR diff, linked refs |
+| `read_issue` | Read an issue in this repo | `issue_number` | title, body, comments |
+| `read_change_request` | Read a CR: metadata, diff, review threads | `cr_number` | diff, files, reviews, check summary |
+| `open_or_update_change_request` | Create the CR for this task, or update it if it already exists (**idempotent by work item**) | `title`, `body`, `head_branch`, `base`, `linked_issue` | `cr_number`, url |
+| `post_comment` | Comment on an issue/CR; with `dedupe_key`, updates the same comment on re-run | `target`, `body`, `dedupe_key?` | comment id |
+| `submit_review` | Leave a review verdict on a CR (reviewer role) | `cr_number`, `verdict` (approve\|request_changes\|comment), `body` | review id |
+| `get_check_status` | Read required-check states for a ref (to know if CI is green) | `cr_number` or `sha` | per-check conclusion + overall |
+| `append_transcript` | Append a chunk to this run's transcript in Blob | `chunk` | ok |
+| `record_outcome` | Set the attempt's terminal state | `status` (succeeded\|failed\|blocked), `summary` | ok |
+| `heartbeat` | Extend the task lease (liveness) | — | new lease expiry |
+| `escalate` | Raise an escalation: posts a question as an issue/CR comment + assigns a human, marks the item blocked/escalated | `reason`, `context` | escalation id |
+
+**Branch push vs CR creation.** The worker pushes its branch directly with the short-lived **git installation token** (a plain git operation). The CR itself and all comments/reviews go through Factory Tools so they are recorded and **idempotent** — a re-run calls `open_or_update_change_request` and `post_comment` (with `dedupe_key`) and updates the *same* objects rather than duplicating them.
+
+**No cross-task lookup.** There is deliberately no "search prior runs / how was this done before?" tool — consistent with the product spec's removal of the "It learns" subsystem. A worker sees only its own task's context.
 
 ## Key workflows
 
@@ -177,6 +402,23 @@ Every service and the worker harness emit **OpenTelemetry** traces/metrics/logs,
 - **CI/CD:** GitHub Actions runs `cargo fmt --check && cargo clippy -D warnings && cargo test`, builds images, pushes to ACR, deploys to Container Apps.
 - **Local:** `docker-compose` brings up Postgres + **Azurite** (Blob emulator) + the Factory services; workers run as local Docker containers driving Claude Code. Same binaries/images as production — one codebase, not two.
 
+## Defaults (retention, capacity, effort, timeouts)
+
+Starting values. Per-repo `.factory/config.yml` may override the **capacity caps**; the rest are platform defaults.
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| Retention — operational records (`work_items`, `attempts`, `events`, `escalations`) | **30 days** | Purged in place by the retention job. |
+| Retention — Blob transcripts + checkpoints | **30 days** | Blob lifecycle expiry. |
+| Global concurrency (`limits.max_concurrent_workers`) | **5** | Per repo; overridable. |
+| Per-worker concurrency (`max_concurrent`) | **2** | Default when a worker omits it; overridable. |
+| Failed-attempt retries | **3** | Then escalate. |
+| Per-issue review-rework loop cap | **5** | Coder↔Reviewer cycles; then escalate. |
+| Deterministic-crash resumes | **3** | Before falling through to a fresh attempt / escalation. |
+| Worker lease | **15 min** | Extended by heartbeat; sweeper reclaims past expiry. |
+| Heartbeat interval | **60 s** | Via the Tools `heartbeat` call. |
+| Per-attempt wall-clock cap | **30 min** | Attempt killed + reclaimed past this. |
+
 ## Workspace layout (Rust)
 
 ```
@@ -199,7 +441,4 @@ dashboard/        # React/TS SPA
 ## Deferred to a later infra/design doc
 
 - IaC tool choice (Bicep vs Terraform) and exact Azure SKUs/sizing.
-- Concrete retention durations and capacity-cap defaults.
-- Exact `.factory/config.yml` schema.
-- MCP tool surface (precise tool list and arguments).
 - Database migration/rollback runbook.
