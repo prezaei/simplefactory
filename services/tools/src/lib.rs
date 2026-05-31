@@ -236,11 +236,11 @@ pub async fn get_task(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
     let (repo_ident, repo_config) = record::repo_by_id_with_config(&state.pool, auth.repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repo {} not found", auth.repo_id))?;
-    let repo = RepoRef {
-        owner: repo_ident.owner,
-        name: repo_ident.name,
-        installation_id: repo_ident.installation_id,
-    };
+    let repo = RepoRef::new(
+        repo_ident.owner,
+        repo_ident.name,
+        repo_ident.installation_id,
+    );
 
     // Compose the worker's prompt from the repo's stored config: the built-in role
     // default, then the repo-wide instructions, then the matching worker's.
@@ -772,33 +772,21 @@ async fn resolve_repo(state: &ToolsState, auth: &TaskAuth) -> anyhow::Result<Rep
     let r = record::repo_by_id(&state.pool, auth.repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repo {} not found", auth.repo_id))?;
-    Ok(RepoRef {
-        owner: r.owner,
-        name: r.name,
-        installation_id: r.installation_id,
-    })
-}
-
-/// Map a [`Subject`] to its [`CommentTarget`].
-fn subject_to_comment_target(subject: Subject) -> CommentTarget {
-    match subject {
-        Subject::Issue(n) => CommentTarget::Issue(n),
-        Subject::ChangeRequest(n) => CommentTarget::ChangeRequest(n),
-    }
+    Ok(RepoRef::new(r.owner, r.name, r.installation_id))
 }
 
 /// Map a `subject_ref` to the comment target used for escalation questions.
 fn subject_comment_target(subject_ref: &str) -> Option<CommentTarget> {
     Subject::from_str(subject_ref)
         .ok()
-        .map(subject_to_comment_target)
+        .map(Subject::comment_target)
 }
 
 /// Parse a `post_comment` target argument (`issue#N` / `cr#N`). An unparseable
 /// target is a bad request (HTTP 400).
 fn parse_comment_target(target: &str) -> std::result::Result<CommentTarget, ToolError> {
     Subject::from_str(target)
-        .map(subject_to_comment_target)
+        .map(Subject::comment_target)
         .map_err(|_| {
             ToolError::BadRequest(format!(
                 "post_comment: target must be 'issue#N' or 'cr#N', got {target:?}"

@@ -10,8 +10,8 @@
 //! Multiple replicas may run [`coordinator_tick`] concurrently, and a lease-expiry
 //! re-dispatch can resurface the same terminal condition. Three record-book
 //! guarantees make a racing double-decision safe:
-//! - [`record::mark_reacted`] is the per-item claim: exactly one caller wins, so
-//!   `loop_count` is incremented at most once per terminal item.
+//! - [`record::mark_reacted`] is the per-item claim: exactly one caller wins and
+//!   applies the decision for a given terminal item.
 //! - [`record::enqueue`] is idempotent by active `(repo, subject, kind)`, so a
 //!   re-decided "assign a coder" / "wake a reviewer" never duplicates work.
 //! - [`record::create_escalation_idempotent`] is exactly-once per
@@ -19,9 +19,15 @@
 //!   run ONLY when that call reports it created the row — so a re-dispatch posts
 //!   exactly one comment and one assignment.
 //!
+//! The bounded review-rework counter is the per-CR `change_requests.loop_count`,
+//! advanced via [`record::increment_cr_loop_count`] on each changes-requested cycle;
+//! at [`LOOP_CAP`] the loop escalates instead of dispatching another coder.
+//!
 //! GitHub *reads* needed for a decision happen BEFORE the claim; the DB next-step
 //! writes and side effects happen AFTER winning it.
 #![forbid(unsafe_code)]
+
+use std::collections::HashMap;
 
 use factory_config::{Config, Role};
 use factory_github::{CheckConclusion, CheckRef, CommentTarget, GitHubClient, RepoRef, Subject};
@@ -55,9 +61,22 @@ pub async fn coordinator_tick(pool: &record::Pool, gh: &dyn GitHubClient) -> any
         "coordinator tick: scanning terminal items"
     );
 
+    // Cache each repo's identity + parsed config for the duration of the tick: many
+    // terminal items typically share a repo, so this loads + parses each distinct
+    // repo at most once per tick instead of once per item.
+    let mut repo_cache: HashMap<Uuid, Option<(RepoIdent, Config)>> = HashMap::new();
+
     let mut reacted = 0usize;
     for item in items {
-        match react_to_item(pool, gh, &item).await {
+        let repo = match repo_cache.get(&item.repo_id) {
+            Some(cached) => cached.clone(),
+            None => {
+                let loaded = load_repo_and_config(pool, item.repo_id).await?;
+                repo_cache.insert(item.repo_id, loaded.clone());
+                loaded
+            }
+        };
+        match react_to_item(pool, gh, &item, repo).await {
             Ok(true) => reacted += 1,
             Ok(false) => {
                 tracing::info!(work_item = %item.id, "already reacted by another replica; skipped");
@@ -77,14 +96,20 @@ async fn react_to_item(
     pool: &record::Pool,
     gh: &dyn GitHubClient,
     item: &WorkItem,
+    repo_and_config: Option<(RepoIdent, Config)>,
 ) -> anyhow::Result<bool> {
-    // Load the repo + its validated config first: every decision needs the coder
-    // and reviewer worker names. A repo with no usable config can't be acted on.
-    let Some((repo_ident, config)) = load_repo_and_config(pool, item.repo_id).await? else {
+    // Every decision needs the repo identity and its validated config (the coder and
+    // reviewer worker names). A repo with no usable config can't be acted on. The
+    // tick loads + parses this once per repo and hands it in (see `coordinator_tick`).
+    let Some((repo_ident, config)) = repo_and_config else {
         tracing::warn!(work_item = %item.id, repo_id = %item.repo_id, "no usable repo config; skipping");
         return Ok(false);
     };
-    let repo = repo_ref(&repo_ident);
+    let repo = RepoRef::new(
+        repo_ident.owner,
+        repo_ident.name,
+        repo_ident.installation_id,
+    );
 
     // GitHub reads needed for the decision happen BEFORE the claim. Only the
     // reviewer-approved path reads GitHub (the can't-weaken guard + check status);
@@ -265,14 +290,15 @@ async fn apply_approval(
     match decision {
         ApprovalDecision::WeakensGating { cr, number } => {
             // NEVER mark ready. Escalate a conflict and hand to a human.
+            let (comment_target, assign_issue) = escalation_target(item, Some(&cr));
             escalate(
                 pool,
                 gh,
                 repo,
                 item,
                 Escalation {
-                    comment_target: CommentTarget::ChangeRequest(number as i64),
-                    assign_issue: escalation_assign_issue(&cr),
+                    comment_target,
+                    assign_issue,
                     reason: "conflict",
                     context: "change weakens its own gating checks",
                 },
@@ -321,10 +347,7 @@ async fn decide_changes_requested(
 
     if count >= LOOP_CAP {
         // The rework loop is stuck. Escalate exactly once and block the issue.
-        let comment_target = match cr.number {
-            Some(n) => CommentTarget::ChangeRequest(n as i64),
-            None => issue_comment_target(cr),
-        };
+        let (comment_target, assign_issue) = escalation_target(item, Some(cr));
         escalate(
             pool,
             gh,
@@ -332,7 +355,7 @@ async fn decide_changes_requested(
             item,
             Escalation {
                 comment_target,
-                assign_issue: escalation_assign_issue(cr),
+                assign_issue,
                 reason: "loop_cap",
                 context: &format!(
                     "review-rework loop reached the cap ({LOOP_CAP}) without converging"
@@ -373,14 +396,15 @@ async fn decide_failed(
         tracing::info!(work_item = %item.id, attempt_count = item.attempt_count, cap = RETRY_CAP, "failed item under retry cap; no escalation");
         return Ok(());
     }
+    let (comment_target, assign_issue) = escalation_target(item, None);
     escalate(
         pool,
         gh,
         repo,
         item,
         Escalation {
-            comment_target: subject_comment_target(&item.subject_ref),
-            assign_issue: subject_issue_number(&item.subject_ref),
+            comment_target,
+            assign_issue,
             reason: "retries_exhausted",
             context: &format!("worker failed after {} attempts", item.attempt_count),
         },
@@ -393,8 +417,10 @@ async fn decide_failed(
 /// The details of one escalation: where to notify the human, which issue to hand
 /// them, and why. Bundled so [`escalate`] stays under the argument limit.
 struct Escalation<'a> {
-    /// Where to post the human-facing escalation comment (issue or CR).
-    comment_target: CommentTarget,
+    /// Where to post the human-facing escalation comment (issue or CR), or `None`
+    /// when no subject could be resolved — the escalation row + assignment are still
+    /// recorded, but no comment is posted (a `#0` placeholder would be a misdelivery).
+    comment_target: Option<CommentTarget>,
     /// The issue to assign to a human, if any.
     assign_issue: Option<i64>,
     /// The escalation reason (one of the record-book reasons; the dedupe key).
@@ -427,12 +453,19 @@ async fn escalate(
         return Ok(());
     }
 
-    let body = format!("Factory escalation ({}): {}", esc.reason, esc.context);
-    gh.post_comment(repo, esc.comment_target, &body).await?;
+    match esc.comment_target {
+        Some(target) => {
+            let body = format!("Factory escalation ({}): {}", esc.reason, esc.context);
+            gh.post_comment(repo, target, &body).await?;
+        }
+        None => {
+            tracing::warn!(work_item = %item.id, reason = esc.reason, %escalation_id, "escalation comment target unresolved; recorded escalation without a comment");
+        }
+    }
     if let Some(issue) = esc.assign_issue {
         gh.assign_issue(repo, issue, HANDOFF_ASSIGNEE).await?;
     }
-    tracing::info!(work_item = %item.id, reason = esc.reason, %escalation_id, "escalation created; comment + assignment posted");
+    tracing::info!(work_item = %item.id, reason = esc.reason, %escalation_id, "escalation created; side effects applied");
     Ok(())
 }
 
@@ -486,14 +519,6 @@ async fn load_repo_and_config(
     }
 }
 
-fn repo_ref(ident: &RepoIdent) -> RepoRef {
-    RepoRef {
-        owner: ident.owner.clone(),
-        name: ident.name.clone(),
-        installation_id: ident.installation_id,
-    }
-}
-
 /// The first worker with the given role, by name.
 fn worker_with_role(config: &Config, role: Role) -> Option<&str> {
     config
@@ -533,32 +558,40 @@ fn parse_subject(subject_ref: &str) -> anyhow::Result<Subject> {
         .map_err(|e| anyhow::anyhow!("unparseable subject_ref {subject_ref:?}: {e}"))
 }
 
-/// The comment target for a subject string (`issue#N` / `cr#N`); falls back to the
-/// issue form if the subject is unparseable (best-effort delivery).
-fn subject_comment_target(subject_ref: &str) -> CommentTarget {
-    match subject_ref.parse::<Subject>() {
-        Ok(Subject::Issue(n)) => CommentTarget::Issue(n),
-        Ok(Subject::ChangeRequest(n)) => CommentTarget::ChangeRequest(n),
-        Err(_) => CommentTarget::Issue(0),
+/// Resolve where to deliver an escalation: the comment target and the issue to hand
+/// a human. With a [`ChangeRequest`] in hand (loop-cap / gating conflict) the target
+/// is the CR (or its linked issue if the CR has no number yet) and the assigned issue
+/// is the CR's linked issue. Without one (a Failed item) the target and assigned issue
+/// come from the item's own subject. Either component is `None` when it can't be
+/// resolved — the caller skips the corresponding side effect rather than fabricating
+/// a `#0` placeholder. The subject is parsed exactly once.
+fn escalation_target(
+    item: &WorkItem,
+    cr: Option<&ChangeRequest>,
+) -> (Option<CommentTarget>, Option<i64>) {
+    match cr {
+        Some(cr) => {
+            let assign_issue = cr.linked_issue.map(|n| n as i64);
+            let comment_target = match cr.number {
+                Some(n) => Some(CommentTarget::ChangeRequest(n as i64)),
+                None => assign_issue.map(CommentTarget::Issue),
+            };
+            (comment_target, assign_issue)
+        }
+        None => match item.subject_ref.parse::<Subject>() {
+            Ok(subject) => {
+                let assign_issue = match subject {
+                    Subject::Issue(n) => Some(n),
+                    Subject::ChangeRequest(_) => None,
+                };
+                (Some(subject.comment_target()), assign_issue)
+            }
+            Err(_) => {
+                tracing::warn!(work_item = %item.id, subject = %item.subject_ref, "escalation subject unparseable; no comment target");
+                (None, None)
+            }
+        },
     }
-}
-
-/// The issue number to assign on a subject string, if it is an issue subject.
-fn subject_issue_number(subject_ref: &str) -> Option<i64> {
-    match subject_ref.parse::<Subject>() {
-        Ok(Subject::Issue(n)) => Some(n),
-        _ => None,
-    }
-}
-
-/// The issue number to assign for a CR escalation: the CR's linked issue.
-fn escalation_assign_issue(cr: &ChangeRequest) -> Option<i64> {
-    cr.linked_issue.map(|n| n as i64)
-}
-
-/// The comment target for a CR's linked issue (used when the CR has no number yet).
-fn issue_comment_target(cr: &ChangeRequest) -> CommentTarget {
-    CommentTarget::Issue(cr.linked_issue.unwrap_or(0) as i64)
 }
 
 /// Whether a changed path is part of the gating-check definition. A change touching
@@ -581,21 +614,79 @@ mod tests {
         assert!(!is_gating_path("docs/.github/workflows/x.yml"));
     }
 
-    #[test]
-    fn subject_comment_target_maps_both_and_falls_back() {
-        assert_eq!(subject_comment_target("issue#7"), CommentTarget::Issue(7));
-        assert_eq!(
-            subject_comment_target("cr#9"),
-            CommentTarget::ChangeRequest(9)
-        );
-        assert_eq!(subject_comment_target("garbage"), CommentTarget::Issue(0));
+    /// A throwaway terminal work item with the given subject, for `escalation_target`.
+    fn item_with_subject(subject_ref: &str) -> WorkItem {
+        WorkItem {
+            id: Uuid::now_v7(),
+            repo_id: Uuid::now_v7(),
+            kind: Kind::Coder,
+            worker_name: "w".into(),
+            trigger: "manager".into(),
+            subject_ref: subject_ref.into(),
+            correlation_id: Uuid::now_v7(),
+            state: State::Failed,
+            attempt_count: 0,
+            loop_count: 0,
+            config_sha: "sha".into(),
+            lease_owner: None,
+            lease_expires_at: None,
+        }
+    }
+
+    fn cr_with(number: Option<i32>, linked_issue: Option<i32>) -> ChangeRequest {
+        ChangeRequest {
+            id: Uuid::now_v7(),
+            repo_id: Uuid::now_v7(),
+            number,
+            head_branch: "factory/issue-1".into(),
+            linked_issue,
+            work_item_id: None,
+            factory_state: "open".into(),
+        }
     }
 
     #[test]
-    fn subject_issue_number_only_for_issue_subjects() {
-        assert_eq!(subject_issue_number("issue#3"), Some(3));
-        assert_eq!(subject_issue_number("cr#3"), None);
-        assert_eq!(subject_issue_number("nope"), None);
+    fn escalation_target_from_subject_when_no_cr() {
+        // An issue subject → comment on the issue, assign the issue.
+        assert_eq!(
+            escalation_target(&item_with_subject("issue#7"), None),
+            (Some(CommentTarget::Issue(7)), Some(7))
+        );
+        // A CR subject → comment on the CR, but nothing to assign (no linked issue).
+        assert_eq!(
+            escalation_target(&item_with_subject("cr#9"), None),
+            (Some(CommentTarget::ChangeRequest(9)), None)
+        );
+    }
+
+    #[test]
+    fn escalation_target_unparseable_subject_skips_comment() {
+        // An unparseable subject resolves to neither a comment target nor an
+        // assignment: the caller skips the GitHub comment rather than misdelivering
+        // to a `#0` placeholder. (The escalation row itself is still recorded.)
+        assert_eq!(
+            escalation_target(&item_with_subject("garbage"), None),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn escalation_target_from_cr() {
+        // A CR with a number → comment on the CR, assign its linked issue.
+        assert_eq!(
+            escalation_target(&item_with_subject("cr#9"), Some(&cr_with(Some(9), Some(1)))),
+            (Some(CommentTarget::ChangeRequest(9)), Some(1))
+        );
+        // A CR with no number yet → fall back to the linked issue for the comment.
+        assert_eq!(
+            escalation_target(&item_with_subject("cr#9"), Some(&cr_with(None, Some(1)))),
+            (Some(CommentTarget::Issue(1)), Some(1))
+        );
+        // A CR with neither a number nor a linked issue → nothing to deliver to.
+        assert_eq!(
+            escalation_target(&item_with_subject("cr#9"), Some(&cr_with(None, None))),
+            (None, None)
+        );
     }
 
     #[test]

@@ -1227,21 +1227,6 @@ pub async fn mark_reacted(pool: &Pool, work_item_id: Uuid) -> Result<bool> {
     Ok(row.is_some())
 }
 
-/// Create (or fetch) an issue row for `(repo, number)`; returns its id.
-pub async fn upsert_issue(pool: &Pool, repo_id: Uuid, number: i32) -> Result<Uuid> {
-    let row = sqlx::query(
-        "INSERT INTO issues (id, repo_id, number) VALUES ($1, $2, $3)
-         ON CONFLICT (repo_id, number) DO UPDATE SET updated_at = now()
-         RETURNING id",
-    )
-    .bind(Uuid::now_v7())
-    .bind(repo_id)
-    .bind(number)
-    .fetch_one(pool)
-    .await?;
-    Ok(row.try_get("id")?)
-}
-
 /// Set an issue's factory state (`open` | `in_progress` | `blocked` | `done`).
 pub async fn set_issue_state(pool: &Pool, repo_id: Uuid, number: i32, state: &str) -> Result<()> {
     sqlx::query(

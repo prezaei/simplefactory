@@ -474,11 +474,7 @@ mod acceptance {
                 comments: vec![],
             },
         ));
-        let state = std::sync::Arc::new(factory_tools::ToolsState {
-            pool: pool.clone(),
-            gh,
-            blob: std::sync::Arc::new(factory_blob::InMemoryTranscripts::new()),
-        });
+        let state = std::sync::Arc::new(tools_state(&pool, gh));
 
         // Resolve the captured token to the task auth (as the Tools HTTP layer does).
         let auth = factory_tools::authorize(&pool, &raw_token)
@@ -672,20 +668,74 @@ mod acceptance {
             .collect()
     }
 
+    /// The shared preamble for every P4 coordinator test: take the cross-test serial
+    /// lock, drain any pre-existing terminal items so this test's `FakeGitHub` only
+    /// records its own effects, create a fresh uniquely-named repo with the three-role
+    /// config, and build the `(FakeGitHub, ToolsState)` the test drives the workers
+    /// through. Returns the held lock guard (kept alive for the test's duration), the
+    /// repo id, the `(manager, coder, reviewer)` worker names, and the gh/state pair.
+    #[allow(clippy::type_complexity)]
+    async fn p4_fixture(
+        pool: &record::Pool,
+        name_prefix: &str,
+    ) -> (
+        tokio::sync::MutexGuard<'static, ()>,
+        Uuid,
+        (&'static str, &'static str, &'static str),
+        Arc<FakeGitHub>,
+        ToolsState,
+    ) {
+        let serial = P4_SERIAL.lock().await;
+        drain_terminal(pool).await;
+        let repo = record::upsert_repo(pool, "acme", &unique(name_prefix), 1)
+            .await
+            .unwrap();
+        let names = setup_three_role_repo(pool, repo).await;
+        let gh = Arc::new(FakeGitHub::new());
+        let state = tools_state(pool, gh.clone());
+        (serial, repo, names, gh, state)
+    }
+
+    /// Bootstrap a CR on `issue#1`: enqueue a coder, open the change request through
+    /// the Tools seam, and read its record-book row back. Returns the CR number and
+    /// the persisted [`record::ChangeRequest`] row. The opening coder item id is not
+    /// returned (callers that need to finish it look it up by subject).
+    async fn open_cr(
+        pool: &record::Pool,
+        repo: Uuid,
+        coder: &str,
+        state: &ToolsState,
+        body: &str,
+    ) -> (i64, record::ChangeRequest) {
+        let coder_item = enqueue_item(pool, repo, record::Kind::Coder, coder, "issue#1").await;
+        let coder_auth = task_auth(coder_item, repo, record::Kind::Coder);
+        let cr = factory_tools::open_or_update_change_request(
+            state,
+            &coder_auth,
+            "[coder] issue#1",
+            body,
+            "factory/issue-1",
+            "main",
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let cr_number = cr["cr_number"].as_i64().unwrap();
+        let cr_row = record::change_request_by_number(pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .unwrap();
+        (cr_number, cr_row)
+    }
+
     #[tokio::test]
     async fn worked_example_happy_path_issue_to_merge_handoff() {
         let Some(pool) = pool_or_skip().await else {
             eprintln!("SKIP: DATABASE_URL not set");
             return;
         };
-        let _serial = P4_SERIAL.lock().await;
-        drain_terminal(&pool).await;
-        let name = unique("e2e-p4-happy");
-        let repo = record::upsert_repo(&pool, "acme", &name, 1).await.unwrap();
-        let (manager, _coder, _reviewer) = setup_three_role_repo(&pool, repo).await;
-
-        let gh = Arc::new(FakeGitHub::new());
-        let state = tools_state(&pool, gh.clone());
+        let (_serial, repo, (manager, _coder, _reviewer), gh, state) =
+            p4_fixture(&pool, "e2e-p4-happy").await;
 
         // The manager triaged issue#1 and succeeded → coordinator assigns a coder.
         let manager_item =
@@ -779,39 +829,19 @@ mod acceptance {
             eprintln!("SKIP: DATABASE_URL not set");
             return;
         };
-        let _serial = P4_SERIAL.lock().await;
-        drain_terminal(&pool).await;
-        let name = unique("e2e-p4-rework");
-        let repo = record::upsert_repo(&pool, "acme", &name, 1).await.unwrap();
-        let (_manager, coder, reviewer) = setup_three_role_repo(&pool, repo).await;
-
-        let gh = Arc::new(FakeGitHub::new());
-        let state = tools_state(&pool, gh.clone());
+        let (_serial, repo, (_manager, coder, reviewer), gh, state) =
+            p4_fixture(&pool, "e2e-p4-rework").await;
 
         // Bootstrap a CR on issue#1: one coder opens it.
-        let first_coder = enqueue_item(&pool, repo, record::Kind::Coder, coder, "issue#1").await;
-        let coder_auth = task_auth(first_coder, repo, record::Kind::Coder);
-        let cr = factory_tools::open_or_update_change_request(
-            &state,
-            &coder_auth,
-            "[coder] issue#1",
-            "first attempt",
-            "factory/issue-1",
-            "main",
-            Some(1),
-        )
-        .await
-        .unwrap();
-        let cr_number = cr["cr_number"].as_i64().unwrap();
+        let (cr_number, cr_row) = open_cr(&pool, repo, coder, &state, "first attempt").await;
         let cr_subject = format!("cr#{cr_number}");
-        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
-            .await
-            .unwrap()
-            .unwrap();
         // The bootstrap coder finished opening the CR: mark it terminal AND reacted
         // so it neither occupies the active (repo, issue#1, coder) slot (which would
         // make the coordinator's rework dispatch dedupe against it) nor shows up as
         // an extra item for the coordinator to react to in the cycles below.
+        let first_coder = find_item(&pool, repo, record::Kind::Coder, "issue#1")
+            .await
+            .expect("the bootstrap coder item");
         mark_succeeded(&pool, first_coder).await;
         assert!(record::mark_reacted(&pool, first_coder).await.unwrap());
 
@@ -887,36 +917,13 @@ mod acceptance {
             eprintln!("SKIP: DATABASE_URL not set");
             return;
         };
-        let _serial = P4_SERIAL.lock().await;
-        drain_terminal(&pool).await;
-        let name = unique("e2e-p4-once");
-        let repo = record::upsert_repo(&pool, "acme", &name, 1).await.unwrap();
-        let (_manager, coder, reviewer) = setup_three_role_repo(&pool, repo).await;
-
-        let gh = Arc::new(FakeGitHub::new());
-        let state = tools_state(&pool, gh.clone());
+        let (_serial, repo, (_manager, coder, reviewer), gh, state) =
+            p4_fixture(&pool, "e2e-p4-once").await;
 
         // A CR already at the loop cap (loop_count = LOOP_CAP - 1, so the next
         // changes-requested reaches it). Open the CR via the coder seam.
-        let coder_item = enqueue_item(&pool, repo, record::Kind::Coder, coder, "issue#1").await;
-        let coder_auth = task_auth(coder_item, repo, record::Kind::Coder);
-        let cr = factory_tools::open_or_update_change_request(
-            &state,
-            &coder_auth,
-            "[coder] issue#1",
-            "attempt",
-            "factory/issue-1",
-            "main",
-            Some(1),
-        )
-        .await
-        .unwrap();
-        let cr_number = cr["cr_number"].as_i64().unwrap();
+        let (cr_number, cr_row) = open_cr(&pool, repo, coder, &state, "attempt").await;
         let cr_subject = format!("cr#{cr_number}");
-        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
-            .await
-            .unwrap()
-            .unwrap();
         for _ in 0..4 {
             record::increment_cr_loop_count(&pool, cr_row.id)
                 .await
@@ -975,31 +982,13 @@ mod acceptance {
             eprintln!("SKIP: DATABASE_URL not set");
             return;
         };
-        let _serial = P4_SERIAL.lock().await;
-        drain_terminal(&pool).await;
-        let name = unique("e2e-p4-gating");
-        let repo = record::upsert_repo(&pool, "acme", &name, 1).await.unwrap();
-        let (_manager, coder, reviewer) = setup_three_role_repo(&pool, repo).await;
-
-        // First open the CR on a default FakeGitHub so we learn its number, then
-        // build the assertion FakeGitHub seeded with a gating file list + green
-        // checks for that CR (green checks prove the guard, not the checks, blocks it).
-        let setup_gh = Arc::new(FakeGitHub::new());
-        let setup_state = tools_state(&pool, setup_gh.clone());
-        let coder_item = enqueue_item(&pool, repo, record::Kind::Coder, coder, "issue#1").await;
-        let coder_auth = task_auth(coder_item, repo, record::Kind::Coder);
-        let cr = factory_tools::open_or_update_change_request(
-            &setup_state,
-            &coder_auth,
-            "[coder] issue#1",
-            "disables CI",
-            "factory/issue-1",
-            "main",
-            Some(1),
-        )
-        .await
-        .unwrap();
-        let cr_number = cr["cr_number"].as_i64().unwrap();
+        // The fixture's gh/state act as the setup pair: open the CR on a default
+        // FakeGitHub so we learn its number, then below build the assertion FakeGitHub
+        // seeded with a gating file list + green checks for that CR (green checks prove
+        // the guard, not the checks, blocks it).
+        let (_serial, repo, (_manager, coder, reviewer), _setup_gh, setup_state) =
+            p4_fixture(&pool, "e2e-p4-gating").await;
+        let (cr_number, _cr_row) = open_cr(&pool, repo, coder, &setup_state, "disables CI").await;
         let cr_subject = format!("cr#{cr_number}");
 
         let gh = Arc::new(
