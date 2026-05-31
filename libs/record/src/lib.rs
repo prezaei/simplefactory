@@ -1254,8 +1254,12 @@ pub async fn list_unreacted_terminal(pool: &Pool) -> Result<Vec<WorkItem>> {
 /// per-react transaction (binding the claim and the decision writes atomically),
 /// while existing callers passing `&pool` still work (`&Pool: PgExecutor`).
 pub async fn mark_reacted(executor: impl sqlx::PgExecutor<'_>, work_item_id: Uuid) -> Result<bool> {
+    // Do NOT touch `updated_at`: it records when the item became TERMINAL, and both
+    // `purge_terminal` retention and the coordinator's `WorkItem.updated_at` defer-grace
+    // anchor rely on that meaning. Bumping it on the react claim would make an old
+    // terminal row look newly terminal (retained longer; stale grace window).
     let row = sqlx::query(
-        "UPDATE work_items SET reacted = true, updated_at = now()
+        "UPDATE work_items SET reacted = true
           WHERE id = $1 AND NOT reacted
          RETURNING id",
     )

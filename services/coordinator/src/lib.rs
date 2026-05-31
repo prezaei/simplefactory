@@ -992,11 +992,19 @@ async fn load_cr_for_item(
     if item.kind == Kind::Coder && item.state == State::Succeeded {
         return Ok(record::change_request_for_item(pool, item.id).await?);
     }
-    // Otherwise the CR (if any) is the `cr#N` the item's subject names.
+    // Otherwise the CR (if any) is the `cr#N` the item's subject names. Narrow N to the
+    // i32 the change_requests table stores with a CHECKED conversion: an out-of-range
+    // (malformed/overflowing) cr# must resolve to "untracked" (None), never wrap via
+    // `as i32` into an unrelated CR number — consistent with how any other subject shape
+    // is treated as no-CR.
     match item.subject_ref.parse::<Subject>() {
-        Ok(Subject::ChangeRequest(n)) => {
-            Ok(record::change_request_by_number(pool, item.repo_id, n as i32).await?)
-        }
+        Ok(Subject::ChangeRequest(n)) => match i32::try_from(n) {
+            Ok(num) => Ok(record::change_request_by_number(pool, item.repo_id, num).await?),
+            Err(_) => {
+                tracing::warn!(work_item = %item.id, cr_number = n, "cr# subject out of i32 range; treating as untracked (no CR)");
+                Ok(None)
+            }
+        },
         _ => Ok(None),
     }
 }
