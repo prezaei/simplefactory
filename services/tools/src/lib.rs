@@ -504,6 +504,18 @@ async fn record_verdict_cr_state(
         .map_err(|_| ToolError::BadRequest(format!("invalid cr_number {cr_number}")))?;
     if let Some(cr) = record::change_request_by_number(&state.pool, auth.repo_id, cr_number).await?
     {
+        // Don't clobber a CR the coordinator has already advanced past review: once a
+        // CR is `ready`/`merged`/`closed` a late or duplicate verdict must not drag it
+        // back to `approved`/`changes_requested` (that would re-open a settled handoff).
+        if matches!(cr.factory_state.as_str(), "ready" | "merged" | "closed") {
+            tracing::info!(
+                work_item = %auth.work_item_id,
+                cr_number,
+                factory_state = %cr.factory_state,
+                "submit_review: CR already past review; not overwriting its factory state"
+            );
+            return Ok(());
+        }
         record::set_change_request_state(&state.pool, cr.id, new_state).await?;
     }
     Ok(())

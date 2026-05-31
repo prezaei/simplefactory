@@ -41,7 +41,8 @@
 //!
 //! The bounded review-rework counter is the per-CR `change_requests.loop_count`,
 //! advanced via [`record::increment_cr_loop_count`] on each changes-requested cycle;
-//! at [`LOOP_CAP`] the loop escalates instead of dispatching another coder.
+//! at the repo's configured `settings.loop_cap` the loop escalates instead of
+//! dispatching another coder.
 //!
 //! ## Side-effect ordering
 //! GitHub *reads* needed for a decision happen BEFORE the transaction (they are
@@ -55,6 +56,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use factory_config::{Config, Role};
 use factory_github::{CheckConclusion, CheckRef, CommentTarget, GitHubClient, RepoRef, Subject};
@@ -62,14 +64,6 @@ use factory_record::{
     self as record, ChangeRequest, Kind, NewWorkItem, RepoIdent, State, WorkItem,
 };
 use uuid::Uuid;
-
-/// Platform-default retry ceiling: a Failed item with this many attempts (or more)
-/// escalates rather than being retried again.
-const RETRY_CAP: i32 = 3;
-
-/// Platform-default review-rework ceiling: at this many changes-requested cycles the
-/// loop escalates instead of dispatching yet another coder.
-const LOOP_CAP: i32 = 5;
 
 /// The human handed work on escalation / ready-for-merge. Factory has no per-repo
 /// human identity in scope yet, so a single placeholder assignee is used; a real
@@ -91,10 +85,11 @@ pub async fn coordinator_tick(pool: &record::Pool, gh: &dyn GitHubClient) -> any
 
     // Cache each repo's identity + parsed config for the duration of the tick: many
     // terminal items typically share a repo, so this loads + parses each distinct
-    // repo at most once per tick instead of once per item. The cache value is itself
-    // a `Result` so a config-load failure is isolated per item (it is replayed for
-    // each item that shares the repo) without aborting the tick.
-    let mut repo_cache: HashMap<Uuid, Option<(RepoIdent, Config)>> = HashMap::new();
+    // repo at most once per tick instead of once per item. The cache stores an
+    // `Arc<(RepoIdent, Config)>` so each item clones a cheap pointer, not the whole
+    // (potentially large) Config. `None` records a repo with no usable config so it
+    // is not re-loaded for every item that shares it.
+    let mut repo_cache: HashMap<Uuid, Option<Arc<(RepoIdent, Config)>>> = HashMap::new();
 
     let mut reacted = 0usize;
     for item in items {
@@ -104,6 +99,7 @@ pub async fn coordinator_tick(pool: &record::Pool, gh: &dyn GitHubClient) -> any
             Some(cached) => cached.clone(),
             None => match load_repo_and_config(pool, item.repo_id).await {
                 Ok(loaded) => {
+                    let loaded = loaded.map(Arc::new);
                     repo_cache.insert(item.repo_id, loaded.clone());
                     loaded
                 }
@@ -137,35 +133,44 @@ async fn react_to_item(
     pool: &record::Pool,
     gh: &dyn GitHubClient,
     item: &WorkItem,
-    repo_and_config: Option<(RepoIdent, Config)>,
+    repo_and_config: Option<Arc<(RepoIdent, Config)>>,
 ) -> anyhow::Result<bool> {
     // Every decision needs the repo identity and its validated config (the coder and
     // reviewer worker names). A repo with no usable config can't be acted on. The
     // tick loads + parses this once per repo and hands it in (see `coordinator_tick`).
-    let Some((repo_ident, config)) = repo_and_config else {
+    let Some(repo_and_config) = repo_and_config else {
         tracing::warn!(work_item = %item.id, repo_id = %item.repo_id, "no usable repo config; skipping");
         return Ok(false);
     };
+    let (repo_ident, config) = repo_and_config.as_ref();
     let repo = RepoRef::new(
-        repo_ident.owner,
-        repo_ident.name,
+        repo_ident.owner.clone(),
+        repo_ident.name.clone(),
         repo_ident.installation_id,
     );
+
+    // Load the CR ONCE, BEFORE the tx, for every path that needs it (reviewer-succeeded
+    // and any failed item whose subject is a CR). Reading it here — not inside the tx —
+    // avoids acquiring a second pool connection while the tx holds one plus the per-issue
+    // lock (a pool-starvation deadlock risk under load), and avoids re-reading the same
+    // CR 2–3× per react. The loaded CR is threaded into the lock-key derivation and the
+    // in-tx decision; NO `&Pool` read happens inside the tx (C4).
+    let cr = load_cr_for_item(pool, item).await?;
 
     // GitHub reads needed for the decision happen BEFORE the claim/tx. Only the
     // reviewer-approved path reads GitHub (the can't-weaken guard + check status).
     let approval = if item.kind == Kind::Reviewer && item.state == State::Succeeded {
-        load_approval_decision(pool, gh, &repo, item, &config).await?
+        load_approval_decision(gh, &repo, item, config, cr.clone()).await?
     } else {
         None
     };
 
     // The per-issue serialization key for the advisory lock. Derived from the item's
-    // subject (issue#N directly; cr#N via the CR's linked issue) so two replicas
-    // reacting to different terminal items for the SAME issue serialize. When it can't
-    // be derived, fall back to a stable key from the work-item id so two replicas
-    // racing on the SAME item still serialize on the lock.
-    let lock_key = issue_lock_key(pool, item).await?;
+    // subject (issue#N directly; cr#N via the pre-loaded CR's linked issue) so two
+    // replicas reacting to different terminal items for the SAME issue serialize. When
+    // no issue can be derived, fall back to a REPO-LEVEL key (C5) so items for the same
+    // repo still serialize (coarser, but it never splits the namespace per work item).
+    let lock_key = issue_lock_key(item, cr.as_ref());
 
     let mut tx = pool.begin().await?;
     record::issue_advisory_lock(&mut tx, item.repo_id, lock_key).await?;
@@ -185,18 +190,19 @@ async fn react_to_item(
     );
 
     // Apply the DB decision INSIDE the tx; it returns the GitHub side effects to run
-    // after the commit (a no-op for most paths).
+    // after the commit (a no-op for most paths). All DB access here uses `&mut *tx`;
+    // the CR was pre-loaded above so no path re-reads the pool inside the tx (C4).
     let post_commit = match (item.kind, item.state) {
         (Kind::Manager, State::Succeeded) => {
-            decide_manager_succeeded(&mut tx, item, &config).await?
+            decide_manager_succeeded(&mut tx, item, config).await?
         }
         (Kind::Coder, State::Succeeded) => {
-            decide_coder_succeeded(&mut tx, pool, item, &config).await?
+            decide_coder_succeeded(&mut tx, item, config, cr).await?
         }
         (Kind::Reviewer, State::Succeeded) => {
-            decide_reviewer_succeeded(&mut tx, pool, item, &config, approval).await?
+            decide_reviewer_succeeded(&mut tx, item, config, approval, cr).await?
         }
-        (_, State::Failed) => decide_failed(&mut tx, pool, item).await?,
+        (_, State::Failed) => decide_failed(&mut tx, item, config, cr).await?,
         (_, State::Escalated) => {
             // Already escalated upstream; nothing more to do but record the react.
             tracing::info!(work_item = %item.id, "terminal item already escalated; no-op react");
@@ -216,32 +222,38 @@ async fn react_to_item(
 }
 
 /// The GitHub side effects to run AFTER the per-react transaction commits. Most
-/// decision paths produce [`PostCommit::None`]; the handoff and escalation paths
-/// carry the targets and the `created` flag so the comment + assignment run exactly
-/// once (only when the underlying row was newly created in the tx).
+/// decision paths produce [`PostCommit::None`]; the handoff and escalation paths carry
+/// a PREBUILT human-facing `body` (D2: the decision layer composes all copy; this
+/// transport layer only delivers it), the comment target, the issue to assign, and the
+/// guard flag (`did_transition` / `created`) so the comment + assignment run exactly
+/// once — only when the underlying transition/row actually happened in the tx.
 enum PostCommit {
     /// No GitHub side effect.
     None,
-    /// An approved CR is ready for merge: post the handoff comment on the CR and
-    /// assign the linked issue (if any) to a human.
+    /// An approved CR transitioned to `ready` for merge: post the prebuilt handoff
+    /// `body` on `comment_target` and assign the linked issue (if any) to a human. Runs
+    /// only when `did_transition` (the in-tx `approved → ready` guard won).
     ReadyHandoff {
-        cr_number: i64,
+        body: String,
+        comment_target: CommentTarget,
         assign_issue: Option<i64>,
+        did_transition: bool,
     },
-    /// An escalation was recorded; run its human-facing side effects iff `created`.
+    /// An escalation was recorded; deliver its prebuilt `body` iff `created`.
     Escalation {
-        created: bool,
-        escalation_id: Uuid,
+        body: String,
         comment_target: Option<CommentTarget>,
         assign_issue: Option<i64>,
+        created: bool,
         reason: &'static str,
-        context: String,
     },
 }
 
-/// Run the post-commit GitHub side effects for a decision. Idempotent: escalation
-/// effects run only when the row was newly created in the tx; a re-dispatch / racing
-/// replica that hit the existing row carries `created = false` and posts nothing.
+/// Run the post-commit GitHub side effects for a decision. Pure transport: it delivers
+/// the prebuilt `body` the decision layer composed (D2) and NEVER composes copy itself.
+/// Idempotent: handoff/escalation effects run only when their in-tx guard won
+/// (`did_transition` / `created`); a re-dispatch / racing replica that lost the guard
+/// posts nothing.
 async fn run_post_commit(
     gh: &dyn GitHubClient,
     repo: &RepoRef,
@@ -251,65 +263,66 @@ async fn run_post_commit(
     match post_commit {
         PostCommit::None => Ok(()),
         PostCommit::ReadyHandoff {
-            cr_number,
+            body,
+            comment_target,
             assign_issue,
+            did_transition,
         } => {
-            let body = format!(
-                "Factory: change request #{cr_number} is approved and all checks are green. \
-                 Ready for a human to merge; the linked issue is closed once you merge."
-            );
-            gh.post_comment(repo, CommentTarget::ChangeRequest(cr_number), &body)
-                .await?;
+            if !did_transition {
+                tracing::info!(work_item = %item.id, "approved→ready handoff skipped post-commit: transition guard lost");
+                return Ok(());
+            }
+            gh.post_comment(repo, comment_target, &body).await?;
             if let Some(issue) = assign_issue {
                 gh.assign_issue(repo, issue, HANDOFF_ASSIGNEE).await?;
-                tracing::info!(work_item = %item.id, cr_number, issue, "reviewer approved: CR ready, handed to human; issue stays open awaiting merge");
+                tracing::info!(work_item = %item.id, issue, "reviewer approved: CR ready, handed to human; issue stays open awaiting merge");
             } else {
-                tracing::warn!(work_item = %item.id, cr_number, "approved CR has no linked issue; marked ready without issue handoff");
+                tracing::warn!(work_item = %item.id, "approved CR has no linked issue; marked ready without issue handoff");
             }
             Ok(())
         }
         PostCommit::Escalation {
-            created,
-            escalation_id,
+            body,
             comment_target,
             assign_issue,
+            created,
             reason,
-            context,
         } => {
             if !created {
-                tracing::info!(work_item = %item.id, reason, %escalation_id, "escalation already exists; no second comment/assignment");
+                tracing::info!(work_item = %item.id, reason, "escalation already exists; no second comment/assignment");
                 return Ok(());
             }
             match comment_target {
                 Some(target) => {
-                    let body = format!("Factory escalation ({reason}): {context}");
                     gh.post_comment(repo, target, &body).await?;
                 }
                 None => {
-                    tracing::warn!(work_item = %item.id, reason, %escalation_id, "escalation comment target unresolved; recorded escalation without a comment");
+                    tracing::warn!(work_item = %item.id, reason, "escalation comment target unresolved; recorded escalation without a comment");
                 }
             }
             if let Some(issue) = assign_issue {
                 gh.assign_issue(repo, issue, HANDOFF_ASSIGNEE).await?;
             }
-            tracing::info!(work_item = %item.id, reason, %escalation_id, "escalation created; side effects applied");
+            tracing::info!(work_item = %item.id, reason, "escalation created; side effects applied");
             Ok(())
         }
     }
 }
 
-/// The pre-claim decision for a Succeeded reviewer: read the CR and (if approved
-/// and gating-safe) its check status. `None` means "no actionable approval"
-/// (the CR isn't tracked, isn't approved, or the gating guard / checks block it).
-/// The result is applied only after the react claim is won.
+/// The pre-claim decision for a Succeeded reviewer: inspect the pre-loaded CR and
+/// (if approved and gating-safe) read its check status. `None` means "no actionable
+/// approval" (the CR isn't tracked, isn't approved, or the gating guard / checks
+/// block it). The CR was loaded ONCE before the tx (C4) and is handed in here; this
+/// fn performs only GitHub reads, no `&Pool` reads. The result is applied only after
+/// the react claim is won.
 async fn load_approval_decision(
-    pool: &record::Pool,
     gh: &dyn GitHubClient,
     repo: &RepoRef,
     item: &WorkItem,
     config: &Config,
+    cr: Option<ChangeRequest>,
 ) -> anyhow::Result<Option<ApprovalDecision>> {
-    let Some(cr) = cr_for_reviewed_subject(pool, item).await? else {
+    let Some(cr) = cr else {
         return Ok(None);
     };
     if cr.factory_state != "approved" {
@@ -320,38 +333,46 @@ async fn load_approval_decision(
         return Ok(None);
     };
 
-    // Can't-weaken-own-checks guard: read the CR's files. If any touches a configured
-    // gating path, the change alters the very checks that gate it → never mark ready.
-    // The gating prefixes are repo-configurable (`settings.gating_paths`, default
+    // D3: the two GitHub reads needed for the decision are independent — the CR view
+    // (for the can't-weaken-gating guard) and the check rollup (for the green gate) — so
+    // fetch them CONCURRENTLY rather than serially, halving the GitHub round-trip latency
+    // on the hot approval path. `try_join!` short-circuits on the first error.
+    let (view, checks) = tokio::try_join!(
+        gh.read_change_request(repo, number as i64),
+        gh.check_status(repo, CheckRef::ChangeRequest(number as i64)),
+    )?;
+
+    // Can't-weaken-own-checks guard: if any changed file touches a configured gating
+    // path, the change alters the very checks that gate it → never mark ready. The
+    // gating prefixes are repo-configurable (`settings.gating_paths`, default
     // `[".github/workflows/"]`) so a repo's checks defined elsewhere are guarded too.
-    let view = gh.read_change_request(repo, number as i64).await?;
+    // This guard takes precedence over the green check regardless of check status.
     if view
         .files
         .iter()
         .any(|f| is_gating_path(f, &config.settings.gating_paths))
     {
         tracing::warn!(work_item = %item.id, cr_number = number, "CR alters its own gating checks; will escalate conflict");
-        return Ok(Some(ApprovalDecision::WeakensGating { cr, number }));
+        return Ok(Some(ApprovalDecision::WeakensGating { cr }));
     }
 
     // Checks must be green to hand to a human. Pending/Failure → leave approved.
-    let checks = gh
-        .check_status(repo, CheckRef::ChangeRequest(number as i64))
-        .await?;
     if is_green(checks.overall) {
-        Ok(Some(ApprovalDecision::Ready { cr, number }))
+        Ok(Some(ApprovalDecision::Ready { cr }))
     } else {
         tracing::info!(work_item = %item.id, cr_number = number, overall = checks.overall.as_str(), "approved CR checks not green; leaving CR approved this tick");
         Ok(None)
     }
 }
 
-/// What a Succeeded reviewer's approval resolves to (computed pre-claim).
+/// What a Succeeded reviewer's approval resolves to (computed pre-claim). Each
+/// variant carries the [`ChangeRequest`] it was computed from; the GitHub number is
+/// `cr.number` (no separate copy).
 enum ApprovalDecision {
     /// Checks green, no gating-path changes: mark ready + hand to a human.
-    Ready { cr: ChangeRequest, number: i32 },
+    Ready { cr: ChangeRequest },
     /// The CR weakens its own gating checks: escalate a conflict, never mark ready.
-    WeakensGating { cr: ChangeRequest, number: i32 },
+    WeakensGating { cr: ChangeRequest },
 }
 
 /// Manager succeeded → assign a coder for the issue and mark the issue in_progress.
@@ -385,20 +406,19 @@ async fn decide_manager_succeeded(
     Ok(PostCommit::None)
 }
 
-/// Coder succeeded → it opened a CR; wake a reviewer for that CR.
+/// Coder succeeded → it opened a CR; wake a reviewer for that CR. The CR was loaded
+/// ONCE before the tx (C4) and handed in; no `&Pool` read happens inside the tx.
 async fn decide_coder_succeeded(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    pool: &record::Pool,
     item: &WorkItem,
     config: &Config,
+    cr: Option<ChangeRequest>,
 ) -> anyhow::Result<PostCommit> {
     let Some(reviewer) = worker_with_role(config, Role::Reviewer) else {
         tracing::warn!(work_item = %item.id, "no reviewer worker in config; cannot request review");
         return Ok(PostCommit::None);
     };
-    // Read the CR row for this coder item. A read against the pool is fine — the CR
-    // was committed by the worker before the item went terminal.
-    let Some(cr) = record::change_request_for_item(pool, item.id).await? else {
+    let Some(cr) = cr else {
         tracing::info!(work_item = %item.id, "coder succeeded but no CR row yet; nothing to review");
         return Ok(PostCommit::None);
     };
@@ -421,23 +441,25 @@ async fn decide_coder_succeeded(
     Ok(PostCommit::None)
 }
 
-/// Reviewer succeeded → drive the CR forward by its factory_state.
+/// Reviewer succeeded → drive the CR forward by its factory_state. The CR was loaded
+/// ONCE before the tx (C4) and handed in; no `&Pool` read happens inside the tx.
 async fn decide_reviewer_succeeded(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    pool: &record::Pool,
     item: &WorkItem,
     config: &Config,
     approval: Option<ApprovalDecision>,
+    cr: Option<ChangeRequest>,
 ) -> anyhow::Result<PostCommit> {
-    // The approved path was pre-computed (it needed GitHub reads); apply it.
+    // The approved path was pre-computed (it needed GitHub reads); apply it. The
+    // approval carries its own CR; the conditional ready transition inside
+    // `apply_approval` re-checks the CR state in-tx (C3), so a stale pre-loaded
+    // factory_state can't cause a wrong handoff.
     if let Some(decision) = approval {
         return apply_approval(tx, item, decision).await;
     }
 
-    // Otherwise re-read the CR's factory_state to handle changes_requested. (The
-    // approved case already returned above; a non-approved read here is cheap.) The
-    // read is against the pool, not the tx, which is fine — it is a plain read.
-    let Some(cr) = cr_for_reviewed_subject(pool, item).await? else {
+    // Otherwise handle changes_requested from the pre-loaded CR (no re-read).
+    let Some(cr) = cr else {
         tracing::info!(work_item = %item.id, "reviewer succeeded but no CR found; no-op");
         return Ok(PostCommit::None);
     };
@@ -460,7 +482,7 @@ async fn apply_approval(
     decision: ApprovalDecision,
 ) -> anyhow::Result<PostCommit> {
     match decision {
-        ApprovalDecision::WeakensGating { cr, number } => {
+        ApprovalDecision::WeakensGating { cr } => {
             // NEVER mark ready. Escalate a conflict and hand to a human.
             let (comment_target, assign_issue) = escalation_target(item, Some(&cr));
             let post = escalate(
@@ -474,11 +496,24 @@ async fn apply_approval(
                 },
             )
             .await?;
-            tracing::info!(work_item = %item.id, cr_number = number, "reviewer approved but CR weakens gating checks; escalated conflict");
+            tracing::info!(work_item = %item.id, cr_number = ?cr.number, "reviewer approved but CR weakens gating checks; escalated conflict");
             Ok(post)
         }
-        ApprovalDecision::Ready { cr, number } => {
-            record::set_change_request_state(&mut **tx, cr.id, "ready").await?;
+        ApprovalDecision::Ready { cr } => {
+            // C3 exactly-once + not-stale: the conditional transition is BOTH the
+            // in-tx re-check and the idempotency guard. The approval's factory_state
+            // was read BEFORE the tx; by the time we hold the issue lock the CR may
+            // have been superseded (driven back to changes_requested/closed by a later
+            // reviewer) or already handed off by a racing react. The
+            // `approved → ready` conditional UPDATE succeeds for EXACTLY ONE caller
+            // that finds the CR still `approved`; if it returns false the CR is no
+            // longer approved, so we skip the handoff entirely (no comment, no assign).
+            let did_transition =
+                record::set_change_request_state_if(&mut **tx, cr.id, "approved", "ready").await?;
+            if !did_transition {
+                tracing::info!(work_item = %item.id, cr = %cr.id, cr_number = ?cr.number, "approved→ready handoff skipped: CR no longer approved (superseded or already handed off)");
+                return Ok(PostCommit::None);
+            }
             // This is the ready-for-human-MERGE handoff, NOT issue closure. The CR is
             // marked `ready`; the linked issue stays OPEN (`in_progress`) awaiting the
             // human's merge. The issue is closed only when the human merges the CR,
@@ -492,10 +527,29 @@ async fn apply_approval(
                 }
                 None => None,
             };
-            tracing::info!(work_item = %item.id, cr_number = number, "reviewer approved: CR marked ready for human merge; issue left in_progress");
+            // A ready CR with no number can't have a handoff comment posted; the
+            // transition still happened, so carry it but with no comment target. (An
+            // approved CR normally has a number — `load_approval_decision` returns
+            // `None` otherwise — so this is defensive.)
+            let cr_number = match cr.number {
+                Some(n) => n as i64,
+                None => {
+                    tracing::warn!(work_item = %item.id, cr = %cr.id, "approved→ready CR has no number; transition recorded but no handoff comment");
+                    return Ok(PostCommit::None);
+                }
+            };
+            // D2: compose the human-facing handoff copy HERE (the decision layer), not in
+            // the transport layer. `run_post_commit` only delivers this body.
+            let body = format!(
+                "Factory: change request #{cr_number} is approved and all checks are green. \
+                 Ready for a human to merge; the linked issue is closed once you merge."
+            );
+            tracing::info!(work_item = %item.id, cr_number, "reviewer approved: CR marked ready for human merge; issue left in_progress");
             Ok(PostCommit::ReadyHandoff {
-                cr_number: number as i64,
+                body,
+                comment_target: CommentTarget::ChangeRequest(cr_number),
                 assign_issue,
+                did_transition,
             })
         }
     }
@@ -509,10 +563,11 @@ async fn decide_changes_requested(
     config: &Config,
     cr: &ChangeRequest,
 ) -> anyhow::Result<PostCommit> {
+    let loop_cap = i64::from(config.settings.loop_cap);
     let count = record::increment_cr_loop_count(&mut **tx, cr.id).await?;
-    tracing::info!(work_item = %item.id, cr = %cr.id, loop_count = count, "changes requested: incremented loop count");
+    tracing::info!(work_item = %item.id, cr = %cr.id, loop_count = count, cap = loop_cap, "changes requested: incremented loop count");
 
-    if count >= LOOP_CAP {
+    if i64::from(count) >= loop_cap {
         // The rework loop is stuck. Escalate exactly once and block the issue.
         let (comment_target, assign_issue) = escalation_target(item, Some(cr));
         let post = escalate(
@@ -523,7 +578,7 @@ async fn decide_changes_requested(
                 assign_issue,
                 reason: "loop_cap",
                 context: format!(
-                    "review-rework loop reached the cap ({LOOP_CAP}) without converging"
+                    "review-rework loop reached the cap ({loop_cap}) without converging"
                 ),
             },
         )
@@ -540,9 +595,25 @@ async fn decide_changes_requested(
         tracing::warn!(work_item = %item.id, "no coder worker in config; cannot rework");
         return Ok(PostCommit::None);
     };
+    // C2: with no linked issue there is nothing to rework against — re-dispatching a
+    // coder is impossible and silently returning would STRAND the CR (no coder, no
+    // escalation, stuck forever). Escalate to a human instead. We do NOT count this
+    // dead-end against the loop cap beyond the increment already applied above.
     let Some(issue) = cr.linked_issue else {
-        tracing::warn!(work_item = %item.id, cr = %cr.id, "CR has no linked issue; cannot rework");
-        return Ok(PostCommit::None);
+        let (comment_target, assign_issue) = escalation_target(item, Some(cr));
+        let post = escalate(
+            tx,
+            item,
+            Escalation {
+                comment_target,
+                assign_issue,
+                reason: "needs_decision",
+                context: "changes requested but CR has no linked issue to rework".to_owned(),
+            },
+        )
+        .await?;
+        tracing::warn!(work_item = %item.id, cr = %cr.id, "changes requested but CR has no linked issue; escalated instead of stranding");
+        return Ok(post);
     };
     let subject = Subject::Issue(issue as i64).as_ref_string();
     enqueue_next(&mut **tx, item, Kind::Coder, coder, &subject, "manager").await?;
@@ -550,21 +621,39 @@ async fn decide_changes_requested(
     Ok(PostCommit::None)
 }
 
-/// Any kind Failed with attempts exhausted → escalate retries_exhausted.
+/// A Failed item: retry it (re-queue for a fresh attempt) while under the retry cap,
+/// otherwise escalate `retries_exhausted`.
+///
+/// C1: `record_outcome("failed")` sets state=Failed WITHOUT bumping `attempt_count`
+/// (only lease-expiry reclaim bumps it), so an explicitly-failed worker that is never
+/// retried would otherwise be silently dropped — never retried (reclaim only handles
+/// leased/running), never escalated (below the cap). The fix gives the coordinator the
+/// retry model: under the cap it re-queues the SAME work item (back to `queued`,
+/// `available_at = now()`, `attempt_count + 1`, lease cleared, AND `reacted = false`
+/// so a subsequent failure of this same row is reacted to again — see
+/// [`record::requeue_for_retry`]) so the dispatcher re-runs it; at the cap it escalates.
+///
+/// D1: the cap is the repo's configured `settings.retry_cap` (default 3), not a
+/// platform constant — consistent with `settings.gating_paths`.
 async fn decide_failed(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    pool: &record::Pool,
     item: &WorkItem,
+    config: &Config,
+    cr: Option<ChangeRequest>,
 ) -> anyhow::Result<PostCommit> {
-    if item.attempt_count < RETRY_CAP {
-        tracing::info!(work_item = %item.id, attempt_count = item.attempt_count, cap = RETRY_CAP, "failed item under retry cap; no escalation");
+    let retry_cap = i64::from(config.settings.retry_cap);
+    if i64::from(item.attempt_count) < retry_cap {
+        // Re-queue for a fresh attempt rather than dropping the failed worker. The
+        // requeue resets `reacted` so the NEXT failure of this row is reacted to again.
+        record::requeue_for_retry(&mut **tx, item.id).await?;
+        tracing::info!(work_item = %item.id, attempt_count = item.attempt_count, next_attempt = item.attempt_count + 1, cap = retry_cap, "failed item under retry cap; re-queued for retry");
         return Ok(PostCommit::None);
     }
-    // When the failed item's subject is a CR (e.g. a failed reviewer, or any cr#N work
-    // item), the CR's own subject carries no issue to assign. Resolve the CR's linked
-    // issue so the escalation assigns a human, not just comments. A failed item with an
-    // `issue#N` subject (e.g. a coder) resolves its issue directly from the subject.
-    let cr = cr_for_failed_item(pool, item).await?;
+    // At/over the cap: escalate. When the failed item's subject is a CR (e.g. a failed
+    // reviewer, or any cr#N work item), the CR's own subject carries no issue to
+    // assign. The pre-loaded CR (C4) resolves the linked issue so the escalation
+    // assigns a human, not just comments. A failed item with an `issue#N` subject
+    // (e.g. a coder) resolves its issue directly from the subject.
     let (comment_target, assign_issue) = escalation_target(item, cr.as_ref());
     let post = escalate(
         tx,
@@ -606,16 +695,26 @@ async fn escalate(
     item: &WorkItem,
     esc: Escalation,
 ) -> anyhow::Result<PostCommit> {
-    let (escalation_id, created) =
-        record::create_escalation_idempotent(tx, item.id, esc.reason, &esc.context, Some("github"))
-            .await?;
+    let (escalation_id, created) = record::create_escalation_idempotent(
+        &mut **tx,
+        item.id,
+        esc.reason,
+        &esc.context,
+        Some("github"),
+    )
+    .await?;
+    // D2: compose the human-facing escalation copy HERE (the decision layer). The
+    // transport layer (`run_post_commit`) only delivers this prebuilt body, and never
+    // re-derives it — so the `escalation_id`/`context` need not be carried out of the tx
+    // (the id is logged at creation right here; `created` flags the deliver-once guard).
+    tracing::info!(work_item = %item.id, reason = esc.reason, %escalation_id, created, "escalation recorded; body composed for delivery");
+    let body = format!("Factory escalation ({}): {}", esc.reason, esc.context);
     Ok(PostCommit::Escalation {
-        created,
-        escalation_id,
+        body,
         comment_target: esc.comment_target,
         assign_issue: esc.assign_issue,
+        created,
         reason: esc.reason,
-        context: esc.context,
     })
 }
 
@@ -648,28 +747,39 @@ async fn enqueue_next(
     Ok(())
 }
 
-/// The per-issue advisory-lock key for an item: the issue number this react serializes
-/// on. A `manager`/`coder` item's subject is `issue#N` (use N directly); a `reviewer`
-/// item's subject is `cr#N`, so resolve N via the CR's linked issue. When neither can
-/// be derived, fall back to a stable key from the work-item id (its low 62 bits) so
-/// two replicas racing on the SAME item still serialize on the lock. The key only
-/// needs to be stable per logical issue, not equal to the GitHub issue number.
-async fn issue_lock_key(pool: &record::Pool, item: &WorkItem) -> anyhow::Result<i64> {
+/// The per-issue advisory-lock key for an item: the logical issue this react
+/// serializes on. A `manager`/`coder` item's subject is `issue#N` (use N directly); a
+/// `reviewer` (or any `cr#N`) item resolves N via the pre-loaded CR's linked issue
+/// (C4: the CR is loaded once before the tx and threaded in here — no `&Pool` read).
+///
+/// C5: when no issue can be derived (unparseable subject, or a `cr#N` whose CR is
+/// untracked or has no linked issue) the fallback is a REPO-LEVEL key (a stable hash
+/// of the repo id), NOT a per-work-item key. A per-item fallback split the namespace
+/// so two same-issue items locked on different keys and did not serialize; the
+/// repo-level fallback is coarser but always serializes items for the same repo. The
+/// key is namespaced by `repo_id` in [`record::issue_advisory_lock`] anyway, so a
+/// repo-level fallback can never collide with another repo's keys.
+fn issue_lock_key(item: &WorkItem, cr: Option<&ChangeRequest>) -> i64 {
     if let Ok(subject) = item.subject_ref.parse::<Subject>() {
         match subject {
-            Subject::Issue(n) => return Ok(n),
+            Subject::Issue(n) => return n,
             Subject::ChangeRequest(_) => {
-                if let Some(cr) = cr_for_reviewed_subject(pool, item).await? {
-                    if let Some(issue) = cr.linked_issue {
-                        return Ok(issue as i64);
-                    }
+                if let Some(issue) = cr.and_then(|c| c.linked_issue) {
+                    return issue as i64;
                 }
             }
         }
     }
-    // Fall back to a stable per-item key (low 62 bits of the uuid) so two replicas
-    // racing on the same item still serialize, even when no issue can be derived.
-    Ok((item.id.as_u128() as i64) & 0x3fff_ffff_ffff_ffff)
+    // Repo-level fallback: a stable non-negative key derived from the repo id alone,
+    // so all of a repo's un-derivable items serialize on one key (coarse but correct)
+    // rather than each splitting onto its own per-item key.
+    repo_level_lock_key(item.repo_id)
+}
+
+/// A stable non-negative repo-level advisory-lock key (low 62 bits of the repo uuid).
+/// Used as the coarse fallback when an item's logical issue can't be derived (C5).
+fn repo_level_lock_key(repo_id: Uuid) -> i64 {
+    (repo_id.as_u128() as i64) & 0x3fff_ffff_ffff_ffff
 }
 
 /// Load a repo's identity and its parsed config. `None` when the repo is gone or
@@ -703,32 +813,29 @@ fn worker_with_role(config: &Config, role: Role) -> Option<&str> {
         .map(|w| w.name.as_str())
 }
 
-/// The CR a failed item is about, when its subject is `cr#N` (e.g. a failed reviewer
-/// or any CR-subject work item); `None` for a non-CR subject (e.g. an `issue#N` coder),
-/// which is normal here and not a warning. Lets the escalation assign the CR's linked
-/// issue to a human rather than commenting with nobody assigned (F7).
-async fn cr_for_failed_item(
+/// Load the CR an item is about, ONCE, BEFORE the react tx (C4), so no decision path
+/// re-reads the pool while the tx holds a connection + the per-issue lock (a pool
+/// starvation/deadlock risk under load) and the same CR is never read 2–3× per react.
+///
+/// Resolution depends on the item: a coder's CR is keyed by its own `work_item_id`
+/// (the coder opened it); a reviewer's / any `cr#N`-subject item's CR is keyed by the
+/// `cr#N` in its subject. Any other shape (e.g. an `issue#N` coder/manager, or an
+/// unparseable subject) has no CR and resolves to `None` — normal, not a warning.
+async fn load_cr_for_item(
     pool: &record::Pool,
     item: &WorkItem,
 ) -> anyhow::Result<Option<ChangeRequest>> {
+    // A succeeded coder's CR is the one it opened, keyed by work_item_id.
+    if item.kind == Kind::Coder && item.state == State::Succeeded {
+        return Ok(record::change_request_for_item(pool, item.id).await?);
+    }
+    // Otherwise the CR (if any) is the `cr#N` the item's subject names.
     match item.subject_ref.parse::<Subject>() {
         Ok(Subject::ChangeRequest(n)) => {
             Ok(record::change_request_by_number(pool, item.repo_id, n as i32).await?)
         }
         _ => Ok(None),
     }
-}
-
-/// Find the CR the reviewer reviewed: its subject is `cr#N`.
-async fn cr_for_reviewed_subject(
-    pool: &record::Pool,
-    item: &WorkItem,
-) -> anyhow::Result<Option<ChangeRequest>> {
-    let Ok(Subject::ChangeRequest(n)) = parse_subject(&item.subject_ref) else {
-        tracing::warn!(work_item = %item.id, subject = %item.subject_ref, "reviewer subject is not a cr#N");
-        return Ok(None);
-    };
-    Ok(record::change_request_by_number(pool, item.repo_id, n as i32).await?)
 }
 
 /// Narrow a subject's i64 issue number to the i32 the issues table stores,
@@ -929,7 +1036,11 @@ mod tests {
 
     #[test]
     fn caps_are_platform_defaults() {
-        assert_eq!(RETRY_CAP, 3);
-        assert_eq!(LOOP_CAP, 5);
+        // D1: the retry/loop caps are now per-repo config (`settings.retry_cap` /
+        // `settings.loop_cap`) rather than coordinator consts. A config that omits them
+        // falls back to the platform defaults (3 / 5), so the coordinator reads those.
+        let cfg = factory_config::parse("version: 1\n").expect("minimal config parses");
+        assert_eq!(cfg.settings.retry_cap, 3);
+        assert_eq!(cfg.settings.loop_cap, 5);
     }
 }

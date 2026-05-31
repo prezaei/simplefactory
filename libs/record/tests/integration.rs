@@ -679,3 +679,162 @@ async fn record_scheduled_fire_fires_each_distinct_slot() {
     ));
     assert_eq!(record::count_for_repo(&pool, repo).await.unwrap(), 2);
 }
+
+#[tokio::test]
+async fn create_escalation_idempotent_reports_created_then_conflict() {
+    // The `created` bool distinguishes the first insert from a later conflict-update:
+    // first call → created=true; a second call for the same (work_item, reason) →
+    // created=false (same row id), so the coordinator runs the human-facing side
+    // effects exactly once.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("escalate-idem"), 1)
+        .await
+        .unwrap();
+    let EnqueueOutcome::Inserted(work_item_id) =
+        record::enqueue(&pool, &coder_item(repo, "issue#1"))
+            .await
+            .unwrap()
+    else {
+        panic!("fresh insert");
+    };
+
+    let mut conn = pool.acquire().await.unwrap();
+    let (id1, created1) = record::create_escalation_idempotent(
+        &mut *conn,
+        work_item_id,
+        "retries_exhausted",
+        "first context",
+        Some("github"),
+    )
+    .await
+    .unwrap();
+    assert!(created1, "the first escalation is newly created");
+
+    let (id2, created2) = record::create_escalation_idempotent(
+        &mut *conn,
+        work_item_id,
+        "retries_exhausted",
+        "second context",
+        Some("github"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !created2,
+        "a second call for the same (item, reason) is a conflict, not created"
+    );
+    assert_eq!(
+        id1, id2,
+        "the conflict path returns the same escalation row id"
+    );
+
+    // Still exactly one row on the book.
+    assert_eq!(
+        record::count_escalations_for_item(&pool, work_item_id)
+            .await
+            .unwrap(),
+        1,
+        "exactly one escalation row for the item",
+    );
+}
+
+#[tokio::test]
+async fn set_change_request_state_if_is_a_conditional_guard() {
+    // The conditional transition succeeds only from the expected `from` state. This
+    // is the approve→ready exactly-once guard: a second attempt from `approved` no
+    // longer matches (state is now `ready`) and returns false.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("cr-cond"), 1)
+        .await
+        .unwrap();
+    let EnqueueOutcome::Inserted(work_item_id) =
+        record::enqueue(&pool, &coder_item(repo, "issue#1"))
+            .await
+            .unwrap()
+    else {
+        panic!("fresh insert");
+    };
+    let cr = record::upsert_change_request_for_item(
+        &pool,
+        repo,
+        work_item_id,
+        "factory/issue-1",
+        Some(1),
+    )
+    .await
+    .unwrap();
+    record::set_change_request_state(&pool, cr.id, "approved")
+        .await
+        .unwrap();
+
+    // approved → ready transitions exactly once.
+    assert!(
+        record::set_change_request_state_if(&pool, cr.id, "approved", "ready")
+            .await
+            .unwrap(),
+        "first approved→ready transition succeeds",
+    );
+    // A second attempt from `approved` no longer matches (state is `ready`).
+    assert!(
+        !record::set_change_request_state_if(&pool, cr.id, "approved", "ready")
+            .await
+            .unwrap(),
+        "a stale approved→ready attempt is a no-op",
+    );
+    // The CR has no GitHub number (it was created via upsert_change_request_for_item,
+    // which leaves number NULL), so read its final state back by id.
+    let final_state: String =
+        sqlx::query_scalar("SELECT factory_state FROM change_requests WHERE id = $1")
+            .bind(cr.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(final_state, "ready");
+}
+
+#[tokio::test]
+async fn requeue_for_retry_resets_state_attempts_and_reacted() {
+    // A terminal, reacted, failed item is requeued for a fresh attempt: back to
+    // queued, attempt_count bumped, lease cleared, and reacted reset so a later
+    // failure is reacted to again.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("requeue-retry"), 1)
+        .await
+        .unwrap();
+    let EnqueueOutcome::Inserted(id) = record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap()
+    else {
+        panic!("fresh insert");
+    };
+    // Drive it to failed with attempt_count=1 and reacted=true (a reacted terminal).
+    sqlx::query(
+        "UPDATE work_items SET state = 'failed', attempt_count = 1, reacted = true WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    record::requeue_for_retry(&pool, id).await.unwrap();
+
+    let item = record::work_item_by_id(&pool, id).await.unwrap().unwrap();
+    assert_eq!(item.state, State::Queued, "requeued back to queued");
+    assert_eq!(item.attempt_count, 2, "attempt_count bumped");
+    assert!(item.lease_owner.is_none(), "lease cleared");
+    let reacted: bool = sqlx::query_scalar("SELECT reacted FROM work_items WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !reacted,
+        "reacted reset so a later terminal occurrence is reacted again"
+    );
+}

@@ -44,6 +44,17 @@ pub struct Settings {
     /// deserializes (back-compat for already-connected repos).
     #[serde(default = "default_gating_paths")]
     pub gating_paths: Vec<String>,
+    /// Retry ceiling: a Failed work item with this many attempts (or more) escalates
+    /// `retries_exhausted` instead of being re-queued for another attempt. Per-repo
+    /// (consistent with `gating_paths`); defaults to 3. `serde(default)` for back-compat
+    /// with config jsonb stored before this field existed.
+    #[serde(default = "default_retry_cap")]
+    pub retry_cap: u32,
+    /// Review-rework ceiling: at this many changes-requested cycles the loop escalates
+    /// `loop_cap` instead of dispatching yet another coder. Per-repo; defaults to 5.
+    /// `serde(default)` for back-compat with older stored config jsonb.
+    #[serde(default = "default_loop_cap")]
+    pub loop_cap: u32,
 }
 
 /// Global capacity limits.
@@ -98,6 +109,10 @@ pub enum ConfigError {
     UnsupportedVersion(u32),
     #[error("limits.max_concurrent_workers must be greater than 0")]
     NonPositiveGlobalCap,
+    #[error("settings.retry_cap must be greater than 0")]
+    NonPositiveRetryCap,
+    #[error("settings.loop_cap must be greater than 0")]
+    NonPositiveLoopCap,
     #[error("worker '{0}': max_concurrent must be greater than 0")]
     NonPositiveWorkerCap(String),
     #[error("duplicate worker name '{0}'")]
@@ -123,6 +138,12 @@ pub fn parse(yaml: &str) -> Result<Config, ConfigError> {
     }
     if raw.limits.max_concurrent_workers == 0 {
         return Err(ConfigError::NonPositiveGlobalCap);
+    }
+    if raw.settings.retry_cap == 0 {
+        return Err(ConfigError::NonPositiveRetryCap);
+    }
+    if raw.settings.loop_cap == 0 {
+        return Err(ConfigError::NonPositiveLoopCap);
     }
 
     let mut seen = HashSet::new();
@@ -186,6 +207,8 @@ pub fn parse(yaml: &str) -> Result<Config, ConfigError> {
             default_model: raw.settings.default_model,
             instructions: raw.settings.instructions,
             gating_paths: raw.settings.gating_paths,
+            retry_cap: raw.settings.retry_cap,
+            loop_cap: raw.settings.loop_cap,
         },
         limits: Limits {
             max_concurrent_workers: raw.limits.max_concurrent_workers,
@@ -298,6 +321,10 @@ struct RawSettings {
     instructions: Option<String>,
     #[serde(default = "default_gating_paths")]
     gating_paths: Vec<String>,
+    #[serde(default = "default_retry_cap")]
+    retry_cap: u32,
+    #[serde(default = "default_loop_cap")]
+    loop_cap: u32,
 }
 
 impl Default for RawSettings {
@@ -307,6 +334,8 @@ impl Default for RawSettings {
             default_model: None,
             instructions: None,
             gating_paths: default_gating_paths(),
+            retry_cap: default_retry_cap(),
+            loop_cap: default_loop_cap(),
         }
     }
 }
@@ -370,6 +399,18 @@ fn default_gating_paths() -> Vec<String> {
     vec![".github/workflows/".to_owned()]
 }
 
+/// The platform-default retry ceiling (`settings.retry_cap`): a Failed work item with
+/// this many attempts (or more) escalates rather than being re-queued.
+fn default_retry_cap() -> u32 {
+    3
+}
+
+/// The platform-default review-rework ceiling (`settings.loop_cap`): at this many
+/// changes-requested cycles the loop escalates instead of dispatching another coder.
+fn default_loop_cap() -> u32 {
+    5
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +472,29 @@ workers:
             cfg.settings.gating_paths,
             vec![".github/workflows/".to_owned()]
         );
+        // The retry/loop caps default when omitted (the platform defaults).
+        assert_eq!(cfg.settings.retry_cap, 3);
+        assert_eq!(cfg.settings.loop_cap, 5);
+    }
+
+    #[test]
+    fn reads_custom_retry_and_loop_caps() {
+        let cfg = parse("version: 1\nsettings:\n  label: factory\n  retry_cap: 7\n  loop_cap: 9\n")
+            .expect("config with custom caps should parse");
+        assert_eq!(cfg.settings.retry_cap, 7, "a custom retry_cap is read");
+        assert_eq!(cfg.settings.loop_cap, 9, "a custom loop_cap is read");
+    }
+
+    #[test]
+    fn rejects_zero_retry_cap() {
+        let err = parse("version: 1\nsettings:\n  label: factory\n  retry_cap: 0\n");
+        assert!(matches!(err, Err(ConfigError::NonPositiveRetryCap)));
+    }
+
+    #[test]
+    fn rejects_zero_loop_cap() {
+        let err = parse("version: 1\nsettings:\n  label: factory\n  loop_cap: 0\n");
+        assert!(matches!(err, Err(ConfigError::NonPositiveLoopCap)));
     }
 
     #[test]
@@ -557,6 +621,9 @@ workers:
             cfg.settings.gating_paths,
             vec![".github/workflows/".to_owned()]
         );
+        // The retry/loop caps also default for jsonb stored before they existed.
+        assert_eq!(cfg.settings.retry_cap, 3);
+        assert_eq!(cfg.settings.loop_cap, 5);
     }
 
     #[test]

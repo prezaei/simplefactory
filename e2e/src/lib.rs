@@ -551,6 +551,7 @@ mod acceptance {
     use factory_coordinator::coordinator_tick;
     use factory_github::{CheckConclusion, CheckSummary, FakeGitHub};
     use factory_tools::ToolsState;
+    use sqlx::Row;
 
     /// `coordinator_tick` scans the WHOLE record book (it is a global service), so in
     /// a shared test DB the P4 tests — which assert exact per-tick react counts and
@@ -1221,6 +1222,161 @@ mod acceptance {
         );
     }
 
+    /// C1: an explicitly-Failed item UNDER the retry cap is RE-QUEUED for a fresh
+    /// attempt (state `queued`, `attempt_count + 1`, `reacted = false`), NOT escalated
+    /// and NOT silently dropped. Then, at the cap, the same kind of failure escalates
+    /// exactly once. (Default `retry_cap` = 3: attempt_count 1 → requeue to 2; a fresh
+    /// failed row at attempt_count 3 → escalate.)
+    #[tokio::test]
+    async fn failed_item_under_cap_is_requeued_then_escalated_at_cap() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (_manager, coder, _reviewer), gh, _state) =
+            p4_fixture(&pool, "e2e-p4-retry").await;
+
+        // (A) A failed coder on issue#1 at attempt_count 1 (< cap 3): re-queued, not
+        // escalated. `reacted` must reset to false so a SUBSEQUENT failure of this same
+        // row is reacted to again.
+        let failed = enqueue_item(&pool, repo, record::Kind::Coder, coder, "issue#1").await;
+        force_failed(&pool, failed, 1).await;
+
+        assert_eq!(
+            coordinator_tick(&pool, gh.as_ref()).await.unwrap(),
+            1,
+            "the failed item is reacted exactly once"
+        );
+
+        let (state, attempts, reacted) = item_state_attempts_reacted(&pool, failed).await;
+        assert_eq!(state, "queued", "a failed item under the cap is re-queued");
+        assert_eq!(attempts, 2, "attempt_count is bumped on re-queue (1 → 2)");
+        assert!(
+            !reacted,
+            "reacted is reset so the next failure of this row is reacted to again"
+        );
+        assert_eq!(
+            record::count_escalations_for_item(&pool, failed)
+                .await
+                .unwrap(),
+            0,
+            "an under-cap retry never escalates"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            0,
+            "no escalation comment for an under-cap retry"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            0,
+            "no assignment for an under-cap retry"
+        );
+
+        // (B) A fresh failed coder on issue#2 AT the cap (attempt_count 3): escalates
+        // exactly once with one comment + one assignment, and is NOT re-queued.
+        let exhausted = enqueue_item(&pool, repo, record::Kind::Coder, coder, "issue#2").await;
+        force_failed(&pool, exhausted, 3).await;
+
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        let (state2, _attempts2, _reacted2) = item_state_attempts_reacted(&pool, exhausted).await;
+        assert_eq!(
+            state2, "failed",
+            "an at-cap item is escalated, not re-queued"
+        );
+        let retries: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'retries_exhausted' AND work_item_id = $1",
+        )
+        .bind(exhausted)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retries, 1,
+            "exactly one retries_exhausted escalation at the cap"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment (only the at-cap item)"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one escalation assignment (only the at-cap item)"
+        );
+    }
+
+    /// C2: a reviewer-requested-changes CR that is BELOW the loop cap but has NO linked
+    /// issue cannot be reworked (there is no issue to re-dispatch a coder against).
+    /// Rather than STRANDING the CR (no coder, no escalation — stuck forever), the
+    /// coordinator escalates `needs_decision` exactly once.
+    #[tokio::test]
+    async fn changes_requested_without_linked_issue_escalates_needs_decision() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (_manager, coder, reviewer), gh, _state) =
+            p4_fixture(&pool, "e2e-p4-nolink").await;
+
+        // A CR with NO linked issue, in `changes_requested`, below the loop cap. Build it
+        // directly: a coder item opens the CR row (linked_issue = None), give it a number,
+        // and set its factory_state to changes_requested.
+        let coder_item = enqueue_item(&pool, repo, record::Kind::Coder, coder, "issue#7").await;
+        let cr = record::upsert_change_request_for_item(
+            &pool,
+            repo,
+            coder_item,
+            "factory/unlinked",
+            None, // no linked issue — the C2 condition
+        )
+        .await
+        .unwrap();
+        record::set_change_request_number(&pool, cr.id, 42)
+            .await
+            .unwrap();
+        record::set_change_request_state(&pool, cr.id, "changes_requested")
+            .await
+            .unwrap();
+
+        // A succeeded reviewer item whose subject is that CR.
+        let reviewer_id =
+            enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, "cr#42").await;
+        mark_succeeded(&pool, reviewer_id).await;
+
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        // Exactly one needs_decision escalation against the reviewer item; the CR is NOT
+        // reworked (no coder enqueued) and NOT left stranded.
+        let needs: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'needs_decision' AND work_item_id = $1",
+        )
+        .bind(reviewer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(needs, 1, "exactly one needs_decision escalation");
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment (delivered to the CR)"
+        );
+        // No coder rework was dispatched (there was no issue to rework against).
+        let coders: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM work_items
+              WHERE repo_id = $1 AND kind = 'coder' AND state IN ('queued', 'leased', 'running', 'blocked')
+                AND id <> $2",
+        )
+        .bind(repo)
+        .bind(coder_item)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(coders, 0, "no rework coder is enqueued for an unlinked CR");
+    }
+
     /// F5: an already-`escalated` terminal item is a pure no-op react — the coordinator
     /// marks it reacted but creates NO new escalation and enqueues NO new work.
     #[tokio::test]
@@ -1359,6 +1515,21 @@ mod acceptance {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    /// A work item's `(state, attempt_count, reacted)` — used by the retry test to
+    /// assert the requeue resets state/attempts/reacted (C1).
+    async fn item_state_attempts_reacted(pool: &record::Pool, id: Uuid) -> (String, i32, bool) {
+        let row = sqlx::query("SELECT state, attempt_count, reacted FROM work_items WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        (
+            row.get("state"),
+            row.get("attempt_count"),
+            row.get("reacted"),
+        )
     }
 
     /// Force a work item to a Failed terminal state with `attempt_count` so the

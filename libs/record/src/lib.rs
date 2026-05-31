@@ -1237,17 +1237,6 @@ pub async fn mark_reacted(executor: impl sqlx::PgExecutor<'_>, work_item_id: Uui
     Ok(row.is_some())
 }
 
-/// Whether a work item has already been reacted to. Executor-generic for an in-tx
-/// re-check; `mark_reacted`'s `RETURNING` is the actual claim, so this is a
-/// diagnostic / convenience read.
-pub async fn is_reacted(executor: impl sqlx::PgExecutor<'_>, work_item_id: Uuid) -> Result<bool> {
-    let reacted: bool = sqlx::query_scalar("SELECT reacted FROM work_items WHERE id = $1")
-        .bind(work_item_id)
-        .fetch_one(executor)
-        .await?;
-    Ok(reacted)
-}
-
 /// Take the per-issue serialization lock for the lifetime of `tx`. Two coordinator
 /// replicas reacting to terminal items for the SAME issue serialize here, so the
 /// per-issue decision (enqueue next / set issue+CR state / escalate) is applied by
@@ -1308,6 +1297,58 @@ pub async fn set_change_request_state(
     Ok(())
 }
 
+/// Conditionally transition a CR's factory state ONLY when it is currently `from`,
+/// returning whether the transition happened. This is the exactly-once idempotency
+/// guard for the approve→ready handoff: the `WHERE factory_state = from` makes the
+/// UPDATE succeed for exactly one caller even if two reacts (or a stale reviewer
+/// race) try to advance the same CR. Executor-generic (see [`mark_reacted`]) so it
+/// runs inside the coordinator's per-react transaction.
+pub async fn set_change_request_state_if(
+    executor: impl sqlx::PgExecutor<'_>,
+    cr_id: Uuid,
+    from: &str,
+    to: &str,
+) -> Result<bool> {
+    let row = sqlx::query(
+        "UPDATE change_requests SET factory_state = $3, updated_at = now()
+          WHERE id = $1 AND factory_state = $2
+         RETURNING id",
+    )
+    .bind(cr_id)
+    .bind(from)
+    .bind(to)
+    .fetch_optional(executor)
+    .await?;
+    let did_transition = row.is_some();
+    tracing::info!(cr = %cr_id, from, to, did_transition, "set CR state (conditional)");
+    Ok(did_transition)
+}
+
+/// Re-queue a work item for a fresh retry attempt: transition it back to `queued`,
+/// make it immediately available, bump `attempt_count`, clear any lease, and reset
+/// `reacted` so a SUBSEQUENT terminal occurrence of this same row is reacted to
+/// again (the coordinator already reacted to THIS terminal occurrence; the retry is
+/// a new active row-state). Executor-generic (see [`mark_reacted`]) so the
+/// coordinator runs it INSIDE its per-react transaction.
+pub async fn requeue_for_retry(
+    executor: impl sqlx::PgExecutor<'_>,
+    work_item_id: Uuid,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE work_items
+            SET state = 'queued', available_at = now(),
+                attempt_count = attempt_count + 1,
+                lease_owner = NULL, lease_expires_at = NULL,
+                reacted = false, updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(work_item_id)
+    .execute(executor)
+    .await?;
+    tracing::info!(work_item = %work_item_id, "requeued for retry");
+    Ok(())
+}
+
 /// Fetch a change request by its GitHub number.
 pub async fn change_request_by_number(
     pool: &Pool,
@@ -1355,49 +1396,36 @@ pub async fn cr_loop_count(pool: &Pool, cr_id: Uuid) -> Result<i32> {
 /// escalation id and whether this call created it (`true`) or it already existed
 /// (`false`) — so a re-dispatch / racing replica never double-escalates.
 ///
-/// Takes a `&mut sqlx::PgConnection` rather than an `impl PgExecutor` because it
-/// runs two statements (INSERT…RETURNING, then a fallback SELECT) and a borrowed
-/// `PgExecutor` is consumed by the first `.execute`/`.fetch`. A `&mut PgConnection`
-/// can be reborrowed for both. The coordinator runs this INSIDE its per-react
-/// transaction via `&mut *tx` (which derefs to `&mut PgConnection`); other callers
-/// pass `&mut *pool.acquire().await?`.
+/// A single `INSERT … ON CONFLICT DO UPDATE … RETURNING` does both the claim and the
+/// existing-row read: `xmax = 0` is true only for a freshly-inserted row (no prior
+/// tuple version), so `(xmax = 0) AS created` distinguishes an insert from a
+/// conflict-update without a second statement. Because it is one statement it is
+/// `impl PgExecutor` like its siblings; the coordinator runs it INSIDE its per-react
+/// transaction via `&mut **tx`.
 pub async fn create_escalation_idempotent(
-    conn: &mut sqlx::PgConnection,
+    executor: impl sqlx::PgExecutor<'_>,
     work_item_id: Uuid,
     reason: &str,
     context: &str,
     delivered_to: Option<&str>,
 ) -> Result<(Uuid, bool)> {
-    let inserted = sqlx::query(
+    let row = sqlx::query(
         "INSERT INTO escalations (id, work_item_id, reason, context, delivered_to)
          VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (work_item_id, reason) DO NOTHING
-         RETURNING id",
+         ON CONFLICT (work_item_id, reason) DO UPDATE SET context = excluded.context
+         RETURNING id, (xmax = 0) AS created",
     )
     .bind(Uuid::now_v7())
     .bind(work_item_id)
     .bind(reason)
     .bind(context)
     .bind(delivered_to)
-    .fetch_optional(&mut *conn)
+    .fetch_one(executor)
     .await?;
-    match inserted {
-        Some(r) => {
-            let id: Uuid = r.try_get("id")?;
-            tracing::info!(%work_item_id, reason, "escalation created");
-            Ok((id, true))
-        }
-        None => {
-            let id: Uuid = sqlx::query_scalar(
-                "SELECT id FROM escalations WHERE work_item_id = $1 AND reason = $2",
-            )
-            .bind(work_item_id)
-            .bind(reason)
-            .fetch_one(&mut *conn)
-            .await?;
-            Ok((id, false))
-        }
-    }
+    let id: Uuid = row.try_get("id")?;
+    let created: bool = row.try_get("created")?;
+    tracing::info!(%work_item_id, reason, created, "escalation recorded (idempotent)");
+    Ok((id, created))
 }
 
 fn map_change_request(row: sqlx::postgres::PgRow) -> Result<ChangeRequest> {
