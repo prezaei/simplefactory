@@ -63,3 +63,5 @@ factory-record = { path = "libs/record" }
 factory-github = { path = "libs/github" }
 factory-blob = { path = "libs/blob" }
 factory-intake = { path = "services/intake" }
+factory-tools = { path = "services/tools" }
+factory-dispatcher = { path = "services/dispatcher" }

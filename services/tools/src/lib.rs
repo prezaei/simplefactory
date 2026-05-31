@@ -9,6 +9,8 @@
 //! event in one place so no tool can skip its audit row.
 #![forbid(unsafe_code)]
 
+pub mod mcp;
+
 use std::sync::Arc;
 
 use factory_blob::TranscriptStore;
@@ -183,11 +185,24 @@ pub async fn get_task(state: &ToolsState, auth: &TaskAuth) -> anyhow::Result<Val
         .await?
         .ok_or_else(|| anyhow::anyhow!("work item {} not found", auth.work_item_id))?;
 
+    // Compose the worker's prompt from the repo's stored config: the built-in role
+    // default, then the repo-wide instructions, then the matching worker's.
+    let prompt = compose_prompt(state, auth, &item).await?;
+
+    // Deterministic head branch from the subject so a re-dispatch pushes the SAME
+    // branch (idempotent CR). e.g. `issue#7` -> `factory/issue-7`.
+    let head_branch = format!("factory/{}", item.subject_ref.replace('#', "-"));
+    // TODO: we don't yet track the repo's default branch; assume "main" until then.
+    let base = "main";
+
     let mut out = json!({
         "work_item_id": auth.work_item_id.to_string(),
         "role": item.kind.as_str(),
         "subject_ref": item.subject_ref,
         "correlation_id": item.correlation_id.to_string(),
+        "head_branch": head_branch,
+        "base": base,
+        "prompt": prompt,
     });
 
     match parse_subject(&item.subject_ref) {
@@ -444,12 +459,17 @@ pub async fn record_outcome(
         record::finish_attempt(&state.pool, attempt_id, attempt_status, Some(summary)).await?;
     let state_changed = record::set_state(&state.pool, auth.work_item_id, work_state).await?;
 
+    // The task has ended: revoke its tokens so the bearer can no longer act
+    // (spec: "Tokens revoked when the task ends").
+    let revoked = record::revoke_task_tokens(&state.pool, auth.work_item_id).await?;
+
     tracing::info!(
         work_item = %auth.work_item_id,
         attempt = %attempt_id,
         status,
         finished,
         state_changed,
+        revoked,
         "record_outcome"
     );
     Ok(json!({
@@ -537,6 +557,66 @@ pub async fn escalate(
 
 /// Default heartbeat lease extension (15 minutes), per the spec.
 const HEARTBEAT_TTL_SECS: f64 = 900.0;
+
+/// The built-in, role-specific base prompt. Repo-wide and per-worker instructions
+/// are layered on top of this by [`compose_prompt`].
+fn role_default_prompt(role: record::Kind) -> &'static str {
+    match role {
+        record::Kind::Manager => {
+            "You are a manager. Triage the subject, decide the work, and delegate to coders."
+        }
+        record::Kind::Coder => {
+            "You are a coder. Implement the task with tests, then open a change request."
+        }
+        record::Kind::Reviewer => {
+            "You are a reviewer. Review the change request and submit a verdict."
+        }
+        record::Kind::Tester => {
+            "You are a tester. Exercise the change and report whether the checks pass."
+        }
+    }
+}
+
+/// Compose the worker's effective prompt: role default → repo-wide
+/// (`settings.instructions`) → the matching worker's instructions. Missing config
+/// layers are skipped; the role default is always present.
+async fn compose_prompt(
+    state: &ToolsState,
+    auth: &TaskAuth,
+    item: &record::WorkItem,
+) -> anyhow::Result<String> {
+    let role_default = role_default_prompt(item.kind);
+
+    let cfg = match record::repo_config_by_id(&state.pool, auth.repo_id).await? {
+        Some(value) => match serde_json::from_value::<factory_config::Config>(value) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(work_item = %auth.work_item_id, error = %e, "get_task: stored config is not a valid Config; using role default only");
+                None
+            }
+        },
+        None => {
+            tracing::info!(work_item = %auth.work_item_id, "get_task: repo has no stored config; using role default only");
+            None
+        }
+    };
+
+    let repo_wide = cfg
+        .as_ref()
+        .and_then(|c| c.settings.instructions.as_deref());
+    let worker = cfg.as_ref().and_then(|c| {
+        c.workers
+            .iter()
+            .find(|w| w.name == item.worker_name)
+            .and_then(|w| w.instructions.as_deref())
+    });
+
+    Ok(factory_config::resolve_prompt(
+        role_default,
+        repo_wide,
+        worker,
+    ))
+}
 
 /// The transcript object URI for a task. Derived solely from the work item id so a
 /// token can only ever address its own transcript.
@@ -692,6 +772,10 @@ pub fn build_router(state: Arc<ToolsState>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { StatusCode::OK }))
         .route("/tools/:tool", post(handle_tool))
+        // MCP Streamable-HTTP / JSON-RPC 2.0 endpoint (Claude Code & other MCP
+        // clients). POST carries JSON-RPC requests; GET would open the SSE stream,
+        // which Factory does not use (all tools are request/response).
+        .route("/mcp", post(mcp::handle_post).get(mcp::handle_get))
         .with_state(state)
 }
 
@@ -728,34 +812,80 @@ async fn handle_tool(
 
     let args = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
 
-    // Audit the authorized call before running it: every attempt to use a tool is
-    // recorded. The single place no tool call can escape.
-    if let Err(e) = record::append_event(
-        &state.pool,
-        Some(auth.repo_id),
-        Some(auth.work_item_id),
-        None,
-        "tools",
-        tool.as_str(),
-        json!({ "args": args }),
-    )
-    .await
-    {
-        tracing::error!(tool = tool.as_str(), error = %e, "audit write failed");
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "audit error");
-    }
-
-    match dispatch(&state, &auth, tool, &args).await {
+    match audit_and_dispatch(&state, &auth, tool, &args).await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(e) => {
+        Err(ToolCallError::Audit(e)) => {
+            tracing::error!(tool = tool.as_str(), error = %e, "audit write failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "audit error")
+        }
+        Err(ToolCallError::Tool(e)) => {
             tracing::error!(tool = tool.as_str(), work_item = %auth.work_item_id, error = %e, "tool failed");
             error_response(StatusCode::BAD_REQUEST, &e.to_string())
         }
     }
 }
 
+/// Outcome of running a tool through the audited choke point: either an
+/// infrastructure failure writing the audit row, or a failure inside the tool
+/// itself. The HTTP layer maps `Audit` → 500 and `Tool` → 400; the MCP layer maps
+/// `Audit` → a JSON-RPC internal error and `Tool` → an `isError` content result.
+pub enum ToolCallError {
+    /// Writing the mandatory audit event failed; the call did not run.
+    Audit(anyhow::Error),
+    /// The tool ran (or its arguments were rejected) and returned an error.
+    Tool(anyhow::Error),
+}
+
+/// The single audited choke point shared by the REST and MCP surfaces: thread the
+/// work item's correlation id onto the audit row, write the mandatory audit event
+/// BEFORE running the tool (so no call can escape the events book), then dispatch.
+///
+/// Both transports call exactly this — there is one code path that authorizes,
+/// audits, and dispatches a tool, so neither surface can skip an audit row.
+pub async fn audit_and_dispatch(
+    state: &ToolsState,
+    auth: &TaskAuth,
+    tool: Tool,
+    args: &Value,
+) -> Result<Value, ToolCallError> {
+    // Thread the work item's correlation id onto the audit row so every tool call
+    // joins the same causal chain as the dispatch that launched it.
+    let correlation_id = match record::work_item_by_id(&state.pool, auth.work_item_id).await {
+        Ok(Some(item)) => Some(item.correlation_id),
+        Ok(None) => {
+            tracing::warn!(work_item = %auth.work_item_id, "audit: work item not found for correlation");
+            None
+        }
+        Err(e) => {
+            tracing::error!(tool = tool.as_str(), error = %e, "audit: correlation lookup failed");
+            return Err(ToolCallError::Audit(e.into()));
+        }
+    };
+
+    // Audit the authorized call before running it: every attempt to use a tool is
+    // recorded. The single place no tool call can escape. Per the spec data model,
+    // the actor is `tool:<name>` and the action is the tool name.
+    if let Err(e) = record::append_event(
+        &state.pool,
+        Some(auth.repo_id),
+        Some(auth.work_item_id),
+        correlation_id,
+        &format!("tool:{}", tool.as_str()),
+        tool.as_str(),
+        json!({ "args": args }),
+    )
+    .await
+    {
+        return Err(ToolCallError::Audit(e.into()));
+    }
+
+    dispatch(state, auth, tool, args)
+        .await
+        .map_err(ToolCallError::Tool)
+}
+
 /// Extract the `Authorization: Bearer <token>` value.
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

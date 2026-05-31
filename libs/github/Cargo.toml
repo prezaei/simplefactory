@@ -17,6 +17,11 @@ anyhow.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
 octocrab.workspace = true
+# Direct deps so OctocrabGitHub can build the App JWT client: octocrab takes a
+# `jsonwebtoken::EncodingKey` (not re-exported) and returns the token as a
+# `secrecy::SecretString`. Pinned to the versions octocrab 0.51 resolves to.
+jsonwebtoken = "10"
+secrecy = "0.10"
 
 [dev-dependencies]
 tokio.workspace = true

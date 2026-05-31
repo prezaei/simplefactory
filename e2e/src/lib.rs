@@ -357,6 +357,171 @@ mod acceptance {
         assert_eq!(record::count_for_repo(&pool, repo).await.unwrap(), 1);
     }
 
+    // P3 — dispatcher → worker → Tools slice (Coder drives a change request).
+    //
+    // Exercises the P3 vertical over its seams with fakes: the dispatcher leases a
+    // coder work item and launches it (minting the per-task token), then — standing
+    // in for the launched worker — we drive the Tools service with that exact token
+    // to open the change request and record the outcome. Asserts the CR is recorded,
+    // the item succeeds, the token is revoked when the task ends, and the audit
+    // trail is exactly what the slice should produce.
+
+    /// A dispatcher launcher that captures the raw per-task token the dispatcher
+    /// minted, so the test can act as the worker would with that token.
+    #[derive(Default)]
+    struct CapturingLauncher {
+        captured: std::sync::Mutex<Vec<factory_dispatcher::LaunchSpec>>,
+    }
+
+    #[async_trait::async_trait]
+    impl factory_dispatcher::WorkerLauncher for CapturingLauncher {
+        async fn launch(&self, spec: &factory_dispatcher::LaunchSpec) -> anyhow::Result<String> {
+            self.captured.lock().expect("lock").push(spec.clone());
+            Ok(format!("e2e-job-{}", Uuid::now_v7()))
+        }
+    }
+
+    #[tokio::test]
+    async fn p3_coder_work_item_drives_a_change_request() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+
+        // A repo with a coder worker triggered by the manager.
+        let name = unique("e2e-p3");
+        let repo = record::upsert_repo(&pool, "acme", &name, 1).await.unwrap();
+        let worker_name = "bug-fixer";
+        let yaml = format!(
+            "version: 1\n\
+             settings:\n  label: factory\n\
+             limits:\n  max_concurrent_workers: 4\n\
+             workers:\n  - name: {worker_name}\n    role: coder\n    on: [manager]\n"
+        );
+        let cfg = factory_config::parse(&yaml).expect("valid config");
+        let cfg_json = serde_json::to_value(&cfg).unwrap();
+        record::set_repo_config(&pool, repo, &cfg_json, "p3-sha")
+            .await
+            .unwrap();
+
+        // Enqueue one coder work item (kind Coder, the worker_name, trigger manager).
+        let correlation_id = Uuid::now_v7();
+        let enqueued = record::enqueue(
+            &pool,
+            &record::NewWorkItem {
+                repo_id: repo,
+                kind: record::Kind::Coder,
+                worker_name: worker_name.into(),
+                config_sha: "p3-sha".into(),
+                trigger: "manager".into(),
+                subject_ref: "issue#1".into(),
+                correlation_id,
+                priority: 0,
+                available_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let work_item_id = match enqueued {
+            record::EnqueueOutcome::Inserted(id) => id,
+            other => panic!("expected a fresh insert, got {other:?}"),
+        };
+
+        // Dispatch over the seam. The dispatcher scans every configured repo in the
+        // shared DB, so we scope our assertion to THIS work item: it is launched
+        // exactly once, and we capture its minted raw token.
+        let launcher = CapturingLauncher::default();
+        factory_dispatcher::dispatch_once(&pool, &launcher, "http://tools.test", "e2e")
+            .await
+            .unwrap();
+        let specs = launcher.captured.lock().expect("lock").clone();
+        let mine: Vec<_> = specs
+            .iter()
+            .filter(|s| s.work_item_id == work_item_id)
+            .collect();
+        assert_eq!(mine.len(), 1, "this work item is launched exactly once");
+        let spec = mine[0];
+        assert_eq!(spec.role, record::Kind::Coder);
+        assert_eq!(spec.worker_name, worker_name);
+        let raw_token = spec.raw_token.clone();
+
+        // Build the Tools service the worker would call, with the captured token's
+        // task scope. Seed the issue the subject points at.
+        let gh = std::sync::Arc::new(factory_github::FakeGitHub::new().with_issue(
+            factory_github::IssueView {
+                number: 1,
+                title: "Fix the bug".into(),
+                body: "broken".into(),
+                comments: vec![],
+            },
+        ));
+        let state = std::sync::Arc::new(factory_tools::ToolsState {
+            pool: pool.clone(),
+            gh,
+            blob: std::sync::Arc::new(factory_blob::InMemoryTranscripts::new()),
+        });
+
+        // Resolve the captured token to the task auth (as the Tools HTTP layer does).
+        let auth = factory_tools::authorize(&pool, &raw_token)
+            .await
+            .unwrap()
+            .expect("captured token authorizes the task");
+
+        // The worker opens its change request, then records success.
+        let cr = factory_tools::open_or_update_change_request(
+            &state,
+            &auth,
+            "[coder] issue#1",
+            "Implemented the fix with tests",
+            "factory/issue-1",
+            "main",
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let cr_number = cr["cr_number"].as_i64().expect("a cr_number");
+
+        factory_tools::record_outcome(&state, &auth, "succeeded", "all done")
+            .await
+            .unwrap();
+
+        // A change_requests row exists for the work item, carrying the cr_number.
+        let cr_row = record::change_request_for_item(&pool, work_item_id)
+            .await
+            .unwrap()
+            .expect("a CR row for the work item");
+        assert_eq!(cr_row.number, Some(cr_number as i32));
+        assert_eq!(cr_row.work_item_id, Some(work_item_id));
+
+        // The work item succeeded.
+        let item = record::work_item_by_id(&pool, work_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.state, record::State::Succeeded);
+
+        // The task token is revoked once the task ended (record_outcome).
+        assert!(
+            record::resolve_task_token(&pool, &record::hash_token(&raw_token))
+                .await
+                .unwrap()
+                .is_none(),
+            "token revoked when the task ends"
+        );
+
+        // Exactly the expected audit trail: the dispatcher's launch event plus one
+        // event per Tools call routed through the audit choke point. Here we drove
+        // the tool fns directly (not via HTTP), so only the dispatcher launch event
+        // is on the book for this item.
+        assert_eq!(
+            record::count_events_for_item(&pool, work_item_id)
+                .await
+                .unwrap(),
+            1,
+            "exactly the dispatcher launch event is audited for this item"
+        );
+    }
+
     // P4 — coordinator + reviewer (full loop)
     #[test]
     #[ignore = "P4: implement manager + coder + reviewer loop"]

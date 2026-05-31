@@ -608,3 +608,164 @@ async fn record_outcome_without_attempt_errors() {
     // The attempt status mapping is exercised separately to keep this focused.
     let _ = AttemptStatus::Succeeded;
 }
+
+// ===========================================================================
+// FIX 2 — get_task returns head_branch, base, and a composed prompt that layers
+// the role default, repo-wide instructions, and the matching worker's.
+// ===========================================================================
+
+#[tokio::test]
+async fn get_task_returns_head_branch_base_and_layered_prompt() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let issue = IssueView {
+        number: 7,
+        title: "Fix it".into(),
+        body: "broken".into(),
+        comments: vec![],
+    };
+    let fx = fixture_with(&pool, "issue#7", FakeGitHub::new().with_issue(issue)).await;
+
+    // Store a config whose worker name matches the fixture's work item so the
+    // per-worker instruction layer participates in the composed prompt.
+    let item = record::work_item_by_id(&pool, fx.work_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let yaml = format!(
+        "version: 1\n\
+         settings:\n  label: factory\n  instructions: \"Repo-wide house style.\"\n\
+         workers:\n  - name: {worker}\n    role: coder\n    on: [manager]\n    instructions: \"Prefer small commits.\"\n",
+        worker = item.worker_name
+    );
+    let cfg = factory_config::parse(&yaml).expect("valid config");
+    let cfg_json = serde_json::to_value(&cfg).unwrap();
+    record::set_repo_config(&pool, fx.auth.repo_id, &cfg_json, "sha-cfg")
+        .await
+        .unwrap();
+
+    let (status, body) = http_call(fx.state.clone(), &fx.raw_token, "get_task", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(body["head_branch"], "factory/issue-7");
+    assert_eq!(body["base"], "main");
+
+    let prompt = body["prompt"].as_str().expect("prompt is a string");
+    assert!(!prompt.is_empty(), "prompt must be non-empty");
+    // All three layers are present and in order.
+    assert!(
+        prompt.contains("You are a coder."),
+        "role default present: {prompt}"
+    );
+    assert!(
+        prompt.contains("Repo-wide house style."),
+        "repo-wide layer present: {prompt}"
+    );
+    assert!(
+        prompt.contains("Prefer small commits."),
+        "per-worker layer present: {prompt}"
+    );
+}
+
+#[tokio::test]
+async fn get_task_prompt_falls_back_to_role_default_without_config() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    // No config stored on this repo → prompt is just the role default.
+    let issue = IssueView {
+        number: 71,
+        title: "Fix it".into(),
+        body: "broken".into(),
+        comments: vec![],
+    };
+    let fx = fixture_with(&pool, "issue#71", FakeGitHub::new().with_issue(issue)).await;
+    let (status, body) = http_call(fx.state.clone(), &fx.raw_token, "get_task", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["head_branch"], "factory/issue-71");
+    assert_eq!(body["base"], "main");
+    let prompt = body["prompt"].as_str().expect("prompt is a string");
+    assert!(prompt.contains("You are a coder."), "got: {prompt}");
+}
+
+// ===========================================================================
+// FIX 3 — record_outcome revokes the task's tokens; the token can no longer act.
+// ===========================================================================
+
+#[tokio::test]
+async fn record_outcome_revokes_task_tokens() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#33", FakeGitHub::new()).await;
+    let token_hash = record::hash_token(&fx.raw_token);
+
+    // Before completion the token resolves to this task.
+    assert!(
+        record::resolve_task_token(&pool, &token_hash)
+            .await
+            .unwrap()
+            .is_some(),
+        "token authorizes before the task ends"
+    );
+
+    factory_tools::record_outcome(&fx.state, &fx.auth, "succeeded", "done")
+        .await
+        .unwrap();
+
+    // After completion the token no longer resolves.
+    assert!(
+        record::resolve_task_token(&pool, &token_hash)
+            .await
+            .unwrap()
+            .is_none(),
+        "token is revoked when the task ends"
+    );
+
+    // A subsequent tool HTTP call with that bearer is rejected with 401.
+    let (status, _) = http_call(fx.state.clone(), &fx.raw_token, "heartbeat", json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ===========================================================================
+// FIX 4 — the audit row carries the work item's correlation_id and a
+// `tool:<name>` actor.
+// ===========================================================================
+
+#[tokio::test]
+async fn audit_event_has_correlation_id_and_tool_actor() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#19", FakeGitHub::new()).await;
+    let item = record::work_item_by_id(&pool, fx.work_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (status, _) = http_call(fx.state.clone(), &fx.raw_token, "heartbeat", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Inspect the latest audit row for this work item.
+    let row: (Option<Uuid>, String, String) = sqlx::query_as(
+        "SELECT correlation_id, actor, action FROM events
+          WHERE work_item_id = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(fx.work_item_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        row.0,
+        Some(item.correlation_id),
+        "audit correlation_id matches the work item's"
+    );
+    assert_eq!(row.1, "tool:heartbeat", "actor is tool:<name>");
+    assert_eq!(row.2, "heartbeat", "action is the tool name");
+}

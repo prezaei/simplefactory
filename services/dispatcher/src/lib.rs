@@ -20,8 +20,9 @@ use record::{Kind, LeaseRequest, Pool};
 use serde_json::json;
 use uuid::Uuid;
 
-/// Per-task lease/token TTL in seconds. A leased item that the worker never
-/// completes within this window is reclaimed by the record layer's sweeper.
+/// Per-task lease/token TTL in seconds. The lease sweeper that reclaims expired
+/// leases and revokes their tokens lands in P5; until then an expired lease is
+/// NOT auto-reclaimed within this window.
 const TASK_TTL_SECS: f64 = 900.0;
 
 /// Default per-worker concurrency cap when a worker does not set `max_concurrent`.
@@ -135,25 +136,19 @@ impl DockerLauncher {
 #[async_trait::async_trait]
 impl WorkerLauncher for DockerLauncher {
     async fn launch(&self, spec: &LaunchSpec) -> anyhow::Result<String> {
-        // Pass secrets/URL via the environment; never on the command line where
-        // they would leak into process listings.
+        // Secrets and config are passed via the environment, never on the command
+        // line where they would leak into process listings. We log only the
+        // work item / role / image — never the assembled argv (it holds the
+        // token) — so tracing here is intentionally narrow.
+        tracing::info!(
+            work_item = %spec.work_item_id,
+            role = spec.role.as_str(),
+            image = %self.image,
+            "DockerLauncher: docker run --rm --detach"
+        );
+        let args = docker_run_args(&self.image, spec);
         let output = tokio::process::Command::new("docker")
-            .arg("run")
-            .arg("--rm")
-            .arg("--detach")
-            .arg("-e")
-            .arg(format!("FACTORY_TASK_TOKEN={}", spec.raw_token))
-            .arg("-e")
-            .arg(format!("FACTORY_TOOLS_URL={}", spec.tools_url))
-            .arg("-e")
-            .arg(format!("FACTORY_WORK_ITEM_ID={}", spec.work_item_id))
-            .arg("-e")
-            .arg(format!("FACTORY_REPO_ID={}", spec.repo_id))
-            .arg("-e")
-            .arg(format!("FACTORY_ROLE={}", spec.role.as_str()))
-            .arg("-e")
-            .arg(format!("FACTORY_WORKER_NAME={}", spec.worker_name))
-            .arg(&self.image)
+            .args(&args)
             .output()
             .await?;
 
@@ -177,6 +172,41 @@ impl WorkerLauncher for DockerLauncher {
         );
         Ok(job_id)
     }
+}
+
+/// Build the full `docker run` argv for a worker launch.
+///
+/// Secrets and config are injected as `-e KEY=VALUE` environment pairs (the only
+/// place the raw token appears), and the image is the final positional argument
+/// so `docker run` treats everything after it as the container's command. The
+/// returned vec contains the token and MUST NOT be logged.
+fn docker_run_args(image: &str, spec: &LaunchSpec) -> Vec<String> {
+    let mut args = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "--detach".to_string(),
+    ];
+    for (key, value) in docker_env(spec) {
+        args.push("-e".to_string());
+        args.push(format!("{key}={value}"));
+    }
+    // Image is last: docker treats trailing args as the container command.
+    args.push(image.to_string());
+    args
+}
+
+/// The environment passed into the worker container, as ordered (key, value)
+/// pairs. The raw task token is delivered here (`FACTORY_TASK_TOKEN`) so it never
+/// touches a logged argv string.
+fn docker_env(spec: &LaunchSpec) -> Vec<(&'static str, String)> {
+    vec![
+        ("FACTORY_TASK_TOKEN", spec.raw_token.clone()),
+        ("FACTORY_TOOLS_URL", spec.tools_url.clone()),
+        ("FACTORY_WORK_ITEM", spec.work_item_id.to_string()),
+        ("FACTORY_REPO_ID", spec.repo_id.to_string()),
+        ("FACTORY_ROLE", spec.role.as_str().to_string()),
+        ("FACTORY_WORKER_NAME", spec.worker_name.clone()),
+    ]
 }
 
 /// Generate a fresh raw task token. Two v4 UUIDs concatenated give 256 bits of
@@ -263,7 +293,7 @@ pub async fn dispatch_once(
                             worker = %worker.name,
                             work_item = %item.id,
                             error = %e,
-                            "failed to launch leased item; leaving it leased for reclaim"
+                            "failed to launch leased item; it stays leased until the P5 lease sweeper reclaims expired leases (no auto-reclaim in P3)"
                         );
                     }
                 }
@@ -332,4 +362,71 @@ async fn launch_leased(
         "dispatched worker"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKEN: &str = "rawtoken-supersecret";
+
+    fn spec() -> LaunchSpec {
+        LaunchSpec {
+            work_item_id: Uuid::nil(),
+            repo_id: Uuid::nil(),
+            role: Kind::Coder,
+            raw_token: TOKEN.to_string(),
+            tools_url: "http://tools.local:8080".to_string(),
+            worker_name: "coder-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn docker_env_carries_token_and_required_keys() {
+        let env = docker_env(&spec());
+        let token = env
+            .iter()
+            .find(|(k, _)| *k == "FACTORY_TASK_TOKEN")
+            .expect("token env present");
+        assert_eq!(token.1, TOKEN);
+
+        let keys: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&"FACTORY_TOOLS_URL"));
+        assert!(keys.contains(&"FACTORY_WORK_ITEM"));
+        assert!(keys.contains(&"FACTORY_ROLE"));
+
+        let role = env
+            .iter()
+            .find(|(k, _)| *k == "FACTORY_ROLE")
+            .expect("role env present");
+        assert_eq!(role.1, "coder");
+    }
+
+    #[test]
+    fn docker_run_args_have_image_last_and_run_flags_first() {
+        let args = docker_run_args("ghcr.io/acme/worker:latest", &spec());
+        assert_eq!(args[0], "run");
+        assert_eq!(args[1], "--rm");
+        assert_eq!(args[2], "--detach");
+        // Image is the final positional argument.
+        assert_eq!(args.last().unwrap(), "ghcr.io/acme/worker:latest");
+    }
+
+    #[test]
+    fn docker_run_args_pass_token_only_in_an_env_pair() {
+        let args = docker_run_args("ghcr.io/acme/worker:latest", &spec());
+        // The token appears exactly once, in the FACTORY_TASK_TOKEN env value.
+        let token_args: Vec<&String> = args.iter().filter(|a| a.contains(TOKEN)).collect();
+        assert_eq!(token_args.len(), 1, "token must appear exactly once");
+        assert_eq!(token_args[0], &format!("FACTORY_TASK_TOKEN={TOKEN}"));
+        // It is preceded by a `-e` flag (it is an env injection, not a bare arg).
+        let idx = args.iter().position(|a| a.contains(TOKEN)).unwrap();
+        assert_eq!(args[idx - 1], "-e");
+    }
+
+    #[test]
+    fn docker_run_args_never_put_token_in_the_image_position() {
+        let args = docker_run_args("ghcr.io/acme/worker:latest", &spec());
+        assert!(!args.last().unwrap().contains(TOKEN));
+    }
 }

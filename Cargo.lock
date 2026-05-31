@@ -594,11 +594,17 @@ dependencies = [
 name = "factory-e2e"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "chrono",
+ "factory-blob",
  "factory-config",
+ "factory-dispatcher",
  "factory-github",
  "factory-intake",
  "factory-record",
+ "factory-tools",
+ "serde_json",
  "tokio",
  "uuid",
 ]
@@ -611,7 +617,9 @@ dependencies = [
  "async-trait",
  "hex",
  "hmac",
+ "jsonwebtoken",
  "octocrab",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2",
@@ -696,7 +704,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
+ "factory-blob",
+ "factory-config",
+ "factory-github",
+ "factory-record",
  "factory-telemetry",
+ "factory-tools",
  "reqwest",
  "serde",
  "serde_json",

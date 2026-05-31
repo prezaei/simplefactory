@@ -182,11 +182,141 @@ async fn run_task_inner(
     Ok(())
 }
 
+/// Real Tools client over HTTP — the worker's live seam to the Tools service.
+///
+/// Every call targets `POST {base}/tools/{tool}` (the only surface the Tools
+/// router serves) and carries `Authorization: Bearer <task_token>`. Lives in the
+/// library (not just the binary) so an integration test can drive the REAL client
+/// against a real `build_router`, proving the two seams actually connect.
+pub struct HttpTools {
+    base_url: String,
+    task_token: String,
+    http: reqwest::Client,
+}
+
+impl HttpTools {
+    pub fn new(base_url: String, task_token: String) -> Self {
+        Self {
+            base_url,
+            task_token,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// The URL for a tool: every call targets `POST {base}/tools/{tool}`, which is
+    /// the only surface the Tools router serves.
+    pub fn tool_url(&self, tool: &str) -> String {
+        format!("{}/tools/{}", self.base_url.trim_end_matches('/'), tool)
+    }
+
+    /// POST a JSON body to a tool and return the parsed response. All tools (even
+    /// no-argument ones like get_task/heartbeat) are POSTed with a JSON object.
+    async fn call_tool(
+        &self,
+        tool: &str,
+        body: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let resp = self
+            .http
+            .post(self.tool_url(tool))
+            .bearer_auth(&self.task_token)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.json().await?)
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolsClient for HttpTools {
+    async fn get_task(&self) -> anyhow::Result<TaskInfo> {
+        tracing::info!("HttpTools: get_task");
+        let v = self.call_tool("get_task", serde_json::json!({})).await?;
+        Ok(TaskInfo {
+            role: json_str(&v, "role"),
+            subject_ref: json_str(&v, "subject_ref"),
+            head_branch: json_str(&v, "head_branch"),
+            base: json_str(&v, "base"),
+            prompt: json_str(&v, "prompt"),
+        })
+    }
+
+    async fn open_or_update_change_request(&self, req: &CrRequest) -> anyhow::Result<CrResult> {
+        tracing::info!(head_branch = %req.head_branch, "HttpTools: open_or_update_change_request");
+        let v = self
+            .call_tool(
+                "open_or_update_change_request",
+                serde_json::json!({
+                    "title": req.title,
+                    "body": req.body,
+                    "head_branch": req.head_branch,
+                    "base": req.base,
+                    "linked_issue": req.linked_issue,
+                }),
+            )
+            .await?;
+        Ok(CrResult {
+            cr_number: v.get("cr_number").and_then(|n| n.as_i64()).unwrap_or(0),
+            url: json_str(&v, "url"),
+        })
+    }
+
+    async fn append_transcript(&self, chunk: &str) -> anyhow::Result<()> {
+        tracing::info!("HttpTools: append_transcript");
+        self.call_tool("append_transcript", serde_json::json!({ "chunk": chunk }))
+            .await?;
+        Ok(())
+    }
+
+    async fn heartbeat(&self) -> anyhow::Result<()> {
+        tracing::info!("HttpTools: heartbeat");
+        self.call_tool("heartbeat", serde_json::json!({})).await?;
+        Ok(())
+    }
+
+    async fn record_outcome(&self, status: &str, summary: &str) -> anyhow::Result<()> {
+        tracing::info!(status, "HttpTools: record_outcome");
+        self.call_tool(
+            "record_outcome",
+            serde_json::json!({ "status": status, "summary": summary }),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+/// Extract a string field from a JSON object, defaulting to empty.
+fn json_str(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|f| f.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    #[test]
+    fn tool_url_targets_tools_namespace_without_double_slash() {
+        let t = HttpTools::new("https://tools.test/".into(), "tok".into());
+        assert_eq!(t.tool_url("get_task"), "https://tools.test/tools/get_task");
+        let t2 = HttpTools::new("https://tools.test".into(), "tok".into());
+        assert_eq!(
+            t2.tool_url("record_outcome"),
+            "https://tools.test/tools/record_outcome"
+        );
+    }
+
+    #[test]
+    fn json_str_extracts_and_defaults() {
+        let v = serde_json::json!({ "role": "engineer" });
+        assert_eq!(json_str(&v, "role"), "engineer");
+        assert_eq!(json_str(&v, "missing"), "");
+    }
 
     /// Records every call the harness makes. `open_or_update_change_request`
     /// models the real idempotent endpoint: it always returns the same
