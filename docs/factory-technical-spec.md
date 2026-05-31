@@ -281,7 +281,7 @@ workers:
   - name: bug-fixer
     role: coder                  # manager | coder | reviewer | tester
     on:                          # declarative trigger list
-      - issue_labeled            # an issue gains the opt-in label
+      - manager                  # the Manager assigns this coder (manager-first; see below)
       - cr_changes_requested     # a reviewer asked for changes (the rework loop)
     max_concurrent: 3
     model: claude-opus-4-8       # optional per-worker model override
@@ -307,13 +307,13 @@ workers:
     max_concurrent: 1
 ```
 
-**Worker model.** `workers:` is a named list; each entry binds a `name` to a `role` (`manager` | `coder` | `reviewer` | `tester`), its triggers, and its caps. The named-list form (vs fixed role blocks) allows multiple workers of the same role (e.g. a `bug-fixer` and a `refactorer`, both coders) and future roles without a schema change. (The `tester` role and the `review_requested` trigger are reserved for future workflows — no shipped workflow drives them yet.)
+**Worker model.** `workers:` is a named list; each entry binds a `name` to a `role` (`manager` | `coder` | `reviewer` | `tester`), its triggers, and its caps. The named-list form (vs fixed role blocks) allows multiple workers of the same role (e.g. a `bug-fixer` and a `refactorer`, both coders) and future roles without a schema change. (The `tester` role and the `review_requested` trigger are reserved for future workflows — no shipped workflow drives them yet.) **Manager-first:** only the Manager subscribes to `issue_labeled`; coders/reviewers/testers are woken by the Manager (`manager` trigger) or by their own CR/comment triggers, never by `issue_labeled` directly — so the single labelled-issue event yields exactly one Manager work item.
 
 **Trigger vocabulary** (`on:`):
 
 | Trigger | Fires when |
 | --- | --- |
-| `issue_labeled` | an issue gains the opt-in label |
+| `issue_labeled` | an issue gains the opt-in label — **wakes the Manager only**; coders/reviewers are dispatched by the Manager via `manager` (manager-first) |
 | `cr_opened` | a change request is opened |
 | `cr_updated` | new commits pushed to a tracked CR |
 | `cr_changes_requested` | a reviewer requested changes (drives the rework loop) |
