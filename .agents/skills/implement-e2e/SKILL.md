@@ -131,13 +131,18 @@ The Copilot review is **asynchronous and external** — do not busy-loop or bloc
 Hand the wait-iterate-merge loop to **`/ship-it`**, which runs on a recurring cron (re-checks every few
 minutes and resumes). **`/ship-it` now enforces the Copilot-on-HEAD gate natively** (see the ship-it
 skill): when Copilot is available on the repo it automatically requests the review and will **not** merge
-until Copilot has *submitted* a review of the **current** HEAD with every comment triaged — so just
-invoke `/ship-it`; no manual gate injection is needed. (If Copilot isn't installed on the repo, `/ship-it`
-records that and proceeds without the gate rather than hanging.) **One CI caveat:** `/ship-it` gates CI on
-the repo's branch-protection-required checks by default; since `AGENTS.md` requires **all** CI checks
-green (not only the required subset — see the exit condition), pass the full check set via `/ship-it
---required-checks <name,…>` whenever branch protection lists fewer. The EXTRA MERGE GATE below is exactly
-the Copilot behavior `/ship-it` now enforces:
+until Copilot has *submitted* a review of the **current** HEAD with every inline comment triaged — so
+invoke `/ship-it` to own the request-wait-merge loop. (If Copilot isn't installed on the repo, `/ship-it`
+records that and proceeds without the gate rather than hanging.) `/ship-it`'s built-in detection counts
+**any** submitted review state (it treats `state != "PENDING"` as a hit, which includes `DISMISSED`) and
+triages only inline `comments`. Steps 1–3 below are a **stricter operator layer** you run each iteration
+*on top of* `/ship-it`: they (a) count only *active* submitted states (`COMMENTED`/`APPROVED`/
+`CHANGES_REQUESTED`, excluding `DISMISSED`), (b) also triage the Copilot **review-summary body**, and
+(c) run `/code-review` on every fix — none of which `/ship-it` does itself. **One CI caveat:** `/ship-it`
+gates CI on the repo's branch-protection-required checks by default; since `AGENTS.md` requires **all** CI
+checks green (not only the required subset — see the exit condition), pass the full check set via
+`/ship-it --required-checks <name,…>` whenever branch protection lists fewer. The EXTRA MERGE GATE below
+is the native behavior `/ship-it` enforces; steps 1–3 tighten it:
 
 > **EXTRA MERGE GATE — do not merge until BOTH:** (a) Copilot has submitted a review whose `commit_id`
 > equals the **current** PR head SHA, and (b) every new inline comment from that review is triaged —
