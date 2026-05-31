@@ -1604,3 +1604,32 @@ async fn record_outcome_terminal_statuses_through_rest_route() {
         assert_eq!(item.state.as_str(), want_state);
     }
 }
+
+#[tokio::test]
+async fn post_comment_redispatch_of_updated_body_does_not_reput() {
+    // Regression for the redo path: after a genuine body change (A → B), an IDENTICAL
+    // re-dispatch of the now-current body B must NOT re-PUT (which would clobber a human
+    // edit made after the B write). The fix re-persists the last-written body so the
+    // equality check compares against B, not the original A.
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#1701", FakeGitHub::new()).await;
+    let mk = |body: &str| json!({ "target": "issue#1701", "body": body, "dedupe_key": "k" });
+
+    // A: first post.
+    let (_, _) = http_call(fx.state.clone(), &fx.raw_token, "post_comment", mk("A")).await;
+    // B: changed body → one update.
+    let (_, _) = http_call(fx.state.clone(), &fx.raw_token, "post_comment", mk("B")).await;
+    assert_eq!(count_calls(&fx.gh, "update_comment"), 1, "A→B updates once");
+    // B again: identical re-dispatch of the current body → NO further update.
+    let (_, _) = http_call(fx.state.clone(), &fx.raw_token, "post_comment", mk("B")).await;
+    assert_eq!(
+        count_calls(&fx.gh, "update_comment"),
+        1,
+        "an identical re-dispatch of the last-written body must not re-PUT"
+    );
+    // Exactly one comment was ever created.
+    assert_eq!(count_calls(&fx.gh, "post_comment"), 1);
+}

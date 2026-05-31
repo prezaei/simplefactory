@@ -439,10 +439,16 @@ pub async fn post_comment(
             }
             state.gh.update_comment(&repo, comment_id, body).await?;
             tracing::info!(work_item = %auth.work_item_id, comment_id, "post_comment: body changed on re-run; updated existing comment");
-            // Return the stable comment id. (The persisted result keeps the originally
-            // posted body; the common clobber case we guard against is an identical
-            // re-dispatch of the same attempt, which the equality check above skips.)
-            Ok(json!({ "comment_id": comment_id }))
+            // Persist the body we just wrote so the equality check compares against the
+            // LAST-written body, not the first one forever. Without this, a later
+            // identical re-dispatch of this same body would re-PUT it — clobbering a
+            // human edit made after this update. (`idempotency_complete` is an UPDATE of
+            // the stored result; the Done branch of `idempotent` does not re-store on its
+            // own, so we do it here.)
+            let updated = json!({ "comment_id": comment_id, "body": body });
+            record::idempotency_complete(&state.pool, auth.work_item_id, "comment", key, &updated)
+                .await?;
+            Ok(updated)
         },
     )
     .await
