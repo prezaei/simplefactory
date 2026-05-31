@@ -978,12 +978,13 @@ async fn upsert_cr_preserves_terminal_state_and_owner_against_stale_coder() {
     else {
         panic!("fresh insert B");
     };
-    let returned = record::upsert_change_request_for_item(&pool, repo, item_b, branch, Some(9))
+    // The stale coder even supplies a DIFFERENT linked_issue (999) — it must not stick.
+    let returned = record::upsert_change_request_for_item(&pool, repo, item_b, branch, Some(999))
         .await
         .unwrap();
     // Contract still holds: the same CR row is returned...
     assert_eq!(returned.id, cr.id, "same CR row returned");
-    // ...but the terminal-ish state and original owner are preserved.
+    // ...but the terminal-ish state, original owner, and linked_issue are preserved.
     assert_eq!(
         returned.factory_state, "ready",
         "terminal-ish state not dragged back by the stale upsert"
@@ -992,6 +993,11 @@ async fn upsert_cr_preserves_terminal_state_and_owner_against_stale_coder() {
         returned.work_item_id,
         Some(item_a),
         "original owner not stolen by the stale upsert"
+    );
+    assert_eq!(
+        returned.linked_issue,
+        Some(9),
+        "linked_issue not overwritten on a terminal-ish CR by the stale upsert"
     );
 
     // The follow-up set_change_request_number must NOT downgrade 'ready' to 'open'.

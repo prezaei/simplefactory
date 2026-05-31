@@ -904,7 +904,9 @@ pub async fn upsert_change_request_for_item(
              -- non-terminal rows are re-pointed/refreshed as before (the rework loop).
              work_item_id = CASE WHEN change_requests.factory_state IN ('ready', 'merged', 'closed')
                                  THEN change_requests.work_item_id ELSE EXCLUDED.work_item_id END,
-             linked_issue = COALESCE(EXCLUDED.linked_issue, change_requests.linked_issue),
+             linked_issue = CASE WHEN change_requests.factory_state IN ('ready', 'merged', 'closed')
+                                 THEN change_requests.linked_issue
+                                 ELSE COALESCE(EXCLUDED.linked_issue, change_requests.linked_issue) END,
              updated_at   = CASE WHEN change_requests.factory_state IN ('ready', 'merged', 'closed')
                                  THEN change_requests.updated_at ELSE now() END
          RETURNING id, repo_id, number, head_branch, linked_issue, work_item_id, factory_state",
