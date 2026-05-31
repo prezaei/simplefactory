@@ -280,6 +280,11 @@ struct RawWorker {
     instructions_file: Option<String>,
 }
 
+// NOTE: `#[serde(untagged)]` cannot enforce `deny_unknown_fields` inside its
+// variants, so an extra key on a `{ schedule: "..." }` trigger (e.g.
+// `{ schedule: "...", typo: 1 }`) is silently ignored rather than rejected.
+// Low severity (the schedule value still round-trips); stricter trigger
+// validation is a P2 follow-up when the scheduler also adds full cron parsing.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RawTrigger {
@@ -443,5 +448,24 @@ workers:
     fn resolves_prompt_skips_empty_layers() {
         let out = resolve_prompt("role default", None, Some("   "));
         assert_eq!(out, "role default");
+    }
+
+    /// Regression guard for the YAML `on:` landmine: under YAML 1.1, the bare
+    /// scalar `on` resolves to boolean `true`, which would make the `on:` key
+    /// miss the struct field and silently drop all triggers. serde_yaml 0.9
+    /// (YAML 1.2 core schema, pinned in Cargo.lock) reads it as the literal key,
+    /// so triggers ARE captured. If a future YAML-parser swap reintroduces 1.1
+    /// coercion, this test fails loudly.
+    #[test]
+    fn on_key_is_not_coerced_to_yaml_boolean() {
+        let cfg = parse(
+            "version: 1\nworkers:\n  - name: c\n    role: coder\n    on: [manager, cr_updated]\n",
+        )
+        .expect("config with an `on:` key should parse");
+        assert_eq!(
+            cfg.workers[0].on,
+            vec![Trigger::Manager, Trigger::CrUpdated],
+            "the `on:` key must capture triggers, not be dropped as a boolean key"
+        );
     }
 }
