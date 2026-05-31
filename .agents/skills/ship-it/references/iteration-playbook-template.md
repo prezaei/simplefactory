@@ -109,7 +109,10 @@ CRITICAL — PAGINATE: the REST review-comments endpoint returns at most 30 comm
 CRITICAL — COPILOT LOGIN: in the REST comments API, Copilot's inline review comments appear under author login "Copilot" (NOT the bot slug `copilot-pull-request-reviewer[bot]`, which is only the login on the reviews API). When detecting/triaging Copilot comments, match login "Copilot". Do NOT rely on the bot slug for comments.
 
 ALSO check review-thread resolution so no unresolved thread is left open at merge (GraphQL — the REST comments API does not expose resolution state):
-  gh api graphql -f query='query { repository(owner:\"<owner>\", name:\"<repo>\") { pullRequest(number: {{PR_NUMBER}}) { reviewThreads(first: 100) { nodes { isResolved comments(first: 1) { nodes { databaseId author { login } } } } } } }'
+  gh api graphql -f query='query { repository(owner:\"<owner>\", name:\"<repo>\") { pullRequest(number: {{PR_NUMBER}}) { reviewThreads(first: 100) { pageInfo { hasNextPage endCursor } nodes { isResolved comments(first: 1) { nodes { databaseId author { login } } } } } } }'
+
+CRITICAL — PAGINATE reviewThreads: `reviewThreads(first: 100)` returns at most 100 threads. On a PR with >100 threads, later pages are SILENTLY DROPPED and an unresolved Copilot/human thread on a later page would be merged over. You MUST cover ALL threads: read `pageInfo { hasNextPage endCursor }` and, while `hasNextPage` is true, re-run the query with `reviewThreads(first: 100, after: \"<endCursor>\")`, accumulating `nodes` across every page until `hasNextPage` is false.
+
 Treat any thread with isResolved == false (especially one authored by "Copilot" or a human reviewer) as an unaddressed item — its root comment id should be surfaced as a NEW/untriaged comment so the decision gate routes it to triage. A still-open thread must NOT be merged over.
 
 (Note: if the repo is on GitHub Enterprise rather than github.com, add `--hostname <ghe-host>` to every `gh api` call.)
@@ -136,6 +139,8 @@ Report as JSON:
 ## Step 2: Decision Gate
 
 Once both agents complete, evaluate results. Take the **FIRST matching** action:
+
+> **Where the Copilot-on-HEAD check lives:** rows 5 and 5b below reference "the Copilot-on-HEAD check". That check is computed by the exact-login / current-HEAD / submitted-state assertion in **[Step 3d](#step-3d-wait-for-copilot-review)** (wait path) and re-asserted at merge in **[Step 4 Gate 5](#gate-5--copilot-review-on-the-exact-current-head-only-when-copilot_available-is-true)**. Look there for the precise `gh api --paginate .../reviews` query and its pass condition.
 
 | # | Condition | Action |
 |---|-----------|--------|
@@ -422,11 +427,13 @@ Run the exact-login / current-HEAD check:
 
 ```bash
 HEAD=$(gh pr view {{PR_NUMBER}} --json headRefOid -q .headRefOid)
-gh api [--hostname <host>] repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
-  --jq "[.[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\")] | length"   # must be >= 1
+gh api --paginate [--hostname <host>] repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
+  --jq "[.[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\" and .state != \"PENDING\")] | length"   # must be >= 1
 ```
 
 (Add `--hostname` from `state.ghe_hostname` when non-null, per the convention used elsewhere.)
+
+**PAGINATE** the reviews endpoint with `--paginate` — it returns at most 30 reviews per page, so on a PR with many reviews the Copilot review can fall onto a later page and be silently missed, breaking the gate. **Exclude PENDING reviews**: a `state == "PENDING"` review is an unsubmitted draft the bot has not yet posted — it must NOT satisfy the gate. Only submitted states count (COMMENTED, APPROVED, CHANGES_REQUESTED, DISMISSED).
 
 - **If the count is >= 1**: a qualifying review exists for the current HEAD. The review's inline comments will surface as NEW comments via Step 1 / Agent B (remember: those comments carry login "Copilot", and Agent B paginates with `--paginate` + checks unresolved threads) and get triaged through row 1 of the decision gate (the existing comment-triage machinery). Once all of them are triaged and no Copilot thread is left unresolved, the next iteration routes to Step 4 (row 5). Do not merge from this step.
 - **If the count is 0**: the reviewer has not yet reviewed the current HEAD. Then:
@@ -516,8 +523,10 @@ When true, run the exact-login / current-HEAD assertion and ABORT the merge (exi
 
 ```bash
 HEAD=$(gh pr view {{PR_NUMBER}} --json headRefOid -q .headRefOid)
-COUNT=$(gh api [--hostname <host>] repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
-  --jq "[.[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\")] | length")
+COUNT=$(gh api --paginate [--hostname <host>] repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
+  --jq "[.[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\" and .state != \"PENDING\")] | length")
+# --paginate: the reviews endpoint caps at 30/page — without it the Copilot review can be on a later page and be missed.
+# .state != "PENDING": skip unsubmitted draft reviews; only submitted reviews (COMMENTED/APPROVED/CHANGES_REQUESTED/DISMISSED) satisfy the gate.
 # COUNT must be >= 1. If 0, the reviewer has not reviewed the current HEAD —
 # go to Step 3d (log "waiting for copilot-pull-request-reviewer[bot] review on $HEAD", re-request per the rule),
 # update state, and EXIT the iteration. Do NOT merge.
@@ -525,7 +534,7 @@ COUNT=$(gh api [--hostname <host>] repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
 
 (Add `--hostname` from `state.ghe_hostname` when non-null.)
 
-Additionally, every NEW inline comment from that HEAD review must already be triaged (its id present in `triaged_comment_ids`) AND no Copilot review thread may be left unresolved. Gate 2 (fresh comment re-check) enforces this — but ONLY if it paginated and matched the right login: re-fetch with `gh api --paginate` (comments cap at 30/page) and match Copilot comments by login "Copilot" (the reviews API uses the bot slug; the comments API uses "Copilot"). Also re-run the GraphQL `reviewThreads { isResolved }` check — any unresolved thread routes back to Step 3b. If any comment from the qualifying review is untriaged or any thread is unresolved, do NOT merge; triage it first. A review on a SUPERSEDED commit does not satisfy this gate; a pushed fix resets it to the new HEAD.
+Additionally, every NEW inline comment from that HEAD review must already be triaged (its id present in `triaged_comment_ids`) AND no Copilot review thread may be left unresolved. Gate 2 (fresh comment re-check) enforces this — but ONLY if it paginated and matched the right login: re-fetch with `gh api --paginate` (comments cap at 30/page) and match Copilot comments by login "Copilot" (the reviews API uses the bot slug; the comments API uses "Copilot"). Also re-run the GraphQL `reviewThreads { isResolved }` check, looping the `pageInfo { hasNextPage, endCursor }` cursor until exhausted so ALL threads are covered (>100 threads spill onto later pages — see Step 1 / Agent B) — any unresolved thread routes back to Step 3b. If any comment from the qualifying review is untriaged or any thread is unresolved, do NOT merge; triage it first. A review on a SUPERSEDED commit does not satisfy this gate; a pushed fix resets it to the new HEAD.
 
 ### Execute Merge
 
