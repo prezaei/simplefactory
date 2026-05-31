@@ -117,7 +117,7 @@ The real subprocess seams are implemented too: `GitCli` (shallow clone + `--forc
 **Tests:** full happy path (issue→code→review→ready-for-human-merge); changes-requested loop increments and caps; **exactly-once** escalation under re-dispatch; reviewer verdict idempotent; **a change that weakens/disables its own gating checks is rejected → escalated, never marked ready** (PROD "can't weaken its own checks").
 **Exit:** end-to-end issue→merge-handoff works locally for the worked example. **Depends on:** P3.
 
-> **Deferred — Manager closes the issue on the human's merge.** P4's exit is the ready-for-human-**merge** handoff: it marks the CR `ready`, comments, and assigns the linked issue to a human, leaving the issue OPEN (`in_progress`). Actually **closing the issue on merge** requires ingesting GitHub's `pull_request closed/merged` webhook so the Coordinator can observe the merge; that ingestion is **not built in P4** (deferred to a later capability). Until then the issue intentionally stays open after handoff rather than being marked `done`.
+> **Deferred — Coordinator closes the issue on the human's merge.** P4's exit is the ready-for-human-**merge** handoff: it marks the CR `ready`, comments, and assigns the linked issue to a human, leaving the issue OPEN (`in_progress`). Actually **closing the issue on merge** requires ingesting GitHub's `pull_request closed/merged` webhook so the Coordinator can observe the merge; that ingestion is **not built in P4** (deferred to a later capability). Until then the issue intentionally stays open after handoff rather than being marked `done`.
 
 ## P4.5 — Per-role worker lifecycle (Manager triage + Reviewer verdict)
 
@@ -129,7 +129,7 @@ The real subprocess seams are implemented too: `GitCli` (shallow clone + `--forc
 - `services/worker`: make `run_task` **role-aware** (branch on `task.role` from `get_task`):
   - **Coder** (unchanged): clone → Claude edits → push branch → `open_or_update_change_request` → `record_outcome`.
   - **Reviewer**: read the CR (`read_change_request`) → Claude reviews → `submit_review` verdict (approve / request changes) → `record_outcome`. **No** branch push, **no** CR.
-  - **Manager**: read the issue (`read_issue`) → Claude triages → act via Tools (e.g. `post_comment` / labels / `escalate` for a non-actionable issue) → `record_outcome` (the Coordinator then assigns a Coder). **No** clone-edit-push, **no** CR. (A manager may not need a clone at all — keep it lean.)
+  - **Manager**: read the issue (`read_issue`) → Claude triages. On an **actionable** issue: optionally `post_comment` a triage note, then `record_outcome` **success** — and only a *succeeded* Manager item makes the Coordinator assign a Coder. On a **non-actionable** issue: `escalate` (a terminal escalated outcome; the Coordinator parks it and does **not** assign a Coder). Either way: **no** clone-edit-push, **no** CR. (No label-mutating Tool exists in the Tools surface, so triage acts via comments/escalation, not labels; a manager may not need a clone at all — keep it lean.)
 - Role-default prompts: ship a per-role default prompt (`manager` / `coder` / `reviewer`) composed with the repo's overrides (the prompt-composition order already in the spec).
 - Keep all worker effects mediated by Tools (the existing trust boundary); no new direct Postgres/Blob access.
 

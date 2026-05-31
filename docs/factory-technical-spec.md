@@ -113,7 +113,7 @@ Every role runs Claude Code over the same MCP/Tools channel, but the harness's t
 
 | Role | Reads | Claude does | Terminal action (via Tools) | Produces a CR? |
 | --- | --- | --- | --- | --- |
-| **Manager** | the issue (`read_issue`) | triages: decide scope / actionability | `post_comment` / label / `escalate`; `record_outcome` → the Coordinator then assigns a Coder | **No** |
+| **Manager** | the issue (`read_issue`) | triages: actionable vs not | actionable → `post_comment` + `record_outcome` **success** (only a *succeeded* Manager makes the Coordinator assign a Coder); non-actionable → `escalate` (terminal; no Coder) | **No** |
 | **Coder** | the issue / CR | writes code on a fresh clone | push branch → `open_or_update_change_request` → `record_outcome` | **Yes** (the only role that does) |
 | **Reviewer** | the CR (`read_change_request`) | reviews the diff + checks | `submit_review` verdict (approve / request changes) → `record_outcome` | **No** |
 
