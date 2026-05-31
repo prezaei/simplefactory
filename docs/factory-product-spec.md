@@ -10,8 +10,8 @@ Think of it as a **factory floor**:
 - **A dispatcher** picks up each piece of work, checks capacity against the configured caps, and hands it to a worker.
 - **Each worker runs in its own sealed workroom** — a throwaway workspace with a copy of the code and a set of tools. The worker is an AI assistant that reads the task, explores the code, makes changes, runs tests, and opens a change request — calling back to the factory for tools as it goes.
 - **Everything the worker does is recorded** — a running play-by-play of its actions and the final result — into a central **record book** that is the single source of truth.
-- **A coordinator (the "manager")** keeps the effort moving: it tracks every ticket and change request, dispatches the next worker when one is needed, and flags a human when something is genuinely blocked. It never writes code — it only decides and delegates. (Some workers are also event-driven — a new change request automatically wakes a reviewer.)
-- **The loop closes:** the manager's decisions become new work on the to-do list, the dispatcher picks them up, and so on, until the task is truly done.
+- **A Coordinator** keeps the effort moving: it tracks every ticket and change request, decides the next step, dispatches the worker that does it, and flags a human when something is genuinely blocked. It is deterministic — it never writes code and makes no AI judgments; it only decides and delegates. (Triage of a new issue — the judgment of *what* to do — is the job of a **Manager** worker, one of the AI team members below, not the Coordinator. Some workers are also event-driven — a new change request automatically wakes a reviewer.)
+- **The loop closes:** the Coordinator's decisions become new work on the to-do list, the dispatcher picks them up, and so on, until the task is truly done.
 - **Humans watch through a dashboard** showing what every worker is doing right now, what has finished, and the state of every ticket and change request.
 
 One thing the factory always does keeps it healthy:
@@ -35,15 +35,15 @@ That's the whole setup. From this point on Factory watches the repo on its own. 
 You've connected your repo and you want a bug fixed. You don't open a console or any special tool — you do exactly what you'd normally do:
 
 1. **You open an issue by hand:** *"Login endpoint has no rate limiting — add it, with tests."* You add the `factory` label to hand it over.
-2. **Factory notices** (it's watching the repo) and puts a job on the to-do list for the **Manager** — the coordinator that decides who does what.
-3. **The Manager reads the issue**, confirms it's in scope, **assigns a Coder**, and leaves a short comment on the issue so you can see it's been picked up.
+2. **Factory notices** (it's watching the repo) and puts a job on the to-do list for the **Manager** — an AI worker that triages the new issue.
+3. **The Manager reads the issue**, confirms it's in scope, and leaves a short comment so you can see it's been picked up; the deterministic **Coordinator**, reacting to the Manager's result, then **assigns a Coder**.
 4. **The Coder wakes up in its own sealed workroom** — a fresh, throwaway copy of your repo. It reads the issue, explores the code to find the login endpoint, writes the rate-limiting change *and* its tests, runs the tests until they pass, then **opens a change request** linked to the issue and comments "ready for review."
 5. **The Coder's job finishes**; its result (success, and the change request it produced) is recorded.
-6. **Opening the change request is itself an event Factory reacts to** — it automatically wakes a **Reviewer** for that change request (no one has to assign it). Meanwhile the Manager also sees the Coder's job finish and keeps tracking the issue's progress.
+6. **Opening the change request is itself an event Factory reacts to** — it automatically wakes a **Reviewer** for that change request (no one has to assign it). Meanwhile the Coordinator also sees the Coder's job finish and keeps tracking the issue's progress.
 7. **The Reviewer wakes up in its own workroom**, reads the diff, checks the fix is correct and the tests are real, and leaves a verdict:
-   - **Requests changes** → the Manager hands the change request back to a Coder to address the feedback, looping to step 4 on the same change request.
+   - **Requests changes** → the Coordinator hands the change request back to a Coder to address the feedback, looping to step 4 on the same change request.
    - **Approves**, and once the repo's own automated checks are green → Factory marks the change ready and **hands it to a human to merge**. Factory never merges on its own — a person performs the final merge, keeping the one irreversible step under human control.
-8. **The Manager closes the loop** — comments the outcome and closes the issue.
+8. **A human merges** — the one irreversible step, kept under human control. *(Post-merge, the Coordinator observing the merge to comment the outcome and close the issue is a **later capability** — it needs merge-webhook ingestion; until then the flow ends at the ready-for-merge handoff and the issue stays open.)*
 
 Throughout, you can watch every step on the dashboard — which worker is doing what, the live play-by-play, the change request, the review — and you can leave a comment or edit the issue or change request to steer it. At most you wrote an issue and clicked merge; Factory did the rest.
 
@@ -111,7 +111,7 @@ flowchart LR
     A -->|transcript| AR[("Transcript Store")]
     A -->|play-by-play / outcome| R[("Record Book<br/>source of truth")]
     TA --> R
-    R -->|completions| MG["Manager<br/>decides next step"]
+    R -->|completions| MG["Coordinator<br/>decides next step"]
     MG -->|new work| Q
     R -->|live view| DB["Dashboard"]
 ```
