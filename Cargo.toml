@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "libs/telemetry",
+    "libs/config",
+    "libs/record",
+    "libs/github",
+    "libs/blob",
+    "services/intake",
+    "services/dispatcher",
+    "services/coordinator",
+    "services/tools",
+    "services/dashboard-api",
+    "services/worker",
+    "e2e",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+# Cross-cutting — used in P0
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Reserved for later phases (declared for intent; only fetched once a crate uses them):
+# tokio (P3), axum (P2/P3 services), sqlx + uuid + chrono (P1 record), octocrab (P2 github),
+# azure_storage_blobs (P3 blob), opentelemetry + opentelemetry-otlp (P7 telemetry export).
+
+# Internal crates
+factory-telemetry = { path = "libs/telemetry" }
+factory-config = { path = "libs/config" }
+factory-record = { path = "libs/record" }
+factory-github = { path = "libs/github" }
+factory-blob = { path = "libs/blob" }
