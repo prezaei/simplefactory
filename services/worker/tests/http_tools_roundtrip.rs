@@ -171,3 +171,239 @@ async fn http_tools_drives_tools_router_over_the_wire() {
 
     server.abort();
 }
+
+// ---------------------------------------------------------------------------
+// P4.5: the per-role worker lifecycle driven through the REAL HttpTools ↔ Tools
+// router over the wire, proving a Manager and a Reviewer run produce NO change
+// request (only the Coder does) and perform their role's terminal action.
+// ---------------------------------------------------------------------------
+
+use factory_worker::{ClaudeRunner, HarnessConfig, ReviewVerdict, RunOutcome, Workspace};
+use std::path::Path;
+
+/// A git double that panics if used — a Manager/Reviewer must never clone or push.
+struct NoGit;
+
+#[async_trait::async_trait]
+impl Workspace for NoGit {
+    async fn shallow_clone(&self, _u: &str, _t: &str, _d: &Path) -> anyhow::Result<()> {
+        panic!("a non-coder role must not clone");
+    }
+    async fn push_branch(&self, _d: &Path, _b: &str) -> anyhow::Result<()> {
+        panic!("a non-coder role must not push");
+    }
+}
+
+/// A Claude double that returns a fixed role outcome.
+struct FixedClaude(RunOutcome);
+
+#[async_trait::async_trait]
+impl ClaudeRunner for FixedClaude {
+    async fn run(
+        &self,
+        _workdir: &Path,
+        _role: &str,
+        _prompt: &str,
+        _tools_url: &str,
+        _token: &str,
+    ) -> anyhow::Result<RunOutcome> {
+        Ok(self.0.clone())
+    }
+}
+
+/// Lease a work item of `kind` with `subject`, mint its token, and serve the REAL
+/// Tools router on an ephemeral port. Returns (base_url, raw_token, item, server).
+async fn serve_with_item(
+    pool: &record::Pool,
+    gh: Arc<FakeGitHub>,
+    repo_id: Uuid,
+    kind: record::Kind,
+    subject: &str,
+) -> (
+    String,
+    String,
+    record::WorkItem,
+    tokio::task::JoinHandle<()>,
+) {
+    let worker_name = "w".to_string();
+    record::enqueue(
+        pool,
+        &record::NewWorkItem {
+            repo_id,
+            kind,
+            worker_name: worker_name.clone(),
+            config_sha: "test-sha".into(),
+            trigger: "manager".into(),
+            subject_ref: subject.into(),
+            correlation_id: Uuid::now_v7(),
+            priority: 0,
+            available_at: None,
+        },
+    )
+    .await
+    .expect("enqueue");
+    let item = record::lease_next(
+        pool,
+        &record::LeaseRequest {
+            repo_id,
+            worker_name,
+            lease_owner: "test".into(),
+            ttl_secs: 300.0,
+            per_worker_cap: 10,
+            global_cap: 10,
+        },
+    )
+    .await
+    .expect("lease")
+    .expect("a leasable item");
+    let attempt_id = record::start_attempt(pool, item.id, None)
+        .await
+        .expect("attempt");
+    let raw_token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    record::mint_task_token(
+        pool,
+        &record::hash_token(&raw_token),
+        item.id,
+        repo_id,
+        kind,
+        Some(attempt_id),
+        300.0,
+    )
+    .await
+    .expect("mint token");
+
+    let state = Arc::new(ToolsState {
+        pool: pool.clone(),
+        gh,
+        blob: Arc::new(InMemoryTranscripts::new()),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, build_router(state)).await;
+    });
+    (format!("http://{addr}"), raw_token, item, server)
+}
+
+fn harness(base_url: &str, token: &str) -> HarnessConfig {
+    HarnessConfig {
+        repo_url: "https://github.com/acme/repo.git".into(),
+        install_token: "ghs_x".into(),
+        tools_url: base_url.into(),
+        task_token: token.into(),
+        workdir: std::env::temp_dir().join(unique("p45-wd")),
+    }
+}
+
+#[tokio::test]
+async fn manager_lifecycle_over_the_wire_posts_comment_and_opens_no_cr() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let name = unique("worker-p45-manager");
+    let repo_id = record::upsert_repo(&pool, "acme", &name, 7)
+        .await
+        .expect("repo");
+    let gh = Arc::new(FakeGitHub::new().with_issue(IssueView {
+        number: 5,
+        title: "Add rate limiting".into(),
+        body: "details".into(),
+        comments: vec![],
+    }));
+    let (base, token, item, server) =
+        serve_with_item(&pool, gh.clone(), repo_id, record::Kind::Manager, "issue#5").await;
+
+    let claude = FixedClaude(RunOutcome::Triage {
+        actionable: true,
+        summary: "In scope; assigning a coder".into(),
+    });
+    factory_worker::run_task(
+        &HttpTools::new(base.clone(), token.clone()),
+        &NoGit,
+        &claude,
+        &harness(&base, &token),
+    )
+    .await
+    .expect("manager run succeeds");
+
+    // NO change request was created by the manager...
+    assert!(
+        record::change_request_for_item(&pool, item.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "manager opens no CR"
+    );
+    // ...a triage comment was posted on the issue...
+    assert!(
+        gh.calls()
+            .iter()
+            .any(|c| c.contains("post_comment") && c.contains("Issue(5)")),
+        "manager posted a triage comment on the issue: {:?}",
+        gh.calls()
+    );
+    // ...and the work item succeeded (so the Coordinator will assign a coder).
+    let final_item = record::work_item_by_id(&pool, item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_item.state, record::State::Succeeded);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn reviewer_lifecycle_over_the_wire_submits_verdict_and_opens_no_cr() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let name = unique("worker-p45-reviewer");
+    let repo_id = record::upsert_repo(&pool, "acme", &name, 7)
+        .await
+        .expect("repo");
+    let gh = Arc::new(FakeGitHub::new());
+    let (base, token, item, server) =
+        serve_with_item(&pool, gh.clone(), repo_id, record::Kind::Reviewer, "cr#12").await;
+
+    let claude = FixedClaude(RunOutcome::Review {
+        verdict: ReviewVerdict::RequestChanges,
+        summary: "Please add tests".into(),
+    });
+    factory_worker::run_task(
+        &HttpTools::new(base.clone(), token.clone()),
+        &NoGit,
+        &claude,
+        &harness(&base, &token),
+    )
+    .await
+    .expect("reviewer run succeeds");
+
+    // NO change request created by the reviewer...
+    assert!(
+        record::change_request_for_item(&pool, item.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "reviewer opens no CR"
+    );
+    // ...a verdict was submitted on the CR...
+    assert!(
+        gh.calls()
+            .iter()
+            .any(|c| c.contains("submit_review") && c.contains("request_changes")),
+        "reviewer submitted a verdict: {:?}",
+        gh.calls()
+    );
+    // ...and the work item succeeded.
+    let final_item = record::work_item_by_id(&pool, item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_item.state, record::State::Succeeded);
+
+    server.abort();
+}

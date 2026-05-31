@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use factory_worker::{ClaudeRunner, HarnessConfig, HttpTools, RunResult, Workspace};
+use factory_worker::{
+    ClaudeRunner, HarnessConfig, HttpTools, ReviewVerdict, RunOutcome, Workspace,
+};
 
 /// Real git CLI driver. Shallow-clones the PLAIN repo URL and pushes with
 /// `--force-with-lease` for idempotent re-runs. The install token is NEVER placed
@@ -158,11 +160,12 @@ impl ClaudeRunner for ClaudeCli {
     async fn run(
         &self,
         workdir: &Path,
+        role: &str,
         prompt: &str,
         tools_url: &str,
         token: &str,
-    ) -> anyhow::Result<RunResult> {
-        tracing::info!(workdir = %workdir.display(), tools_url, "ClaudeCli: running claude headless");
+    ) -> anyhow::Result<RunOutcome> {
+        tracing::info!(workdir = %workdir.display(), role, tools_url, "ClaudeCli: running claude headless");
         // Register the Factory Tools service as a Streamable-HTTP MCP server so
         // Claude reaches Factory (open CRs, etc.) through the authenticated
         // endpoint. The config carries the token (an Authorization header), so it is
@@ -183,7 +186,8 @@ impl ClaudeRunner for ClaudeCli {
         // failure path. If cleanup ran only after a successful write+run, a write that
         // failed (e.g. a planted file at the path) would leave the scratch dir (and any
         // partial token file) on disk. cleanup_scratch runs on every exit path here.
-        let result = run_claude_with_config(&scratch_dir, workdir, prompt, tools_url, token).await;
+        let result =
+            run_claude_with_config(&scratch_dir, workdir, role, prompt, tools_url, token).await;
         cleanup_scratch(&scratch_dir).await;
         result
     }
@@ -197,10 +201,11 @@ impl ClaudeRunner for ClaudeCli {
 async fn run_claude_with_config(
     scratch_dir: &Path,
     workdir: &Path,
+    role: &str,
     prompt: &str,
     tools_url: &str,
     token: &str,
-) -> anyhow::Result<RunResult> {
+) -> anyhow::Result<RunOutcome> {
     let config_path = scratch_dir.join(MCP_CONFIG_FILENAME);
     write_mcp_config_file(&config_path, tools_url, token).await?;
 
@@ -222,8 +227,65 @@ async fn run_claude_with_config(
     } else {
         stdout
     };
-    tracing::info!("ClaudeCli: run completed");
-    Ok(RunResult { summary })
+    tracing::info!(role, "ClaudeCli: run completed");
+    // Shape the textual output into the role's structured outcome. The decision
+    // signals (manager actionable?, reviewer verdict) are parsed from a trailing
+    // marker line Claude is prompted to emit; absent a marker, conservative defaults
+    // apply (manager → actionable, reviewer → comment). Richer parsing is a deploy
+    // refinement; this seam runs only in live deployment (the harness logic is
+    // covered by the fake-driven tests in lib.rs).
+    Ok(outcome_for_role(role, summary))
+}
+
+/// Map a role + Claude's textual summary to a [`RunOutcome`]. Pure (no I/O) so it is
+/// unit-tested. Unknown roles map to `Code` defensively — the harness's run-seam match
+/// rejects any non-coder/manager/reviewer role before this is reached for a real run,
+/// so this default is never exercised for an unsupported role in practice.
+fn outcome_for_role(role: &str, summary: String) -> RunOutcome {
+    match role {
+        "manager" => RunOutcome::Triage {
+            actionable: parse_manager_actionable(&summary),
+            summary,
+        },
+        "reviewer" => RunOutcome::Review {
+            verdict: parse_reviewer_verdict(&summary),
+            summary,
+        },
+        _ => RunOutcome::Code { summary },
+    }
+}
+
+/// Parse the manager's triage decision from a trailing `ACTIONABLE: yes|no` marker.
+/// Defaults to actionable when no clear "no" marker is present (fail toward doing the
+/// work rather than silently dropping an issue).
+fn parse_manager_actionable(summary: &str) -> bool {
+    !last_marker(summary, "ACTIONABLE:")
+        .map(|v| matches!(v.as_str(), "no" | "false" | "not_actionable"))
+        .unwrap_or(false)
+}
+
+/// Parse the reviewer's verdict from a trailing `VERDICT: approve|request_changes|comment`
+/// marker. Defaults to `comment` (the non-destructive verdict) when absent/unrecognized.
+fn parse_reviewer_verdict(summary: &str) -> ReviewVerdict {
+    match last_marker(summary, "VERDICT:").as_deref() {
+        Some("approve") => ReviewVerdict::Approve,
+        Some("request_changes") => ReviewVerdict::RequestChanges,
+        _ => ReviewVerdict::Comment,
+    }
+}
+
+/// Find the last line that starts with `prefix` (case-insensitive on the prefix) and
+/// return its trimmed, lowercased value. `None` if no such line exists.
+fn last_marker(text: &str, prefix: &str) -> Option<String> {
+    text.lines().rev().find_map(|line| {
+        let line = line.trim();
+        let head = line.get(..prefix.len())?;
+        if head.eq_ignore_ascii_case(prefix) {
+            Some(line[prefix.len()..].trim().to_ascii_lowercase())
+        } else {
+            None
+        }
+    })
 }
 
 /// Best-effort delete the entire MCP scratch directory (and its token-bearing config)
@@ -424,6 +486,7 @@ mod tests {
         let result = run_claude_with_config(
             &scratch_dir,
             Path::new("/tmp"),
+            "coder",
             "prompt",
             "https://tools.factory.test",
             TOKEN,
@@ -640,5 +703,82 @@ mod tests {
         assert!(!is_url_safe_token("has:colon"));
         assert!(!is_url_safe_token("has/slash"));
         assert!(!is_url_safe_token("has space"));
+    }
+
+    #[test]
+    fn outcome_for_role_shapes_by_role() {
+        // Coder → Code.
+        assert!(matches!(
+            outcome_for_role("coder", "did the work".into()),
+            RunOutcome::Code { .. }
+        ));
+        // Manager → Triage; default actionable when no marker.
+        assert!(matches!(
+            outcome_for_role("manager", "in scope".into()),
+            RunOutcome::Triage {
+                actionable: true,
+                ..
+            }
+        ));
+        // Reviewer → Review; default comment when no marker.
+        assert!(matches!(
+            outcome_for_role("reviewer", "looks ok".into()),
+            RunOutcome::Review {
+                verdict: ReviewVerdict::Comment,
+                ..
+            }
+        ));
+        // Unknown role defaults to Code (never reached for a real run — the harness
+        // run-seam rejects unsupported roles before this).
+        assert!(matches!(
+            outcome_for_role("tester", "x".into()),
+            RunOutcome::Code { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_manager_actionable_reads_trailing_marker() {
+        assert!(parse_manager_actionable("triaged\nACTIONABLE: yes"));
+        assert!(parse_manager_actionable("triaged")); // default: actionable
+        assert!(!parse_manager_actionable("out of scope\nACTIONABLE: no"));
+        assert!(!parse_manager_actionable("ACTIONABLE: not_actionable"));
+        // Case-insensitive on the marker; the LAST marker wins.
+        assert!(!parse_manager_actionable("actionable: yes\nactionable: no"));
+    }
+
+    #[test]
+    fn parse_reviewer_verdict_reads_trailing_marker() {
+        assert_eq!(
+            parse_reviewer_verdict("looks great\nVERDICT: approve"),
+            ReviewVerdict::Approve
+        );
+        assert_eq!(
+            parse_reviewer_verdict("needs work\nVERDICT: request_changes"),
+            ReviewVerdict::RequestChanges
+        );
+        assert_eq!(
+            parse_reviewer_verdict("just a note\nVERDICT: comment"),
+            ReviewVerdict::Comment
+        );
+        // Absent/unrecognized → conservative `comment`.
+        assert_eq!(parse_reviewer_verdict("no marker"), ReviewVerdict::Comment);
+        assert_eq!(
+            parse_reviewer_verdict("VERDICT: lgtm"),
+            ReviewVerdict::Comment
+        );
+    }
+
+    #[test]
+    fn last_marker_finds_last_and_is_prefix_case_insensitive() {
+        assert_eq!(
+            last_marker("a\nKEY: first\nKEY: second", "KEY:"),
+            Some("second".to_string())
+        );
+        assert_eq!(last_marker("kEy: Val", "KEY:"), Some("val".to_string()));
+        assert_eq!(last_marker("nothing here", "KEY:"), None);
+        // A short line (shorter than the prefix) is skipped, not a panic.
+        assert_eq!(last_marker("hi", "KEY:"), None);
+        // Multibyte content doesn't panic the prefix slice.
+        assert_eq!(last_marker("héllo", "KEY:"), None);
     }
 }

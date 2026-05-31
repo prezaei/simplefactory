@@ -111,7 +111,7 @@ The worker has **no** direct Postgres or Blob credentials — everything goes th
 #### Worker lifecycle by role
 Every role runs Claude Code over the same MCP/Tools channel, but the harness's terminal action differs by `role` (only the **Coder** produces a change request).
 
-> **Implementation status (as of P4).** Only the **Coder** lifecycle below is built in the worker harness; `run_task` is currently Coder-shaped for every role. The **Manager** and **Reviewer** lifecycles in this table are the **P4.5** target (see the implementation plan) and are **not yet implemented** — until P4.5 lands, a Manager or Reviewer work item must not be dispatched to the worker (it would run the Coder path). This table is the contract P4.5 fulfils, not current behavior.
+> **Implementation status (as of P4.5).** All three lifecycles below are built in the worker harness: `run_task` branches on `task.role` — Coder (clone→edit→push→open CR), Manager (triage→comment+succeed or escalate), Reviewer (review→`submit_review`). Only the Coder produces a change request. The **`tester`** role is accepted by `validate_role` but has no lifecycle, so reaching `run_task` with it (or any unknown role) fails loudly at the seam rather than running the Coder default.
 
 | Role | Reads | Claude does | Terminal action (via Tools) | Produces a CR? |
 | --- | --- | --- | --- | --- |
