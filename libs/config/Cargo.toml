@@ -9,3 +9,5 @@ publish = false
 serde.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
+cron.workspace = true
+chrono.workspace = true

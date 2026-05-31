@@ -446,6 +446,16 @@ pub async fn count_events_for_item(pool: &Pool, work_item_id: Uuid) -> Result<i6
     )
 }
 
+/// Count audit events recorded for a repo (diagnostic/test helper).
+pub async fn count_events_for_repo(pool: &Pool, repo_id: Uuid) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE repo_id = $1")
+            .bind(repo_id)
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
 /// Count all work items belonging to a repo (diagnostic/test helper).
 pub async fn count_for_repo(pool: &Pool, repo_id: Uuid) -> Result<i64> {
     Ok(
@@ -454,6 +464,228 @@ pub async fn count_for_repo(pool: &Pool, repo_id: Uuid) -> Result<i64> {
             .fetch_one(pool)
             .await?,
     )
+}
+
+/// A repo and its stored config snapshot (for intake).
+#[derive(Debug, Clone)]
+pub struct RepoConfig {
+    pub id: Uuid,
+    /// The last validated `.factory/config.yml` as jsonb, if any.
+    pub config: Option<serde_json::Value>,
+    pub config_sha: Option<String>,
+}
+
+/// Fetch an **active** repo and its stored config by owner/name. Suspended or
+/// removed repos resolve to `None`, so their webhook events never become work
+/// items (the connection is the authorization to act on a repo).
+pub async fn repo_by_name(pool: &Pool, owner: &str, name: &str) -> Result<Option<RepoConfig>> {
+    let row = sqlx::query(
+        "SELECT id, config, config_sha FROM repos
+          WHERE owner = $1 AND name = $2 AND status = 'active'",
+    )
+    .bind(owner)
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        Some(r) => Some(RepoConfig {
+            id: r.try_get("id")?,
+            config: r.try_get("config")?,
+            config_sha: r.try_get("config_sha")?,
+        }),
+        None => None,
+    })
+}
+
+/// Store a validated config snapshot on a repo (config-apply on push).
+pub async fn set_repo_config(
+    pool: &Pool,
+    repo_id: Uuid,
+    config: &serde_json::Value,
+    config_sha: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE repos SET config = $2, config_sha = $3, updated_at = now() WHERE id = $1")
+        .bind(repo_id)
+        .bind(config)
+        .bind(config_sha)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Whether a webhook delivery id has already been processed (redelivery dedupe
+/// read; the write happens via [`mark_delivery`] only after work succeeds).
+pub async fn delivery_seen(pool: &Pool, delivery_id: &str) -> Result<bool> {
+    let n: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM webhook_deliveries WHERE delivery_id = $1")
+            .bind(delivery_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(n > 0)
+}
+
+/// Mark a webhook delivery id as processed; returns `false` if it was already
+/// seen (redelivery dedupe).
+pub async fn mark_delivery(pool: &Pool, delivery_id: &str) -> Result<bool> {
+    let row = sqlx::query(
+        "INSERT INTO webhook_deliveries (delivery_id) VALUES ($1)
+         ON CONFLICT (delivery_id) DO NOTHING RETURNING delivery_id",
+    )
+    .bind(delivery_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// Purge webhook delivery dedupe rows older than the cutoff. The dedupe table
+/// only needs to outlive GitHub's redelivery window; this keeps it bounded.
+/// Returns the number of rows removed.
+pub async fn purge_deliveries(pool: &Pool, older_than: DateTime<Utc>) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM webhook_deliveries WHERE received_at < $1")
+        .bind(older_than)
+        .execute(pool)
+        .await?;
+    let n = result.rows_affected();
+    tracing::info!(purged = n, "purged webhook deliveries");
+    Ok(n)
+}
+
+/// All active repos that have a stored config, as `(repo_id, config_sha, config)`.
+/// The scheduler iterates these to find due timers. `config` is the raw jsonb;
+/// the caller deserializes it (keeps the record layer free of the config schema).
+pub async fn list_configured_repos(pool: &Pool) -> Result<Vec<(Uuid, String, serde_json::Value)>> {
+    let rows = sqlx::query(
+        "SELECT id, config_sha, config FROM repos
+          WHERE status = 'active' AND config IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let id: Uuid = r.try_get("id")?;
+        let sha: String = r
+            .try_get::<Option<String>, _>("config_sha")?
+            .unwrap_or_default();
+        let cfg: serde_json::Value = r.try_get("config")?;
+        out.push((id, sha, cfg));
+    }
+    Ok(out)
+}
+
+/// The last scheduled tick fired for `(repo, worker)`, if any. The scheduler uses
+/// this to bound the window it scans for newly-due ticks.
+pub async fn last_scheduled_fire(
+    pool: &Pool,
+    repo_id: Uuid,
+    worker_name: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    Ok(sqlx::query_scalar(
+        "SELECT last_fired FROM schedule_state WHERE repo_id = $1 AND worker_name = $2",
+    )
+    .bind(repo_id)
+    .bind(worker_name)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Fire a due scheduled tick exactly once across replicas. Under a per-(repo,
+/// worker) advisory lock it re-checks the stored `last_fired`: if `slot` was
+/// already fired (another replica won the race, or a re-tick recomputed the same
+/// slot), it's a no-op ([`EnqueueOutcome::DuplicateActive`]). Otherwise it
+/// enqueues `item` (idempotently) and advances `last_fired` to `slot`, atomically.
+pub async fn record_scheduled_fire(
+    pool: &Pool,
+    item: &NewWorkItem,
+    slot: DateTime<Utc>,
+) -> Result<EnqueueOutcome> {
+    let mut tx = pool.begin().await?;
+
+    // Serialize firing for this (repo, worker) so the last_fired check + advance
+    // is atomic across replicas.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtext('factory:schedule'), hashtext($1::text || ':' || $2))",
+    )
+    .bind(item.repo_id)
+    .bind(&item.worker_name)
+    .execute(&mut *tx)
+    .await?;
+
+    let last: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT last_fired FROM schedule_state WHERE repo_id = $1 AND worker_name = $2",
+    )
+    .bind(item.repo_id)
+    .bind(&item.worker_name)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if matches!(last, Some(l) if l >= slot) {
+        tx.rollback().await?;
+        tracing::info!(repo_id = %item.repo_id, worker = %item.worker_name, %slot, "schedule already fired; skipping");
+        return Ok(EnqueueOutcome::DuplicateActive);
+    }
+
+    let row = sqlx::query(
+        "INSERT INTO work_items
+           (id, repo_id, kind, worker_name, config_sha, trigger, subject_ref, correlation_id,
+            state, priority, available_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued', $9, coalesce($10, now()))
+         ON CONFLICT (repo_id, subject_ref, kind)
+           WHERE state IN ('queued', 'leased', 'running', 'blocked')
+           DO NOTHING
+         RETURNING id",
+    )
+    .bind(Uuid::now_v7())
+    .bind(item.repo_id)
+    .bind(item.kind.as_str())
+    .bind(&item.worker_name)
+    .bind(&item.config_sha)
+    .bind(&item.trigger)
+    .bind(&item.subject_ref)
+    .bind(item.correlation_id)
+    .bind(item.priority)
+    .bind(item.available_at)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO schedule_state (repo_id, worker_name, last_fired) VALUES ($1, $2, $3)
+         ON CONFLICT (repo_id, worker_name) DO UPDATE SET last_fired = EXCLUDED.last_fired",
+    )
+    .bind(item.repo_id)
+    .bind(&item.worker_name)
+    .bind(slot)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let outcome = match row {
+        Some(r) => EnqueueOutcome::Inserted(r.try_get("id")?),
+        None => EnqueueOutcome::DuplicateActive,
+    };
+    tracing::info!(
+        repo_id = %item.repo_id,
+        worker = %item.worker_name,
+        %slot,
+        fired = matches!(outcome, EnqueueOutcome::Inserted(_)),
+        "schedule fire"
+    );
+    Ok(outcome)
+}
+
+/// Re-queue any `blocked` work items for a subject (the blocked → resume-on-reply
+/// transition). Returns the number re-queued.
+pub async fn requeue_blocked(pool: &Pool, repo_id: Uuid, subject_ref: &str) -> Result<u64> {
+    let result = sqlx::query(
+        "UPDATE work_items SET state = 'queued', available_at = now(), updated_at = now()
+          WHERE repo_id = $1 AND subject_ref = $2 AND state = 'blocked'",
+    )
+    .bind(repo_id)
+    .bind(subject_ref)
+    .execute(pool)
+    .await?;
+    let n = result.rows_affected();
+    tracing::info!(repo_id = %repo_id, subject = subject_ref, requeued = n, "requeue blocked on reply");
+    Ok(n)
 }
 
 fn map_work_item(row: sqlx::postgres::PgRow) -> Result<WorkItem> {

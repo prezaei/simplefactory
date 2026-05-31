@@ -5,10 +5,36 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lib]
+name = "factory_intake"
+path = "src/lib.rs"
+
 [[bin]]
 name = "factory-intake"
 path = "src/main.rs"
 
 [dependencies]
+factory-record.workspace = true
+factory-config.workspace = true
+factory-github.workspace = true
 factory-telemetry.workspace = true
+axum.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+factory-record.workspace = true
+factory-github.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tower.workspace = true
+sqlx.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true

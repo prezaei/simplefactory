@@ -21,13 +21,14 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy (warnings = errors)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
         # Compiles the full E2E acceptance suite (ignored stubs run as skipped,
         # so the contract list can't silently rot) and runs all active tests.
         # DB-backed tests skip cleanly here (no DATABASE_URL); the integration
-        # job below runs them against Postgres.
-        run: cargo test --all
+        # job below runs them against Postgres. --locked: CI must build the
+        # committed Cargo.lock, never silently resolve new versions.
+        run: cargo test --locked --all
 
   integration:
     name: integration (Postgres)
@@ -56,4 +57,4 @@ jobs:
       # - run: cargo install sqlx-cli --no-default-features --features native-tls,postgres
       # - run: cargo sqlx migrate run
       - name: Integration tests
-        run: cargo test --all
+        run: cargo test --locked --all

@@ -9,11 +9,17 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashSet;
+use std::str::FromStr;
 
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// A validated Factory team configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The public types derive `Serialize`/`Deserialize` so a validated config can be
+/// stored as jsonb in the record book and read back (the YAML on-disk form is
+/// parsed separately via [`parse`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub version: u32,
     pub settings: Settings,
@@ -22,7 +28,7 @@ pub struct Config {
 }
 
 /// Repo-wide settings.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     /// Opt-in label; Factory acts only on work carrying it.
     pub label: String,
@@ -33,14 +39,14 @@ pub struct Settings {
 }
 
 /// Global capacity limits.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
     /// Global ceiling across all workers in this repo.
     pub max_concurrent_workers: u32,
 }
 
 /// A single configured worker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Worker {
     pub name: String,
     pub role: Role,
@@ -52,7 +58,7 @@ pub struct Worker {
 }
 
 /// The role a worker plays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Manager,
@@ -62,7 +68,7 @@ pub enum Role {
 }
 
 /// What wakes a worker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Trigger {
     IssueLabeled,
     CrOpened,
@@ -94,6 +100,8 @@ pub enum ConfigError {
     InvalidCron { worker: String, cron: String },
     #[error("worker '{worker}' (role {role:?}): only the manager may subscribe to issue_labeled (manager-first)")]
     NonManagerIssueLabeled { worker: String, role: Role },
+    #[error("at most one worker may subscribe to issue_labeled (a labelled issue yields a single Manager work item); found both '{first}' and '{second}'")]
+    MultipleIssueLabeledSubscribers { first: String, second: String },
     #[error("worker '{0}': instructions_file must be a non-empty path")]
     EmptyInstructionsFile(String),
 }
@@ -110,6 +118,10 @@ pub fn parse(yaml: &str) -> Result<Config, ConfigError> {
     }
 
     let mut seen = HashSet::new();
+    // Tracks the single worker allowed to subscribe to issue_labeled. A labelled
+    // issue must yield exactly one Manager work item; two subscribers would
+    // collide on the (repo, subject, kind) index and silently drop one.
+    let mut issue_labeled_subscriber: Option<&str> = None;
     let mut workers = Vec::with_capacity(raw.workers.len());
     for w in &raw.workers {
         if !seen.insert(w.name.as_str()) {
@@ -130,11 +142,20 @@ pub fn parse(yaml: &str) -> Result<Config, ConfigError> {
         for raw_trigger in &w.on {
             let trigger = convert_trigger(&w.name, raw_trigger)?;
             // Manager-first: only the manager may be woken directly by a labelled issue.
-            if trigger == Trigger::IssueLabeled && w.role != Role::Manager {
-                return Err(ConfigError::NonManagerIssueLabeled {
-                    worker: w.name.clone(),
-                    role: w.role,
-                });
+            if trigger == Trigger::IssueLabeled {
+                if w.role != Role::Manager {
+                    return Err(ConfigError::NonManagerIssueLabeled {
+                        worker: w.name.clone(),
+                        role: w.role,
+                    });
+                }
+                if let Some(first) = issue_labeled_subscriber {
+                    return Err(ConfigError::MultipleIssueLabeledSubscribers {
+                        first: first.to_owned(),
+                        second: w.name.clone(),
+                    });
+                }
+                issue_labeled_subscriber = Some(&w.name);
             }
             triggers.push(trigger);
         }
@@ -199,18 +220,48 @@ fn convert_trigger(worker: &str, raw: &RawTrigger) -> Result<Trigger, ConfigErro
     }
 }
 
-/// Lightweight cron shape check: 5 (standard) or 6 (with seconds) whitespace-
-/// separated fields. Full expression validation lands with the scheduler (P2).
+/// Validate a worker's cron expression by fully parsing it (not just a shape
+/// check), so an unschedulable expression is rejected at config-apply time.
 fn validate_cron(worker: &str, cron: &str) -> Result<(), ConfigError> {
-    let fields = cron.split_whitespace().count();
-    if (5..=6).contains(&fields) {
-        Ok(())
-    } else {
-        Err(ConfigError::InvalidCron {
+    parse_cron_schedule(cron)
+        .map(|_| ())
+        .ok_or_else(|| ConfigError::InvalidCron {
             worker: worker.to_owned(),
             cron: cron.to_owned(),
         })
-    }
+}
+
+/// Parse a cron expression into a schedule. We accept standard 5-field Unix cron
+/// (`min hour dom mon dow`) by normalizing to the `cron` crate's 6-field form
+/// (`sec min hour dom mon dow`, seconds = 0); 6- and 7-field forms pass through.
+/// Returns `None` if the expression is unparseable.
+fn parse_cron_schedule(cron: &str) -> Option<cron::Schedule> {
+    let fields = cron.split_whitespace().count();
+    let normalized = if fields == 5 {
+        format!("0 {cron}")
+    } else {
+        cron.to_owned()
+    };
+    cron::Schedule::from_str(&normalized).ok()
+}
+
+/// The scheduled occurrences of `cron` in the half-open interval `(after, until]`
+/// (UTC). Used by the intake scheduler to find ticks due since the last fire.
+/// Bounded to avoid unbounded iteration on a pathological window.
+pub fn schedule_due_between(
+    cron: &str,
+    after: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> Result<Vec<DateTime<Utc>>, ConfigError> {
+    let schedule = parse_cron_schedule(cron).ok_or_else(|| ConfigError::InvalidCron {
+        worker: "<scheduler>".to_owned(),
+        cron: cron.to_owned(),
+    })?;
+    Ok(schedule
+        .after(&after)
+        .take_while(|dt| *dt <= until)
+        .take(1000)
+        .collect())
 }
 
 // ---- Raw (on-disk) shapes; converted to the validated types above. ----
@@ -283,8 +334,8 @@ struct RawWorker {
 // NOTE: `#[serde(untagged)]` cannot enforce `deny_unknown_fields` inside its
 // variants, so an extra key on a `{ schedule: "..." }` trigger (e.g.
 // `{ schedule: "...", typo: 1 }`) is silently ignored rather than rejected.
-// Low severity (the schedule value still round-trips); stricter trigger
-// validation is a P2 follow-up when the scheduler also adds full cron parsing.
+// Low severity (the schedule value still round-trips, and the cron string
+// itself is fully parsed/validated); rejecting the stray key is a later polish.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RawTrigger {
@@ -413,6 +464,36 @@ workers:
     }
 
     #[test]
+    fn rejects_out_of_range_cron_field() {
+        // Right shape (5 fields) but minute 99 is out of range — real parsing
+        // (not just a field-count check) must reject it.
+        let err = parse(
+            "version: 1\nworkers:\n  - name: c\n    role: coder\n    on:\n      - schedule: \"99 2 * * *\"\n",
+        );
+        assert!(matches!(err, Err(ConfigError::InvalidCron { .. })));
+    }
+
+    #[test]
+    fn schedule_due_between_finds_the_minute_boundary() {
+        use chrono::TimeZone;
+        // Every day at 02:00 UTC. A window spanning 01:59→02:01 contains exactly
+        // the 02:00 tick; a window before it contains none.
+        let before = Utc.with_ymd_and_hms(2026, 1, 1, 1, 59, 0).unwrap();
+        let after = Utc.with_ymd_and_hms(2026, 1, 1, 2, 1, 0).unwrap();
+        let due = schedule_due_between("0 2 * * *", before, after).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0], Utc.with_ymd_and_hms(2026, 1, 1, 2, 0, 0).unwrap());
+
+        let none = schedule_due_between(
+            "0 2 * * *",
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap(),
+        )
+        .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
     fn enforces_manager_first() {
         // A coder subscribed to issue_labeled is rejected.
         let err =
@@ -421,6 +502,20 @@ workers:
             err,
             Err(ConfigError::NonManagerIssueLabeled { worker, role })
                 if worker == "c" && role == Role::Coder
+        ));
+    }
+
+    #[test]
+    fn rejects_multiple_issue_labeled_subscribers() {
+        // Two managers both on issue_labeled would collide on the work-item index
+        // and silently drop one — reject at validation.
+        let err = parse(
+            "version: 1\nworkers:\n  - name: m1\n    role: manager\n    on: [issue_labeled]\n  - name: m2\n    role: manager\n    on: [issue_labeled]\n",
+        );
+        assert!(matches!(
+            err,
+            Err(ConfigError::MultipleIssueLabeledSubscribers { first, second })
+                if first == "m1" && second == "m2"
         ));
     }
 

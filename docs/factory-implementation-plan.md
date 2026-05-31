@@ -71,20 +71,25 @@
 **Goal:** real events flow in, gated by opt-in.
 
 **Tasks**
-- `libs/github` (octocrab): App auth, mint short-lived **installation tokens**, webhook **HMAC verification**, typed events (issue labelled, CR opened/updated, review, **issue_comment**), Checks/PR read APIs.
-- `services/intake` (Axum): verify signature → dedupe on delivery id → filter by opt-in `label` → enqueue `work_item` (pinning current `config_sha`). Fast 2xx; all work async off the queue.
-- **Enqueue policy — manager-first.** On `issue_labeled`, Intake enqueues a single **Manager** work item; coders/reviewers/testers are woken downstream by the Manager (`manager` trigger) or by their own CR/comment triggers — never by `issue_labeled` directly. (This resolves the spec's config-vs-worked-example ambiguity; P0 config validation enforces it.)
-- `services/intake` scheduler loop: read each repo's config timers, advisory-lock the tick, enqueue due `schedule` work.
-- **blocked→queued transition:** an `issue_comment` on a tracked blocked item flips it to `queued` (`available_at=now()`).
+- `libs/github` (**inbound**): webhook **HMAC verification** (constant-time) + typed events — issue labelled, CR opened/updated, `review_requested`, `pull_request_review` → changes-requested, **issue_comment**, push. *(Done.)*
+- `services/intake` (Axum): verify signature → reject requests missing the GitHub identity headers → dedupe on delivery id → filter by opt-in `label` → enqueue `work_item` (pinning current `config_sha`). Fast 2xx; all work async off the queue. **Lost-event-safe:** a delivery id is recorded only *after* successful processing, and "not ready" outcomes (repo not connected / no config) are left unrecorded so a GitHub redelivery re-drives them. Every ingest writes an `events` audit row. *(Done.)*
+- **Enqueue policy — manager-first.** On `issue_labeled`, Intake enqueues a single **Manager** work item; coders/reviewers/testers are woken downstream by the Manager (`manager` trigger) or by their own CR/comment triggers — never by `issue_labeled` directly. (This resolves the spec's config-vs-worked-example ambiguity; P0 config validation enforces it.) *(Done.)*
+- `services/intake` scheduler loop: full cron parsing (`libs/config`), read each repo's config timers, and fire due `schedule` work **exactly once across replicas** via a per-`(repo,worker)` advisory lock that re-checks `schedule_state.last_fired` (work-item idempotency is the backstop). *(Done.)*
+- **blocked→queued transition:** an `issue_comment` on a tracked blocked item flips it to `queued` (`available_at=now()`). *(Done.)*
+- Resolve only **active** repos (suspended/removed never produce work); `webhook_deliveries` retention purge helper (the dedupe table is load-bearing, so it must be prunable). *(Done.)*
 
-**Tests:** signature reject/accept; dedupe (redelivered webhook → one row); label gating (unlabelled → nothing); scheduler fires once across replicas; comment-on-blocked → requeued.
-**Exit:** a labelled issue (via a webhook fixture) creates exactly one Manager `work_item`. **Depends on:** P1.
+- **Carried to P3 (outbound GitHub — no consumer until the worker/Tools exist, and needs live App credentials to test):** `libs/github` (octocrab) App auth, short-lived **installation-token** minting, and **Checks/PR read APIs**; **config-auto-reload-on-push** (fetching `.factory/config.yml` content on a push that touches it, then calling `apply_config`). The validate-and-store unit (`apply_config`) and push-path detection (`Push` carries `touched_paths`) are built and tested now; only the *authenticated file fetch* is deferred to P3 where the App client lands.
+
+**Tests:** signature reject/accept; missing-header reject; dedupe (redelivered webhook → one row); **lost-event redrive** (unknown-repo delivery isn't burned; after the repo connects, the redelivery enqueues); label gating (unlabelled → nothing); CR-opened / review-changes-requested enqueue; scheduler **fires once across replicas** (+ stale-slot never re-fires); comment-on-blocked → requeued; active-only repo resolution; deliveries purge. *(All implemented and green against Postgres.)*
+**Exit:** a labelled issue (via a webhook fixture) creates exactly one Manager `work_item`. **Depends on:** P1. ✅ **met.**
 
 ## P3 — Vertical slice: Dispatcher + Worker + minimal Tools (Coder → CR)
 
 **Goal:** the first real Coder→CR run, locally — proving the worker / dispatcher / Tools / Claude-Code integration. Crude but real. (Full end-to-end *from a labelled issue* arrives in P4, once the Manager exists.)
 
 **Tasks**
+- `libs/github` (**outbound**, carried from P2): octocrab App auth, short-lived **installation-token** minting, **Checks/PR read APIs**. First real consumers are the worker (clone token) and Tools (posting to GitHub); needs the dev App's private key to test against GitHub.
+- **Config-auto-reload-on-push** (carried from P2): on a push touching `.factory/config.yml`, fetch the file content via the installation token and call the existing `apply_config`. (Detection + validate/store already exist; this wires the authenticated fetch.)
 - `services/tools` (MCP server, HTTP/SSE) — **minimal surface:** `get_task`, `read_issue`, `open_or_update_change_request`, `post_comment`, `append_transcript`, `record_outcome`, `heartbeat`. Per-task token auth; every call → `events`.
 - `services/dispatcher`: lease → launch a worker (local Docker container in dev) with the per-task token + Tools URL.
 - `services/worker` harness: mint installation token → **fresh shallow clone** → launch **Claude Code headless** with the composed prompt + Factory MCP configured → on finish, `open_or_update_change_request` (idempotent) + `record_outcome`; push branch via `--force-with-lease`.
