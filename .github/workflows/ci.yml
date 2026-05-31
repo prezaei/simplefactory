@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (warnings = errors)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        # Compiles the full E2E acceptance suite (ignored stubs run as skipped,
+        # so the contract list can't silently rot) and runs all active tests.
+        # DB-backed tests skip cleanly here (no DATABASE_URL); the integration
+        # job below runs them against Postgres.
+        run: cargo test --all
+
+  integration:
+    name: integration (Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: factory
+          POSTGRES_PASSWORD: factory
+          POSTGRES_DB: factory
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U factory -d factory"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://factory:factory@localhost:5432/factory?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Migration gate (activated in P1+, when migrations/ has content):
+      # - run: cargo install sqlx-cli --no-default-features --features native-tls,postgres
+      # - run: cargo sqlx migrate run
+      - name: Integration tests
+        run: cargo test --all
