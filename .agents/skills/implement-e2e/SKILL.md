@@ -38,12 +38,13 @@ names used here.
    user did not ask for* — that is a different PR; name it explicitly and get the user's nod rather than
    silently folding it in or silently dropping the finding. When unsure which side a finding is on, treat
    it as a defect and fix it.
-2. **Green gate between every change.** After any code change, run the repo's full quality gates from
-   `AGENTS.md` → PR Quality Checklist (in THIS repo that is `cargo fmt --check`,
-   `cargo clippy --locked -- -D warnings`, `cargo test --locked --all`; in another repo use whatever that
-   repo's checklist defines). Run the **FULL** test suite and confirm **ZERO failures** — read the actual
-   failure count, do not just eyeball that some suites said "ok". If anything is red, fix it before moving
-   on. (For a change with no executable code — see Applicability — the code gates are N/A; say so.)
+2. **Green gate between every change.** After any code change, run the repo's full quality gates
+   **exactly as `AGENTS.md` → PR Quality Checklist lists them** — copy the commands from AGENTS.md rather
+   than paraphrasing here, so this skill can never drift from the repo's actual gate (in THIS repo, at the
+   time of writing: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo build` — but
+   AGENTS.md wins if it has changed). Run the **FULL** test suite and confirm **ZERO failures** — read the
+   actual failure count, do not just eyeball that some suites said "ok". If anything is red, fix it before
+   moving on. (For a change with no executable code — see Applicability — the code gates are N/A; say so.)
 3. **Hunt flakes, don't tolerate them.** If a test fails in the full run but passes in isolation, it is
    a real defect (usually shared-state/ordering/timing). Root-cause and fix it; re-run the full suite
    2–3× to confirm stability. A flake that "usually passes" is a bug that ships.
@@ -150,8 +151,10 @@ On each ship-it iteration (cron-fired), the loop must:
    and let the cron loop again.
 5. **Merge** (squash, via the REST API so it is worktree-safe) only when the exit condition holds.
 
-**Exit condition (all must hold for the current HEAD):** CI green for the exact HEAD SHA (every required
-check SUCCESS/NEUTRAL/SKIPPED) · PR `MERGEABLE` · Copilot reviewed the **current** HEAD and every comment
+**Exit condition (all must hold for the current HEAD):** CI green for the exact HEAD SHA — **every** CI
+check SUCCESS/NEUTRAL/SKIPPED, not only the branch-required subset (per `AGENTS.md` "all CI checks must
+pass before merge"; if branch protection lists fewer, enforce the full set, e.g. via `/ship-it
+--required-checks`) · PR `MERGEABLE` · Copilot reviewed the **current** HEAD and every comment
 triaged · your own `/code-review` on the latest changes clean · no fix outstanding or deferred.
 
 **Bound + escalation (don't loop forever):** cap the loop (use `/ship-it --max-rounds`, default ~20) and
