@@ -126,49 +126,18 @@ async fn process(
                 enqueued_or_ignored(n)
             }
         }
-        WebhookEvent::CrOpened { number, .. } => {
-            cr_enqueue(
-                pool,
-                rc.id,
-                &config,
-                &config_sha,
-                Trigger::CrOpened,
-                *number,
-            )
-            .await?
-        }
-        WebhookEvent::CrUpdated { number, .. } => {
-            cr_enqueue(
-                pool,
-                rc.id,
-                &config,
-                &config_sha,
-                Trigger::CrUpdated,
-                *number,
-            )
-            .await?
-        }
-        WebhookEvent::CrChangesRequested { number, .. } => {
-            cr_enqueue(
-                pool,
-                rc.id,
-                &config,
-                &config_sha,
-                Trigger::CrChangesRequested,
-                *number,
-            )
-            .await?
-        }
-        WebhookEvent::ReviewRequested { number, .. } => {
-            cr_enqueue(
-                pool,
-                rc.id,
-                &config,
-                &config_sha,
-                Trigger::ReviewRequested,
-                *number,
-            )
-            .await?
+        // CR-keyed triggers: same shape, differing only in the Trigger variant.
+        WebhookEvent::CrOpened { number, .. }
+        | WebhookEvent::CrUpdated { number, .. }
+        | WebhookEvent::CrChangesRequested { number, .. }
+        | WebhookEvent::ReviewRequested { number, .. } => {
+            let trigger = match event {
+                WebhookEvent::CrOpened { .. } => Trigger::CrOpened,
+                WebhookEvent::CrUpdated { .. } => Trigger::CrUpdated,
+                WebhookEvent::CrChangesRequested { .. } => Trigger::CrChangesRequested,
+                _ => Trigger::ReviewRequested,
+            };
+            cr_enqueue(pool, rc.id, &config, &config_sha, trigger, *number).await?
         }
         WebhookEvent::IssueComment { subject, .. } => {
             // A human reply resumes any blocked work on this subject.

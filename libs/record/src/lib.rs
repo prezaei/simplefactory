@@ -1079,19 +1079,6 @@ pub struct RepoIdent {
     pub installation_id: i64,
 }
 
-/// Fetch a repo's stored config snapshot by id, if any. The Tools service uses
-/// this to compose a worker's prompt from the repo's `.factory/config.yml`.
-pub async fn repo_config_by_id(pool: &Pool, id: Uuid) -> Result<Option<serde_json::Value>> {
-    let row = sqlx::query("SELECT config FROM repos WHERE id = $1")
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(match row {
-        Some(r) => r.try_get::<Option<serde_json::Value>, _>("config")?,
-        None => None,
-    })
-}
-
 /// Fetch a repo's identity by id.
 pub async fn repo_by_id(pool: &Pool, id: Uuid) -> Result<Option<RepoIdent>> {
     let row = sqlx::query("SELECT id, owner, name, installation_id FROM repos WHERE id = $1")
@@ -1105,6 +1092,32 @@ pub async fn repo_by_id(pool: &Pool, id: Uuid) -> Result<Option<RepoIdent>> {
             name: r.try_get("name")?,
             installation_id: r.try_get("installation_id")?,
         }),
+        None => None,
+    })
+}
+
+/// Fetch a repo's identity AND its stored config snapshot in a single SELECT. The
+/// Tools `get_task` call needs both (config to compose the prompt, identity to make
+/// GitHub calls) and uses this to avoid loading the same row twice.
+pub async fn repo_by_id_with_config(
+    pool: &Pool,
+    id: Uuid,
+) -> Result<Option<(RepoIdent, Option<serde_json::Value>)>> {
+    let row =
+        sqlx::query("SELECT id, owner, name, installation_id, config FROM repos WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(match row {
+        Some(r) => Some((
+            RepoIdent {
+                id: r.try_get("id")?,
+                owner: r.try_get("owner")?,
+                name: r.try_get("name")?,
+                installation_id: r.try_get("installation_id")?,
+            },
+            r.try_get::<Option<serde_json::Value>, _>("config")?,
+        )),
         None => None,
     })
 }

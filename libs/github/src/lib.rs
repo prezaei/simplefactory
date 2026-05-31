@@ -65,6 +65,31 @@ impl Subject {
     }
 }
 
+/// Parse a `subject_ref` string (the inverse of [`Subject::as_ref_string`]):
+/// `issue#N` → [`Subject::Issue`], `cr#N` → [`Subject::ChangeRequest`]. Any other
+/// form (e.g. a schedule subject) or a non-numeric suffix is an error.
+impl std::str::FromStr for Subject {
+    type Err = SubjectParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(n) = s.strip_prefix("issue#") {
+            return n.parse().map(Subject::Issue).map_err(|_| SubjectParseError);
+        }
+        if let Some(n) = s.strip_prefix("cr#") {
+            return n
+                .parse()
+                .map(Subject::ChangeRequest)
+                .map_err(|_| SubjectParseError);
+        }
+        Err(SubjectParseError)
+    }
+}
+
+/// A `subject_ref` string did not match the `issue#N` / `cr#N` scheme.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("subject must be 'issue#N' or 'cr#N'")]
+pub struct SubjectParseError;
+
 /// The webhook events Factory acts on (everything else parses to `Other`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebhookEvent {
@@ -448,5 +473,19 @@ mod tests {
     fn subject_ref_strings() {
         assert_eq!(Subject::Issue(3).as_ref_string(), "issue#3");
         assert_eq!(Subject::ChangeRequest(8).as_ref_string(), "cr#8");
+    }
+
+    #[test]
+    fn subject_from_str_roundtrips_and_rejects_other() {
+        use std::str::FromStr;
+        assert_eq!(Subject::from_str("issue#7"), Ok(Subject::Issue(7)));
+        assert_eq!(Subject::from_str("cr#42"), Ok(Subject::ChangeRequest(42)));
+        // Roundtrip against as_ref_string for both variants.
+        for s in [Subject::Issue(3), Subject::ChangeRequest(8)] {
+            assert_eq!(Subject::from_str(&s.as_ref_string()), Ok(s));
+        }
+        assert!(Subject::from_str("schedule@manager@x").is_err());
+        assert!(Subject::from_str("issue#notanumber").is_err());
+        assert!(Subject::from_str("pr/9").is_err());
     }
 }

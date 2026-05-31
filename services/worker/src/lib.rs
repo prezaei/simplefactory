@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 /// What the worker needs to know about the task it was leased.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskInfo {
-    /// The agent role to run as (e.g. `engineer`, `reviewer`).
+    /// The agent role to run as (one of `manager`, `coder`, `reviewer`, `tester`).
     pub role: String,
     /// Opaque reference to the subject of the task (issue, CR, etc.).
     pub subject_ref: String,

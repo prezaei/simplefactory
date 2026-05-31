@@ -11,11 +11,12 @@
 
 pub mod mcp;
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use factory_blob::TranscriptStore;
 use factory_github::{
-    CheckRef, CommentTarget, GitHubClient, OpenPrRequest, RepoRef, ReviewVerdict,
+    CheckRef, CommentTarget, GitHubClient, OpenPrRequest, RepoRef, ReviewVerdict, Subject,
 };
 use factory_record::{self as record, AttemptStatus, IdempotencyClaim, State, TaskAuth};
 use serde_json::{json, Value};
@@ -223,9 +224,20 @@ pub async fn get_task(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
         .await?
         .ok_or_else(|| anyhow::anyhow!("work item {} not found", auth.work_item_id))?;
 
+    // Load the repo row ONCE: its config composes the prompt, its identity makes the
+    // GitHub calls below. (Both used to load this same row separately.)
+    let (repo_ident, repo_config) = record::repo_by_id_with_config(&state.pool, auth.repo_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repo {} not found", auth.repo_id))?;
+    let repo = RepoRef {
+        owner: repo_ident.owner,
+        name: repo_ident.name,
+        installation_id: repo_ident.installation_id,
+    };
+
     // Compose the worker's prompt from the repo's stored config: the built-in role
     // default, then the repo-wide instructions, then the matching worker's.
-    let prompt = compose_prompt(state, auth, &item).await?;
+    let prompt = compose_prompt(auth, &item, repo_config);
 
     // Deterministic head branch from the subject so a re-dispatch pushes the SAME
     // branch (idempotent CR). e.g. `issue#7` -> `factory/issue-7`.
@@ -243,9 +255,8 @@ pub async fn get_task(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
         "prompt": prompt,
     });
 
-    match parse_subject(&item.subject_ref) {
-        Some(Subject::Issue(n)) => {
-            let repo = resolve_repo(state, auth).await?;
+    match Subject::from_str(&item.subject_ref) {
+        Ok(Subject::Issue(n)) => {
             let issue = state.gh.read_issue(&repo, n).await?;
             out["subject"] = json!({
                 "type": "issue",
@@ -255,8 +266,7 @@ pub async fn get_task(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
                 "comments": issue.comments,
             });
         }
-        Some(Subject::ChangeRequest(n)) => {
-            let repo = resolve_repo(state, auth).await?;
+        Ok(Subject::ChangeRequest(n)) => {
             let cr = state.gh.read_change_request(&repo, n).await?;
             out["subject"] = json!({
                 "type": "change_request",
@@ -268,7 +278,7 @@ pub async fn get_task(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
                 "checks": check_summary_json(&cr.checks),
             });
         }
-        None => {
+        Err(_) => {
             // Schedule / other subjects carry no GitHub object; the subject_ref
             // string above is the whole answer.
             tracing::info!(subject = %item.subject_ref, "get_task: non-GitHub subject");
@@ -385,43 +395,36 @@ pub async fn post_comment(
         return Ok(json!({ "comment_id": comment_id }));
     };
 
-    match record::idempotency_claim(&state.pool, auth.work_item_id, "comment", key).await? {
-        IdempotencyClaim::Done(v) => {
+    idempotent(
+        state,
+        auth,
+        "comment",
+        key,
+        "a comment for this task is already in progress",
+        || async {
+            let comment_id = state
+                .gh
+                .post_comment(&repo, comment_target, body)
+                .await
+                .map_err(ToolError::Internal)?;
+            tracing::info!(work_item = %auth.work_item_id, ?target, "post_comment");
+            Ok(json!({ "comment_id": comment_id }))
+        },
+        |stored| async {
             // Spec: a re-run with the same dedupe_key UPDATES the same comment rather
             // than suppressing the new body. Parse the stored comment id and update it
             // in place; return the original (stable) result so the comment id is
             // unchanged across re-runs.
-            if let Some(comment_id) = v.get("comment_id").and_then(Value::as_i64) {
+            if let Some(comment_id) = stored.get("comment_id").and_then(Value::as_i64) {
                 state.gh.update_comment(&repo, comment_id, body).await?;
                 tracing::info!(work_item = %auth.work_item_id, comment_id, "post_comment: updated existing comment on re-run");
             } else {
                 tracing::warn!(work_item = %auth.work_item_id, dedupe_key = key, "post_comment: stored result has no comment_id; cannot update");
             }
-            Ok(v)
-        }
-        IdempotencyClaim::Pending => {
-            tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "post_comment: claim pending; ask caller to retry");
-            Err(ToolError::Internal(anyhow::anyhow!(
-                "a comment for this task is already in progress"
-            )))
-        }
-        IdempotencyClaim::Won => {
-            let comment_id = match state.gh.post_comment(&repo, comment_target, body).await {
-                Ok(id) => id,
-                Err(e) => {
-                    // The side effect failed: release the claim so the next retry can
-                    // re-claim immediately rather than waiting out the stale window.
-                    release_claim(state, auth, "comment", key).await;
-                    return Err(ToolError::Internal(e));
-                }
-            };
-            let result = json!({ "comment_id": comment_id });
-            record::idempotency_complete(&state.pool, auth.work_item_id, "comment", key, &result)
-                .await?;
-            tracing::info!(work_item = %auth.work_item_id, ?target, "post_comment");
-            Ok(result)
-        }
-    }
+            Ok(stored)
+        },
+    )
+    .await
 }
 
 /// Submit a review verdict on a change request. Idempotent by `dedupe_key` under
@@ -450,38 +453,27 @@ pub async fn submit_review(
         return Ok(json!({ "review_id": review_id }));
     };
 
-    match record::idempotency_claim(&state.pool, auth.work_item_id, "review", key).await? {
-        IdempotencyClaim::Done(v) => {
-            tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "submit_review: deduped (no-op)");
-            Ok(v)
-        }
-        IdempotencyClaim::Pending => {
-            tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "submit_review: claim pending; ask caller to retry");
-            Err(ToolError::Internal(anyhow::anyhow!(
-                "a review for this task is already in progress"
-            )))
-        }
-        IdempotencyClaim::Won => {
-            let review_id = match state
+    idempotent(
+        state,
+        auth,
+        "review",
+        key,
+        "a review for this task is already in progress",
+        || async {
+            let review_id = state
                 .gh
                 .submit_review(&repo, cr_number, verdict, body)
                 .await
-            {
-                Ok(id) => id,
-                Err(e) => {
-                    // Side effect failed: release the claim so the next retry re-claims
-                    // immediately rather than waiting out the stale window.
-                    release_claim(state, auth, "review", key).await;
-                    return Err(ToolError::Internal(e));
-                }
-            };
-            let result = json!({ "review_id": review_id });
-            record::idempotency_complete(&state.pool, auth.work_item_id, "review", key, &result)
-                .await?;
+                .map_err(ToolError::Internal)?;
             tracing::info!(work_item = %auth.work_item_id, cr_number, verdict = verdict.as_str(), "submit_review");
-            Ok(result)
-        }
-    }
+            Ok(json!({ "review_id": review_id }))
+        },
+        |stored| async {
+            tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "submit_review: deduped (no-op)");
+            Ok(stored)
+        },
+    )
+    .await
 }
 
 /// Read required-check status for either a CR number or an explicit sha. Exactly
@@ -593,35 +585,23 @@ pub async fn escalate(
     // per-task constant so escalate is idempotent per work item by default.
     let key = dedupe_key.unwrap_or(ESCALATE_DEFAULT_KEY);
 
-    match record::idempotency_claim(&state.pool, auth.work_item_id, "escalate", key).await? {
-        IdempotencyClaim::Done(v) => {
-            tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "escalate: deduped (no-op)");
-            return Ok(v);
-        }
-        IdempotencyClaim::Pending => {
-            tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "escalate: claim pending; ask caller to retry");
-            return Err(ToolError::Internal(anyhow::anyhow!(
-                "an escalate for this task is already in progress"
-            )));
-        }
-        IdempotencyClaim::Won => {}
-    }
-
-    // The claim is won; from here any failure before idempotency_complete must
-    // release the placeholder so the next retry re-claims immediately. Run the body
-    // in a helper and release on Err.
-    match escalate_won(state, auth, reason, context).await {
-        Ok(result) => {
-            record::idempotency_complete(&state.pool, auth.work_item_id, "escalate", key, &result)
-                .await?;
+    idempotent(
+        state,
+        auth,
+        "escalate",
+        key,
+        "an escalate for this task is already in progress",
+        || async {
+            let result = escalate_won(state, auth, reason, context).await?;
             tracing::info!(work_item = %auth.work_item_id, reason, "escalate");
             Ok(result)
-        }
-        Err(e) => {
-            release_claim(state, auth, "escalate", key).await;
-            Err(e)
-        }
-    }
+        },
+        |stored| async {
+            tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "escalate: deduped (no-op)");
+            Ok(stored)
+        },
+    )
+    .await
 }
 
 /// The side-effecting body of [`escalate`], run only by the claim winner. Records
@@ -703,15 +683,12 @@ fn role_default_prompt(role: record::Kind) -> &'static str {
 
 /// Compose the worker's effective prompt: role default → repo-wide
 /// (`settings.instructions`) → the matching worker's instructions. Missing config
-/// layers are skipped; the role default is always present.
-async fn compose_prompt(
-    state: &ToolsState,
-    auth: &TaskAuth,
-    item: &record::WorkItem,
-) -> anyhow::Result<String> {
+/// layers are skipped; the role default is always present. Takes the repo's
+/// already-loaded config snapshot (see [`get_task`]) so it never re-queries the row.
+fn compose_prompt(auth: &TaskAuth, item: &record::WorkItem, repo_config: Option<Value>) -> String {
     let role_default = role_default_prompt(item.kind);
 
-    let cfg = match record::repo_config_by_id(&state.pool, auth.repo_id).await? {
+    let cfg = match repo_config {
         Some(value) => match serde_json::from_value::<factory_config::Config>(value) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -735,11 +712,7 @@ async fn compose_prompt(
             .and_then(|w| w.instructions.as_deref())
     });
 
-    Ok(factory_config::resolve_prompt(
-        role_default,
-        repo_wide,
-        worker,
-    ))
+    factory_config::resolve_prompt(role_default, repo_wide, worker)
 }
 
 /// The transcript object URI for a task. Derived solely from the work item id so a
@@ -761,41 +734,27 @@ async fn resolve_repo(state: &ToolsState, auth: &TaskAuth) -> anyhow::Result<Rep
     })
 }
 
-/// A parsed `subject_ref`.
-enum Subject {
-    Issue(i64),
-    ChangeRequest(i64),
-}
-
-/// Parse a `subject_ref` like `issue#12` / `cr#34`. Other forms (e.g. schedule
-/// subjects) return `None`.
-fn parse_subject(subject_ref: &str) -> Option<Subject> {
-    if let Some(n) = subject_ref.strip_prefix("issue#") {
-        return n.parse().ok().map(Subject::Issue);
+/// Map a [`Subject`] to its [`CommentTarget`].
+fn subject_to_comment_target(subject: Subject) -> CommentTarget {
+    match subject {
+        Subject::Issue(n) => CommentTarget::Issue(n),
+        Subject::ChangeRequest(n) => CommentTarget::ChangeRequest(n),
     }
-    if let Some(n) = subject_ref.strip_prefix("cr#") {
-        return n.parse().ok().map(Subject::ChangeRequest);
-    }
-    None
 }
 
 /// Map a `subject_ref` to the comment target used for escalation questions.
 fn subject_comment_target(subject_ref: &str) -> Option<CommentTarget> {
-    match parse_subject(subject_ref)? {
-        Subject::Issue(n) => Some(CommentTarget::Issue(n)),
-        Subject::ChangeRequest(n) => Some(CommentTarget::ChangeRequest(n)),
-    }
+    Subject::from_str(subject_ref)
+        .ok()
+        .map(subject_to_comment_target)
 }
 
 /// Parse a `post_comment` target argument (`issue#N` / `cr#N`). An unparseable
 /// target is a bad request (HTTP 400).
 fn parse_comment_target(target: &str) -> std::result::Result<CommentTarget, ToolError> {
-    parse_subject(target)
-        .map(|s| match s {
-            Subject::Issue(n) => CommentTarget::Issue(n),
-            Subject::ChangeRequest(n) => CommentTarget::ChangeRequest(n),
-        })
-        .ok_or_else(|| {
+    Subject::from_str(target)
+        .map(subject_to_comment_target)
+        .map_err(|_| {
             ToolError::BadRequest(format!(
                 "post_comment: target must be 'issue#N' or 'cr#N', got {target:?}"
             ))
@@ -829,6 +788,57 @@ fn parse_outcome(status: &str) -> std::result::Result<(AttemptStatus, State), To
             )))
         }
     })
+}
+
+/// The shared claim→side-effect→complete / release-on-error idempotency state
+/// machine used by `post_comment`, `submit_review`, and `escalate`. Routes the claim
+/// outcome:
+///
+/// - **`Won`** (this caller owns the slot): run `run` (the side effect); on `Err`
+///   best-effort [`release_claim`] the slot so the next retry re-claims immediately,
+///   then propagate the error; on `Ok(result)` record it with `idempotency_complete`
+///   and return it.
+/// - **`Pending`** (a concurrent caller holds the slot): return the in-progress
+///   error so the caller retries — message and variant are caller-supplied so each
+///   tool keeps its exact wording.
+/// - **`Done(stored)`** (the slot already has a result): run `on_redo(&stored)`
+///   (post_comment updates the existing comment; the others pass a no-op) and return
+///   the stored result unchanged.
+///
+/// `run` is only ever invoked once, by the single claim winner — exactly-once.
+async fn idempotent<RunFut, RedoFut>(
+    state: &ToolsState,
+    auth: &TaskAuth,
+    scope: &str,
+    key: &str,
+    in_progress_msg: &str,
+    run: impl FnOnce() -> RunFut,
+    on_redo: impl FnOnce(Value) -> RedoFut,
+) -> ToolResult
+where
+    RunFut: std::future::Future<Output = ToolResult>,
+    RedoFut: std::future::Future<Output = ToolResult>,
+{
+    match record::idempotency_claim(&state.pool, auth.work_item_id, scope, key).await? {
+        IdempotencyClaim::Done(stored) => on_redo(stored).await,
+        IdempotencyClaim::Pending => {
+            tracing::info!(work_item = %auth.work_item_id, scope, dedupe_key = key, "idempotency: claim pending; ask caller to retry");
+            Err(ToolError::Internal(anyhow::anyhow!("{in_progress_msg}")))
+        }
+        IdempotencyClaim::Won => match run().await {
+            Ok(result) => {
+                record::idempotency_complete(&state.pool, auth.work_item_id, scope, key, &result)
+                    .await?;
+                Ok(result)
+            }
+            Err(e) => {
+                // Side effect failed: release the claim so the next retry re-claims
+                // immediately rather than waiting out the stale window.
+                release_claim(state, auth, scope, key).await;
+                Err(e)
+            }
+        },
+    }
 }
 
 /// Best-effort release of an idempotency claim whose side effect failed. Logs on
@@ -1073,17 +1083,6 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_subject_handles_issue_cr_and_other() {
-        assert!(matches!(parse_subject("issue#7"), Some(Subject::Issue(7))));
-        assert!(matches!(
-            parse_subject("cr#42"),
-            Some(Subject::ChangeRequest(42))
-        ));
-        assert!(parse_subject("schedule@manager@x").is_none());
-        assert!(parse_subject("issue#notanumber").is_none());
-    }
 
     #[test]
     fn tool_parse_roundtrips_every_variant() {
