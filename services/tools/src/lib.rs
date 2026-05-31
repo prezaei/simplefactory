@@ -446,17 +446,40 @@ pub async fn post_comment(
             // the stored result; the Done branch of `idempotent` does not re-store on its
             // own, so we do it here.)
             //
-            // BEST-EFFORT: the GitHub update already succeeded, so this re-persist must
-            // NOT propagate (a `?` here would return a tool error AFTER the write, prompting
-            // the caller to retry → re-run `update_comment` → the exact clobber we're
-            // preventing). On failure we log and still return success; worst case a later
-            // identical re-dispatch does one redundant update, never a lost write.
+            // BEST-EFFORT with bounded retries (mirrors the main `idempotent` Won-branch
+            // pattern): the GitHub update already succeeded, so this re-persist must NOT
+            // propagate (a `?` here would return a tool error AFTER the write, prompting the
+            // caller to retry → re-run `update_comment` → the exact clobber we're preventing).
+            // We retry a few times with a yield to ride out a transient DB blip and shrink
+            // the staleness window, then give up. RESIDUAL RISK if every attempt fails: the
+            // stored body stays at its previous value, so a LATER identical re-dispatch sees
+            // a mismatch and re-PUTs once — which can overwrite a human edit made in between.
+            // That window is the irreducible cost of returning success after the GitHub write
+            // (the alternative — propagating — causes the immediate clobber-retry instead).
             let updated = json!({ "comment_id": comment_id, "body": body });
-            if let Err(e) =
-                record::idempotency_complete(&state.pool, auth.work_item_id, "comment", key, &updated)
-                    .await
-            {
-                tracing::warn!(work_item = %auth.work_item_id, comment_id, error = %e, "post_comment: failed to re-persist updated body (best-effort); a later identical re-dispatch may do one redundant update");
+            let mut persisted = false;
+            for attempt in 1..=IDEMPOTENCY_COMPLETE_ATTEMPTS {
+                match record::idempotency_complete(
+                    &state.pool,
+                    auth.work_item_id,
+                    "comment",
+                    key,
+                    &updated,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        persisted = true;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(work_item = %auth.work_item_id, comment_id, attempt, error = %e, "post_comment: re-persist of updated body failed; retrying");
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+            if !persisted {
+                tracing::warn!(work_item = %auth.work_item_id, comment_id, attempts = IDEMPOTENCY_COMPLETE_ATTEMPTS, "post_comment: could not re-persist updated body after retries; stored body is stale, so a later identical re-dispatch may re-PUT and overwrite a human edit");
             }
             Ok(updated)
         },
