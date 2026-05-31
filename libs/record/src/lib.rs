@@ -159,6 +159,12 @@ pub struct WorkItem {
     pub config_sha: String,
     pub lease_owner: Option<String>,
     pub lease_expires_at: Option<DateTime<Utc>>,
+    /// When the row last changed. For a TERMINAL item this is when it became terminal
+    /// (`record_outcome`/`set_state` stamp `updated_at = now()` on the transition) and
+    /// it is NOT touched by the coordinator's defer path (a defer does not claim the
+    /// item, so nothing writes the row). It is therefore a stable "review completed at"
+    /// anchor the coordinator's bounded-defer grace window is measured from (FIX 4).
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Parameters for a single lease attempt.
@@ -313,7 +319,7 @@ pub async fn lease_next(pool: &Pool, req: &LeaseRequest) -> Result<Option<WorkIt
            FROM next WHERE w.id = next.id
          RETURNING w.id, w.repo_id, w.kind, w.worker_name, w.trigger, w.subject_ref,
                    w.correlation_id, w.state, w.attempt_count, w.loop_count, w.config_sha,
-                   w.lease_owner, w.lease_expires_at",
+                   w.lease_owner, w.lease_expires_at, w.updated_at",
     )
     .bind(req.repo_id)
     .bind(&req.worker_name)
@@ -864,9 +870,21 @@ pub struct ChangeRequest {
     pub factory_state: String,
 }
 
-/// Idempotent-by-work-item CR row. The first call for a work item creates the row
-/// (number stays NULL until the worker opens it on GitHub); a re-dispatch returns
-/// the SAME row, so the CR is never duplicated.
+/// Idempotent-by-head-branch CR row. The CR identity is `(repo_id, head_branch)`
+/// (one CR per branch, deterministic per issue: `factory/issue-N`), NOT the work
+/// item — so the rework loop reuses the same CR row across coder work items. The
+/// first call for a branch creates the row (number stays NULL until the worker opens
+/// it on GitHub); a re-dispatch OR a later REWORK coder pushing the same branch
+/// re-points `work_item_id` to the CURRENT owning coder (preserving the CR number),
+/// so the CR is never duplicated and never collides on `UNIQUE(repo_id, number)`.
+/// `linked_issue` is preserved if the new caller does not supply one.
+///
+/// INVARIANT (see also [`change_request_for_item`]): `work_item_id` on a CR row is "the
+/// most recent coder to own the branch", re-pointed on every rework push — it is NOT a
+/// stable link to the coder that first opened the CR. This is safe because a succeeded
+/// coder is always reacted (in-tx, waking its reviewer) BEFORE any rework coder for the
+/// same issue is enqueued, so the coordinator's by-`work_item_id` CR lookup for a
+/// succeeded coder is never stranded by a later rework coder re-pointing the row.
 pub async fn upsert_change_request_for_item(
     pool: &Pool,
     repo_id: Uuid,
@@ -877,8 +895,10 @@ pub async fn upsert_change_request_for_item(
     let row = sqlx::query(
         "INSERT INTO change_requests (id, repo_id, work_item_id, head_branch, linked_issue)
          VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (work_item_id) WHERE work_item_id IS NOT NULL
-           DO UPDATE SET head_branch = EXCLUDED.head_branch, updated_at = now()
+         ON CONFLICT (repo_id, head_branch)
+           DO UPDATE SET work_item_id = EXCLUDED.work_item_id,
+                         linked_issue = COALESCE(EXCLUDED.linked_issue, change_requests.linked_issue),
+                         updated_at = now()
          RETURNING id, repo_id, number, head_branch, linked_issue, work_item_id, factory_state",
     )
     .bind(Uuid::now_v7())
@@ -902,6 +922,14 @@ pub async fn set_change_request_number(pool: &Pool, cr_id: Uuid, number: i32) ->
 }
 
 /// Fetch the CR row for a work item, if one exists.
+///
+/// INVARIANT: a CR row's `work_item_id` is "the most recent coder to own the branch"
+/// (the upsert re-points it on every rework push — see [`upsert_change_request_for_item`]),
+/// NOT a stable 1:1 link to one coder. The coordinator only ever looks a CR up by
+/// `work_item_id` for a SUCCEEDED coder, and a succeeded coder is always reacted (in the
+/// same tx that wakes the reviewer) BEFORE any later rework coder for the same issue is
+/// enqueued — so the succeeded coder's CR lookup can never be stranded by a subsequent
+/// rework coder having re-pointed the row.
 pub async fn change_request_for_item(
     pool: &Pool,
     work_item_id: Uuid,
@@ -1132,7 +1160,7 @@ pub async fn repo_by_id_with_config(
 pub async fn work_item_by_id(pool: &Pool, id: Uuid) -> Result<Option<WorkItem>> {
     let row = sqlx::query(
         "SELECT id, repo_id, kind, worker_name, trigger, subject_ref, correlation_id, state,
-                attempt_count, loop_count, config_sha, lease_owner, lease_expires_at
+                attempt_count, loop_count, config_sha, lease_owner, lease_expires_at, updated_at
            FROM work_items WHERE id = $1",
     )
     .bind(id)
@@ -1209,7 +1237,7 @@ pub async fn count_escalations_for_item(pool: &Pool, work_item_id: Uuid) -> Resu
 pub async fn list_unreacted_terminal(pool: &Pool) -> Result<Vec<WorkItem>> {
     let rows = sqlx::query(
         "SELECT id, repo_id, kind, worker_name, trigger, subject_ref, correlation_id, state,
-                attempt_count, loop_count, config_sha, lease_owner, lease_expires_at
+                attempt_count, loop_count, config_sha, lease_owner, lease_expires_at, updated_at
            FROM work_items
           WHERE state IN ('succeeded', 'failed', 'escalated') AND NOT reacted
           ORDER BY updated_at",
@@ -1484,6 +1512,7 @@ fn map_work_item(row: sqlx::postgres::PgRow) -> Result<WorkItem> {
         config_sha: row.try_get("config_sha")?,
         lease_owner: row.try_get("lease_owner")?,
         lease_expires_at: row.try_get("lease_expires_at")?,
+        updated_at: row.try_get("updated_at")?,
     })
 }
 

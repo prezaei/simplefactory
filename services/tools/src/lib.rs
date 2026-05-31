@@ -328,10 +328,13 @@ pub async fn read_change_request(
     }))
 }
 
-/// Open (or update) the change request for this task. Idempotent two ways: the
-/// record-book row is keyed by work item (one CR per task, survives re-dispatch),
-/// and the GitHub PR is keyed by head branch (re-open returns the same number).
-/// The number from GitHub is recorded back onto the record-book row.
+/// Open (or update) the change request for this task. Idempotent two ways, BOTH keyed
+/// by the deterministic head branch (`factory/issue-N`): the record-book CR row's
+/// identity is `(repo_id, head_branch)` (one CR per branch — a re-dispatch OR a later
+/// rework coder pushing the same branch reuses the SAME row, re-pointing its
+/// `work_item_id` to the current owning coder), and the GitHub PR is also keyed by head
+/// branch (re-open returns the same number). The number from GitHub is recorded back
+/// onto the record-book row.
 pub async fn open_or_update_change_request(
     state: &ToolsState,
     auth: &TaskAuth,
@@ -343,7 +346,8 @@ pub async fn open_or_update_change_request(
 ) -> ToolResult {
     let repo = resolve_repo(state, auth).await?;
 
-    // One CR row per work item — a re-dispatch returns the SAME row.
+    // One CR row per head branch — a re-dispatch OR a rework coder pushing the same
+    // (deterministic) branch reuses the SAME row, re-pointing it to this work item.
     let cr_row = record::upsert_change_request_for_item(
         &state.pool,
         auth.repo_id,

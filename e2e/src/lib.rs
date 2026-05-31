@@ -888,18 +888,40 @@ mod acceptance {
 
             if cycle < 5 {
                 // A fresh rework coder item exists for the issue (the coordinator's
-                // rework dispatch). The rework pushes to the EXISTING CR/branch, so it
-                // opens no new CR row; mark it succeeded and react (a coder-succeeded
-                // with no CR row is a no-op). Then wake the next reviewer for the CR
-                // directly (idempotent by active (repo, subject, kind)).
+                // rework dispatch). The rework pushes to the EXISTING branch, so its
+                // open_or_update_change_request REUSES the same CR row (keyed by
+                // head_branch) — re-pointing work_item_id to this rework coder, with NO
+                // new CR row and NO unique violation. The coordinator then wakes a
+                // reviewer for that same cr#N on the rework coder's success.
                 let rework = find_item(&pool, repo, record::Kind::Coder, "issue#1")
                     .await
                     .expect("a rework coder item exists below the cap");
                 assert_ne!(rework, first_coder, "rework is a new coder item");
+                let rework_auth = task_auth(rework, repo, record::Kind::Coder);
+                let reused = factory_tools::open_or_update_change_request(
+                    &state,
+                    &rework_auth,
+                    "[coder] issue#1",
+                    "rework",
+                    "factory/issue-1",
+                    "main",
+                    Some(1),
+                )
+                .await
+                .expect("rework reuses the CR without a unique violation");
+                assert_eq!(
+                    reused["cr_number"].as_i64().unwrap(),
+                    cr_number,
+                    "rework reuses the same CR number"
+                );
                 mark_succeeded(&pool, rework).await;
                 coordinator_tick(&pool, gh.as_ref()).await.unwrap();
-                reviewer_id =
-                    enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, &cr_subject).await;
+                // The rework coder now owns the (reused) CR row, so the coordinator's
+                // coder-succeeded react wakes the reviewer itself on the same cr#N.
+                // Pick up THAT reviewer for the next cycle.
+                reviewer_id = find_item(&pool, repo, record::Kind::Reviewer, &cr_subject)
+                    .await
+                    .expect("the coordinator wakes a reviewer for the reused CR");
             }
         }
 
@@ -921,6 +943,89 @@ mod acceptance {
         .await
         .unwrap();
         assert_eq!(escalations, 1, "exactly one loop_cap escalation");
+    }
+
+    /// FIX 3: a rework (changes_requested) coder is a NEW work item but reuses the
+    /// SAME CR row, keyed by the deterministic head branch (`factory/issue-1`). It must
+    /// NOT create a colliding `change_requests` row (which would violate
+    /// `UNIQUE(repo_id, number)` once GitHub returns the same PR number), and
+    /// `decide_coder_succeeded` for the rework coder must wake the reviewer on the SAME
+    /// cr#N (the CR's `work_item_id` is re-pointed to the rework coder).
+    #[tokio::test]
+    async fn rework_coder_reuses_same_cr_row_by_branch() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (_manager, coder, _reviewer), gh, state) =
+            p4_fixture(&pool, "e2e-p4-cr-reuse").await;
+
+        // Coder A opens the CR on issue#1 → branch factory/issue-1, cr#<n>.
+        let (cr_number, cr_row_a) = open_cr(&pool, repo, coder, &state, "first attempt").await;
+        let coder_a = find_item(&pool, repo, record::Kind::Coder, "issue#1")
+            .await
+            .expect("coder A item");
+        // The CR row is owned by coder A.
+        assert_eq!(
+            cr_row_a.work_item_id,
+            Some(coder_a),
+            "the CR row is initially owned by coder A"
+        );
+        // Retire coder A so it does not occupy the active (repo, issue#1, coder) slot
+        // (the rework dispatch must be able to enqueue a fresh coder for the issue).
+        mark_succeeded(&pool, coder_a).await;
+        assert!(record::mark_reacted(&pool, coder_a).await.unwrap());
+
+        // Coder B is the rework coder for the SAME issue (a NEW work item). Enqueue it
+        // and drive its open_or_update_change_request with the SAME deterministic head
+        // branch — exactly what the coordinator's rework re-enqueue produces.
+        let coder_b = enqueue_item(&pool, repo, record::Kind::Coder, coder, "issue#1").await;
+        assert_ne!(coder_b, coder_a, "the rework coder is a new work item");
+        let coder_b_auth = task_auth(coder_b, repo, record::Kind::Coder);
+        let cr_b = factory_tools::open_or_update_change_request(
+            &state,
+            &coder_b_auth,
+            "[coder] issue#1",
+            "rework attempt",
+            "factory/issue-1",
+            "main",
+            Some(1),
+        )
+        .await
+        .expect("rework coder reuses the CR without a unique violation");
+        assert_eq!(
+            cr_b["cr_number"].as_i64().unwrap(),
+            cr_number,
+            "the rework reuses the SAME CR number"
+        );
+
+        // Exactly one CR row exists for the branch, now owned by coder B (re-pointed).
+        let cr_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM change_requests WHERE repo_id = $1 AND head_branch = $2",
+        )
+        .bind(repo)
+        .bind("factory/issue-1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cr_rows, 1, "no second CR row is created for the rework");
+        let cr_for_b = record::change_request_for_item(&pool, coder_b)
+            .await
+            .unwrap()
+            .expect("the CR is now owned by coder B");
+        assert_eq!(cr_for_b.id, cr_row_a.id, "it is the SAME CR row");
+        assert_eq!(cr_for_b.number, Some(cr_number as i32), "same CR number");
+
+        // decide_coder_succeeded(B) wakes the reviewer on the same cr#N.
+        mark_succeeded(&pool, coder_b).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+        let cr_subject = format!("cr#{cr_number}");
+        assert!(
+            find_item(&pool, repo, record::Kind::Reviewer, &cr_subject)
+                .await
+                .is_some(),
+            "the rework coder's success wakes a reviewer on the same cr#N"
+        );
     }
 
     #[tokio::test]
@@ -1641,21 +1746,22 @@ mod acceptance {
         );
     }
 
-    /// F5: an approved CR whose checks are NOT green (Pending, then Failure) is neither
-    /// marked ready NOR escalated — it is left `approved` to be re-evaluated next tick.
+    /// FIX 4 (defer within grace): an approved CR with PENDING checks while the reviewer
+    /// item is FRESH (within the grace window) is DEFERRED — the reviewer item is NOT
+    /// consumed (stays `reacted = false`), nothing is marked ready, nothing is escalated —
+    /// and once the checks flip green the NEXT tick finishes the handoff.
     #[tokio::test]
-    async fn approved_cr_with_non_green_checks_is_left_approved() {
+    async fn approved_cr_with_pending_checks_defers_then_ready_when_green() {
         let Some(pool) = pool_or_skip().await else {
             eprintln!("SKIP: DATABASE_URL not set");
             return;
         };
         let (_serial, repo, (_manager, coder, reviewer), _setup_gh, setup_state) =
-            p4_fixture(&pool, "e2e-p4-notgreen").await;
+            p4_fixture(&pool, "e2e-p4-defer").await;
         let (cr_number, _cr_row) = open_cr(&pool, repo, coder, &setup_state, "wip").await;
         let cr_subject = format!("cr#{cr_number}");
 
-        // Approve the CR once (factory_state → approved); the reviewer item is re-used
-        // across the two non-green check scenarios by clearing its react flag.
+        // Approve the CR (factory_state → approved).
         let reviewer_id =
             enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, &cr_subject).await;
         let reviewer_auth = task_auth(reviewer_id, repo, record::Kind::Reviewer);
@@ -1671,47 +1777,354 @@ mod acceptance {
         .unwrap();
         mark_succeeded(&pool, reviewer_id).await;
 
-        for overall in [CheckConclusion::Pending, CheckConclusion::Failure] {
-            // Reset the react claim so this tick re-reacts to the same reviewer item.
-            sqlx::query("UPDATE work_items SET reacted = false WHERE id = $1")
-                .bind(reviewer_id)
-                .execute(&pool)
+        // Tick with PENDING checks → DEFER: the reviewer item is NOT consumed.
+        let gh_pending = Arc::new(FakeGitHub::new().with_checks(
+            &format!("sha-{cr_number}"),
+            CheckSummary {
+                overall: CheckConclusion::Pending,
+                checks: vec![("ci".into(), CheckConclusion::Pending)],
+            },
+        ));
+        coordinator_tick(&pool, gh_pending.as_ref()).await.unwrap();
+
+        assert!(
+            !is_reacted(&pool, reviewer_id).await,
+            "pending checks DEFER: the reviewer item stays unreacted for re-evaluation"
+        );
+        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cr_row.factory_state, "approved",
+            "pending checks leave the CR approved (not ready)"
+        );
+        assert_eq!(
+            record::count_escalations_for_item(&pool, reviewer_id)
                 .await
-                .unwrap();
-            let gh = Arc::new(FakeGitHub::new().with_checks(
+                .unwrap(),
+            0,
+            "pending checks do not escalate"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh_pending, "post_comment").len(),
+            0,
+            "no handoff comment while checks are pending"
+        );
+
+        // Flip the checks GREEN and tick again — the SAME (still-unreacted) reviewer
+        // item is now finished: the CR is marked ready and handed off exactly once.
+        let gh_green = Arc::new(FakeGitHub::new().with_checks(
+            &format!("sha-{cr_number}"),
+            CheckSummary {
+                overall: CheckConclusion::Success,
+                checks: vec![("ci".into(), CheckConclusion::Success)],
+            },
+        ));
+        coordinator_tick(&pool, gh_green.as_ref()).await.unwrap();
+
+        assert!(
+            is_reacted(&pool, reviewer_id).await,
+            "once checks are green the deferred item is finally consumed"
+        );
+        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cr_row.factory_state, "ready",
+            "green checks on the deferred CR finish the handoff (ready)"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh_green, "post_comment").len(),
+            1,
+            "exactly one handoff comment once green"
+        );
+    }
+
+    /// FIX 4 (flaky self-heal window): an approved CR whose required checks are FAILING
+    /// is DEFERRED while FRESH (within the grace window) — a flaky red check is given a
+    /// chance to self-heal, NOT escalated on the first red. Once the item is BACKDATED
+    /// past the grace window the same red CR escalates `needs_decision` EXACTLY ONCE (so a
+    /// stuck red CR is not polled forever) and is never marked ready.
+    #[tokio::test]
+    async fn approved_cr_with_failing_checks_defers_then_escalates_once_past_grace() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (_manager, coder, reviewer), _setup_gh, setup_state) =
+            p4_fixture(&pool, "e2e-p4-redchecks").await;
+        let (cr_number, _cr_row) = open_cr(&pool, repo, coder, &setup_state, "wip").await;
+        let cr_subject = format!("cr#{cr_number}");
+
+        let reviewer_id =
+            enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, &cr_subject).await;
+        let reviewer_auth = task_auth(reviewer_id, repo, record::Kind::Reviewer);
+        factory_tools::submit_review(
+            &state_for(&pool),
+            &reviewer_auth,
+            cr_number,
+            "approve",
+            "looks good",
+            Some("rev-1"),
+        )
+        .await
+        .unwrap();
+        mark_succeeded(&pool, reviewer_id).await;
+
+        // (A) FRESH + failing checks → DEFER (self-heal window): NOT escalated, NOT
+        // consumed, NOT marked ready.
+        let red = || {
+            Arc::new(FakeGitHub::new().with_checks(
                 &format!("sha-{cr_number}"),
                 CheckSummary {
-                    overall,
-                    checks: vec![("ci".into(), overall)],
+                    overall: CheckConclusion::Failure,
+                    checks: vec![("ci".into(), CheckConclusion::Failure)],
                 },
-            ));
-            coordinator_tick(&pool, gh.as_ref()).await.unwrap();
-
-            let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+            ))
+        };
+        let gh_fresh = red();
+        coordinator_tick(&pool, gh_fresh.as_ref()).await.unwrap();
+        assert!(
+            !is_reacted(&pool, reviewer_id).await,
+            "a fresh red CR is DEFERRED within the grace window, not consumed"
+        );
+        assert_eq!(
+            record::count_escalations_for_item(&pool, reviewer_id)
                 .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                cr_row.factory_state,
-                "approved",
-                "a CR with {} checks stays approved (not ready)",
-                overall.as_str()
-            );
-            assert_eq!(
-                record::count_escalations_for_item(&pool, reviewer_id)
-                    .await
-                    .unwrap(),
-                0,
-                "non-green checks do not escalate ({})",
-                overall.as_str()
-            );
-            assert_eq!(
-                calls_with_prefix(&gh, "post_comment").len(),
-                0,
-                "no handoff comment when checks are not green ({})",
-                overall.as_str()
-            );
-        }
+                .unwrap(),
+            0,
+            "a fresh red CR is not escalated (flaky checks may self-heal)"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh_fresh, "post_comment").len(),
+            0,
+            "no escalation comment for a fresh red CR"
+        );
+
+        // (B) BACKDATE past the grace window, still failing → escalate exactly once with
+        // one comment + one assignment, and never marked ready.
+        backdate_past_grace(&pool, reviewer_id).await;
+        let gh = red();
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cr_row.factory_state, "approved",
+            "a failing-checks CR is never marked ready"
+        );
+        let needs_decision: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'needs_decision' AND work_item_id = $1",
+        )
+        .bind(reviewer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(needs_decision, 1, "exactly one needs_decision escalation");
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one assignment"
+        );
+
+        // Re-dispatch (clear the claim, backdate again, tick again): no SECOND
+        // escalation/comment (the idempotent escalation index bounds it to one).
+        sqlx::query("UPDATE work_items SET reacted = false WHERE id = $1")
+            .bind(reviewer_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        backdate_past_grace(&pool, reviewer_id).await;
+        let gh2 = red();
+        coordinator_tick(&pool, gh2.as_ref()).await.unwrap();
+        let needs_decision: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'needs_decision' AND work_item_id = $1",
+        )
+        .bind(reviewer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            needs_decision, 1,
+            "a red CR escalates exactly once, not on every poll"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh2, "post_comment").len(),
+            0,
+            "no second escalation comment on re-dispatch"
+        );
+    }
+
+    /// FIX 2: an approved CR with NO check runs registered (empty checks) rolls up to
+    /// green and is marked READY (one handoff comment), NOT deferred or escalated — a
+    /// no-CI repo must not be wedged forever. The reviewer item's CR head SHA has no
+    /// seeded checks, so `FakeGitHub::check_status` returns the shared empty→Success
+    /// rollup.
+    #[tokio::test]
+    async fn approved_cr_with_empty_checks_is_marked_ready() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (_manager, coder, reviewer), gh, setup_state) =
+            p4_fixture(&pool, "e2e-p4-emptychecks").await;
+        let (cr_number, _cr_row) = open_cr(&pool, repo, coder, &setup_state, "wip").await;
+        let cr_subject = format!("cr#{cr_number}");
+
+        let reviewer_id =
+            enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, &cr_subject).await;
+        let reviewer_auth = task_auth(reviewer_id, repo, record::Kind::Reviewer);
+        factory_tools::submit_review(
+            &state_for(&pool),
+            &reviewer_auth,
+            cr_number,
+            "approve",
+            "looks good",
+            Some("rev-1"),
+        )
+        .await
+        .unwrap();
+        mark_succeeded(&pool, reviewer_id).await;
+
+        // No `with_checks` seeded for this CR's head SHA → empty rollup → green (FIX 2).
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        assert!(
+            is_reacted(&pool, reviewer_id).await,
+            "empty checks are green: the reviewer item is consumed, not deferred"
+        );
+        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cr_row.factory_state, "ready",
+            "an approved CR with no checks rolls up green and is marked ready"
+        );
+        assert_eq!(
+            record::count_escalations_for_item(&pool, reviewer_id)
+                .await
+                .unwrap(),
+            0,
+            "empty checks do not escalate"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one handoff comment for the empty-checks (green) CR"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one assignment for the empty-checks (green) CR"
+        );
+    }
+
+    /// FIX 4 (bound on pending): an approved CR with PENDING checks that has been
+    /// BACKDATED past the grace window escalates `needs_decision` EXACTLY ONCE — a hung
+    /// check that never resolves must not be deferred forever. A re-dispatch produces no
+    /// second escalation.
+    #[tokio::test]
+    async fn approved_cr_with_pending_checks_past_grace_escalates_once() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (_manager, coder, reviewer), _setup_gh, setup_state) =
+            p4_fixture(&pool, "e2e-p4-pendinggrace").await;
+        let (cr_number, _cr_row) = open_cr(&pool, repo, coder, &setup_state, "wip").await;
+        let cr_subject = format!("cr#{cr_number}");
+
+        let reviewer_id =
+            enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, &cr_subject).await;
+        let reviewer_auth = task_auth(reviewer_id, repo, record::Kind::Reviewer);
+        factory_tools::submit_review(
+            &state_for(&pool),
+            &reviewer_auth,
+            cr_number,
+            "approve",
+            "looks good",
+            Some("rev-1"),
+        )
+        .await
+        .unwrap();
+        mark_succeeded(&pool, reviewer_id).await;
+        // Backdate so the hung pending check is now PAST the grace window.
+        backdate_past_grace(&pool, reviewer_id).await;
+
+        let pending = || {
+            Arc::new(FakeGitHub::new().with_checks(
+                &format!("sha-{cr_number}"),
+                CheckSummary {
+                    overall: CheckConclusion::Pending,
+                    checks: vec![("ci".into(), CheckConclusion::Pending)],
+                },
+            ))
+        };
+        let gh = pending();
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cr_row.factory_state, "approved",
+            "a hung-pending CR past grace is never marked ready"
+        );
+        let needs_decision: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'needs_decision' AND work_item_id = $1",
+        )
+        .bind(reviewer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(needs_decision, 1, "exactly one needs_decision escalation");
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one assignment"
+        );
+
+        // Re-dispatch past grace → no second escalation/comment.
+        sqlx::query("UPDATE work_items SET reacted = false WHERE id = $1")
+            .bind(reviewer_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        backdate_past_grace(&pool, reviewer_id).await;
+        let gh2 = pending();
+        coordinator_tick(&pool, gh2.as_ref()).await.unwrap();
+        let needs_decision: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'needs_decision' AND work_item_id = $1",
+        )
+        .bind(reviewer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            needs_decision, 1,
+            "a hung-pending CR escalates exactly once, not on every poll"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh2, "post_comment").len(),
+            0,
+            "no second escalation comment on re-dispatch"
+        );
     }
 
     /// Build a `ToolsState` over a throwaway `FakeGitHub` for a tool call whose GitHub
@@ -1742,6 +2155,18 @@ mod acceptance {
             row.get("attempt_count"),
             row.get("reacted"),
         )
+    }
+
+    /// Backdate a work item's `updated_at` so it falls PAST the coordinator's checks
+    /// grace window (FIX 4). The bounded-defer model anchors the grace on the reviewer
+    /// item's `updated_at` (= when the review completed); pushing it two hours into the
+    /// past makes a not-green CR escalate this tick instead of deferring.
+    async fn backdate_past_grace(pool: &record::Pool, id: Uuid) {
+        sqlx::query("UPDATE work_items SET updated_at = now() - interval '2 hours' WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     /// Force a work item to a Failed terminal state with `attempt_count` so the

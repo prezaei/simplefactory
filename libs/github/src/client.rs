@@ -97,6 +97,15 @@ impl CheckConclusion {
             CheckConclusion::Neutral => "neutral",
         }
     }
+
+    /// Whether this conclusion counts as "green" for marking a CR ready. GitHub treats
+    /// neutral/skipped checks as passing, so `Success` and `Neutral` are green; `Failure`
+    /// and `Pending` are not. This is the SINGLE source of truth for the green definition
+    /// (FIX 6): the octocrab rollup and the coordinator's gate both delegate here, so the
+    /// definition can never drift between the two crates.
+    pub fn is_green(self) -> bool {
+        matches!(self, CheckConclusion::Success | CheckConclusion::Neutral)
+    }
 }
 
 /// Per-check conclusions plus the overall rollup for a ref.
@@ -104,6 +113,37 @@ impl CheckConclusion {
 pub struct CheckSummary {
     pub overall: CheckConclusion,
     pub checks: Vec<(String, CheckConclusion)>,
+}
+
+impl CheckSummary {
+    /// Roll a set of per-check conclusions up into an overall conclusion + summary. This
+    /// is the SINGLE source of truth for the rollup (FIX 6): both the real octocrab client
+    /// (`OctocrabGitHub::check_status`) and `FakeGitHub` build summaries through here so the
+    /// empty-is-green semantics (FIX 2) hold identically in production and in tests.
+    ///
+    /// Rollup rule: any `Failure` → `Failure`; else any `Pending` → `Pending`; else
+    /// `Success`. The empty set (zero checks) therefore rolls up to `Success` — a ref with
+    /// no checks has nothing non-green, which matches GitHub treating a PR with no required
+    /// checks as mergeable (FIX 2). The narrow window where checks have been registered on
+    /// GitHub but no `check_run` object has materialized yet is accepted as green here; the
+    /// repo's branch protection plus the human merge step are the merge-time backstop.
+    pub fn rollup(checks: Vec<(String, CheckConclusion)>) -> CheckSummary {
+        let any_failure = checks
+            .iter()
+            .any(|(_, c)| matches!(c, CheckConclusion::Failure));
+        let any_pending = checks
+            .iter()
+            .any(|(_, c)| matches!(c, CheckConclusion::Pending));
+        let overall = if any_failure {
+            CheckConclusion::Failure
+        } else if any_pending {
+            CheckConclusion::Pending
+        } else {
+            // Every present check is green, OR there are no checks at all — both green.
+            CheckConclusion::Success
+        };
+        CheckSummary { overall, checks }
+    }
 }
 
 /// The outbound GitHub operations Factory performs. All are idempotent where the
@@ -428,6 +468,9 @@ impl GitHubClient for FakeGitHub {
             CheckRef::Sha(s) => s,
             CheckRef::ChangeRequest(n) => format!("sha-{n}"),
         };
+        // An unseeded ref has no check runs registered. It rolls up through the SHARED
+        // rollup (FIX 6) so the empty-is-green semantics (FIX 2) match production exactly:
+        // zero checks → Success, so a no-CI repo is handed off rather than wedged forever.
         Ok(self
             .state
             .lock()
@@ -435,10 +478,7 @@ impl GitHubClient for FakeGitHub {
             .checks
             .get(&key)
             .cloned()
-            .unwrap_or(CheckSummary {
-                overall: CheckConclusion::Pending,
-                checks: vec![],
-            }))
+            .unwrap_or_else(|| CheckSummary::rollup(vec![])))
     }
 
     async fn get_file(

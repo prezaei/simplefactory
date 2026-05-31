@@ -8,12 +8,15 @@
 //! Every data-plane operation funnels through a GitHub *App* JWT client, built
 //! with `Octocrab::builder().app(AppId, jsonwebtoken::EncodingKey)`. `secrecy`
 //! and `jsonwebtoken` are now direct dependencies, so the App/installation client
-//! can be constructed and the methods are wired for real. The lone exception is
-//! [`OctocrabGitHub::check_status`]: octocrab 0.51's `combined_status_for_ref`
-//! only accepts `params::repos::Reference`, which has just `Branch`/`Tag`
-//! variants (no `Commit`) and always prefixes the ref with `heads/`/`tags/`, so
-//! a raw commit SHA cannot be passed through it cleanly. It therefore stays
-//! `unwired` and `read_change_request` reports checks as `Pending`.
+//! can be constructed and every method is wired for real, including
+//! [`OctocrabGitHub::check_status`]: rather than `combined_status_for_ref` (which
+//! only accepts a `heads/`/`tags/`-prefixed `params::repos::Reference`, not a raw
+//! SHA), it reads the Checks API via `checks().list_check_runs_for_git_ref(..)`,
+//! which accepts a raw commit SHA as a `Commitish`. `read_change_request` populates
+//! the changed-file list for real (the coordinator's can't-weaken-own-gating guard
+//! depends on it) but still reports checks as `Pending` (the coordinator reads checks
+//! via `check_status` directly, so the CR-view check rollup is not on the hot approval
+//! path).
 use secrecy::ExposeSecret;
 
 use crate::client::{
@@ -91,11 +94,25 @@ fn id_u64(n: i64) -> anyhow::Result<u64> {
     u64::try_from(n).map_err(|_| anyhow::anyhow!("invalid id: {n}"))
 }
 
-/// Marker for the one operation that cannot be wired cleanly against octocrab
-/// 0.51 (`check_status`; see the module docs). Keeps the live seam loud rather
-/// than silently returning a wrong result.
-fn unwired(op: &str) -> anyhow::Error {
-    anyhow::anyhow!("OctocrabGitHub::{op} is not wired for octocrab 0.51 (see octo.rs)")
+/// Map a GitHub check-run `conclusion` string to our [`CheckConclusion`]. A run with
+/// no conclusion yet (queued/in_progress → `None`) is `Pending`. Per the GitHub
+/// Checks API: success → Success; failure/timed_out/cancelled/action_required/
+/// startup_failure → Failure (`startup_failure` is a terminal error — the run never
+/// got off the ground); neutral/skipped → Neutral; `stale` → Pending (a stale run is
+/// superseded by a newer run for the same ref, so it is not itself a terminal verdict);
+/// anything else (including unknown future values) is conservatively `Pending` so an
+/// unrecognized state can never be read as green.
+fn map_conclusion(conclusion: Option<&str>) -> CheckConclusion {
+    match conclusion {
+        Some("success") => CheckConclusion::Success,
+        Some("failure")
+        | Some("timed_out")
+        | Some("cancelled")
+        | Some("action_required")
+        | Some("startup_failure") => CheckConclusion::Failure,
+        Some("neutral") | Some("skipped") => CheckConclusion::Neutral,
+        _ => CheckConclusion::Pending,
+    }
 }
 
 #[async_trait::async_trait]
@@ -134,22 +151,43 @@ impl GitHubClient for OctocrabGitHub {
         number: i64,
     ) -> anyhow::Result<ChangeRequestView> {
         tracing::info!(owner = %repo.owner, name = %repo.name, number, "reading change request");
-        let pr = self
-            .installation(repo.installation_id)
-            .await?
+        let client = self.installation(repo.installation_id).await?;
+        let number_u64 = id_u64(number)?;
+        let pr = client
             .pulls(&repo.owner, &repo.name)
-            .get(id_u64(number)?)
+            .get(number_u64)
             .await
             .map_err(|e| anyhow::anyhow!("reading change request #{number}: {e}"))?;
         let head_sha = pr.head.sha.clone();
-        // diff/files/reviews are best-effort empty; checks would come from
-        // `check_status`, which is unwired on octocrab 0.51 (see module docs), so
-        // report Pending.
+
+        // FIX 5: populate the changed-file list for real. The coordinator's
+        // can't-weaken-own-gating guard inspects `files`; with it stubbed empty the guard
+        // was DEAD against real GitHub (a CR editing `.github/workflows/` was handed off as
+        // green). `list_files` returns a `Page<DiffEntry>`, so PAGINATE with `all_pages` —
+        // a gating file on page 2 must never be missed.
+        let first = client
+            .pulls(&repo.owner, &repo.name)
+            .list_files(number_u64)
+            .await
+            .map_err(|e| anyhow::anyhow!("listing files for change request #{number}: {e}"))?;
+        let files: Vec<String> = client
+            .all_pages(first)
+            .await
+            .map_err(|e| anyhow::anyhow!("paginating files for change request #{number}: {e}"))?
+            .into_iter()
+            .map(|entry| entry.filename)
+            .collect();
+        tracing::info!(owner = %repo.owner, name = %repo.name, number, files = files.len(), "read change request files");
+
+        // diff/reviews stay best-effort empty; `checks` stays the `Pending` stub here
+        // because the coordinator reads checks via `check_status` directly (not this
+        // CR-view rollup), so the CR-view checks are off the hot approval path. `files`,
+        // by contrast, is now REAL — the gating guard depends on it (FIX 5).
         Ok(ChangeRequestView {
             number,
             head_sha,
             diff: String::new(),
-            files: vec![],
+            files,
             reviews: vec![],
             checks: CheckSummary {
                 overall: CheckConclusion::Pending,
@@ -300,12 +338,69 @@ impl GitHubClient for OctocrabGitHub {
     }
 
     async fn check_status(&self, repo: &RepoRef, what: CheckRef) -> anyhow::Result<CheckSummary> {
-        // octocrab 0.51's `combined_status_for_ref` only accepts
-        // `params::repos::Reference` (Branch|Tag, always prefixed `heads/`/
-        // `tags/`), so a raw commit SHA cannot be passed cleanly. Left unwired
-        // rather than silently querying the wrong ref (see module docs).
-        tracing::info!(owner = %repo.owner, name = %repo.name, ?what, "check_status is unwired");
-        Err(unwired("check_status"))
+        tracing::info!(owner = %repo.owner, name = %repo.name, ?what, "reading check status");
+        let client = self.installation(repo.installation_id).await?;
+        // Resolve the commit SHA to read checks for. A `CheckRef::Sha` is used
+        // directly; a `CheckRef::ChangeRequest(n)` is resolved to the PR head SHA.
+        let sha = match what {
+            CheckRef::Sha(s) => s,
+            CheckRef::ChangeRequest(n) => {
+                let pr = client
+                    .pulls(&repo.owner, &repo.name)
+                    .get(id_u64(n)?)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("reading change request #{n} head sha: {e}"))?;
+                pr.head.sha
+            }
+        };
+
+        // octocrab 0.51's Checks API: list every check run for the commit ref. A raw
+        // SHA is a valid `Commitish`, so this reads the check runs cleanly (unlike
+        // `combined_status_for_ref`, which only accepts a `heads/`/`tags/` Reference).
+        //
+        // FIX 1: page through EVERY check run, not just the first page (~30). The
+        // `check-runs` endpoint returns a `total_count` plus the page's `check_runs`;
+        // it is NOT a `Page<T>` wrapper (no `next` link octocrab can follow with
+        // `all_pages`), so we drive pagination ourselves: request 100 per page and keep
+        // fetching successive pages until we have collected `total_count` runs. Rolling
+        // up over only the first page could read a red check on page 2 as green.
+        let mut checks: Vec<(String, CheckConclusion)> = Vec::new();
+        let mut page: u32 = 1;
+        loop {
+            let runs = client
+                .checks(&repo.owner, &repo.name)
+                .list_check_runs_for_git_ref(octocrab::params::repos::Commitish(sha.clone()))
+                .per_page(100u8)
+                .page(page)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("listing check runs for {sha} (page {page}): {e}"))?;
+            let total = runs.total_count;
+            // Map each check run's conclusion to a `CheckConclusion`. A run with no
+            // conclusion yet (queued/in_progress) is `Pending`; an unknown conclusion
+            // string is treated conservatively as `Pending` so an unrecognized state can
+            // never be mistaken for green.
+            let page_empty = runs.check_runs.is_empty();
+            checks.extend(
+                runs.check_runs
+                    .into_iter()
+                    .map(|run| (run.name, map_conclusion(run.conclusion.as_deref()))),
+            );
+            // Stop once we have every run (or a short/empty page guards against a
+            // mismatched total so this can never loop forever).
+            if page_empty || checks.len() as u64 >= total {
+                break;
+            }
+            page += 1;
+        }
+
+        // FIX 2 + FIX 6: roll up through the SHARED rollup so the green definition lives
+        // in one place and the empty-is-green semantics match `FakeGitHub` exactly. Zero
+        // check runs → Success (a ref with no required checks is mergeable on GitHub), so
+        // a no-CI repo is handed off rather than wedged forever.
+        let summary = CheckSummary::rollup(checks);
+        tracing::info!(owner = %repo.owner, name = %repo.name, %sha, overall = summary.overall.as_str(), count = summary.checks.len(), "read check status");
+        Ok(summary)
     }
 
     async fn get_file(

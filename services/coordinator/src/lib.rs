@@ -77,6 +77,13 @@ const DEFAULT_RETRY_CAP: u32 = 3;
 /// `default_loop_cap`). Used as the floor when a stored config carries a
 /// `loop_cap < 1` (F2).
 const DEFAULT_LOOP_CAP: u32 = 5;
+/// Grace window (seconds) for an approved CR whose required checks are not yet green
+/// (FIX 4). Measured from the reviewer item's `updated_at` (when the review completed).
+/// Within the window a not-green CR is DEFERRED (re-evaluated next tick) so a hung check
+/// can still settle and a flaky check that self-heals leaves no stale escalation; past
+/// the window a still-not-green CR is ESCALATED exactly once so neither a hung pending
+/// nor a stuck red CR is polled forever. 30 minutes balances both.
+const DEFAULT_CHECKS_GRACE_SECS: i64 = 1800;
 
 /// Read an effective retry cap from config, defending against a `< 1` value (F2).
 /// `config::parse()` rejects a 0 cap, but a directly-written jsonb config could
@@ -206,6 +213,22 @@ async fn react_to_item(
         load_approval_decision(gh, &repo, item, config, cr.clone()).await?
     } else {
         None
+    };
+
+    // DEFER (checks not green, within the grace window): do NOT consume the react claim.
+    // The item must stay terminal-but-unreacted so a later tick re-evaluates it once the
+    // checks resolve (polling), OR — once the grace window elapses — escalates instead.
+    // We compute this from the pre-tx GitHub read + the item's age and return WITHOUT
+    // opening the claim tx — there is nothing to roll back because we never claimed. The
+    // item is "not counted" (Ok(false)), exactly like a lost claim race. Everything else
+    // (Ready / WeakensGating / EscalateChecks) flows into the tx below.
+    let approval = match approval {
+        Some(ReviewerApproval::Defer) => {
+            tracing::info!(work_item = %item.id, "deferring reviewer react: checks not green (within grace)");
+            return Ok(false);
+        }
+        Some(ReviewerApproval::Act(decision)) => Some(decision),
+        None => None,
     };
 
     // The per-issue serialization key for the advisory lock. Derived from the item's
@@ -354,17 +377,17 @@ async fn run_post_commit(
 
 /// The pre-claim decision for a Succeeded reviewer: inspect the pre-loaded CR and
 /// (if approved and gating-safe) read its check status. `None` means "no actionable
-/// approval" (the CR isn't tracked, isn't approved, or the gating guard / checks
-/// block it). The CR was loaded ONCE before the tx (C4) and is handed in here; this
-/// fn performs only GitHub reads, no `&Pool` reads. The result is applied only after
-/// the react claim is won.
+/// approval" (the CR isn't tracked, isn't approved, or has no GitHub number). The CR
+/// was loaded ONCE before the tx (C4) and is handed in here; this fn performs only
+/// GitHub reads, no `&Pool` reads. The result is applied only after the react claim is
+/// won (or, for [`ReviewerApproval::Defer`], it short-circuits BEFORE the claim).
 async fn load_approval_decision(
     gh: &dyn GitHubClient,
     repo: &RepoRef,
     item: &WorkItem,
     config: &Config,
     cr: Option<ChangeRequest>,
-) -> anyhow::Result<Option<ApprovalDecision>> {
+) -> anyhow::Result<Option<ReviewerApproval>> {
     let Some(cr) = cr else {
         return Ok(None);
     };
@@ -396,26 +419,66 @@ async fn load_approval_decision(
         .any(|f| is_gating_path(f, &config.settings.gating_paths))
     {
         tracing::warn!(work_item = %item.id, cr_number = number, "CR alters its own gating checks; will escalate conflict");
-        return Ok(Some(ApprovalDecision::WeakensGating { cr }));
+        return Ok(Some(ReviewerApproval::Act(
+            ApprovalDecision::WeakensGating { cr },
+        )));
     }
 
-    // Checks must be green to hand to a human. Pending/Failure → leave approved.
+    // Green (Success/Neutral, INCLUDING the empty-checks-is-green case per FIX 2) →
+    // mark ready + hand to a human.
     if is_green(checks.overall) {
-        Ok(Some(ApprovalDecision::Ready { cr }))
+        return Ok(Some(ReviewerApproval::Act(ApprovalDecision::Ready { cr })));
+    }
+
+    // Not green (Pending OR Failure). FIX 4: ONE bounded model, keyed on the reviewer
+    // item's age (its `updated_at` = when the review completed; the defer path never
+    // touches the row, so it is a stable anchor). Within the grace window DEFER (a hung
+    // pending can still settle; a flaky red can self-heal). Past the grace window
+    // ESCALATE exactly once (neither a hung pending nor a stuck red is polled forever).
+    let grace = chrono::Duration::seconds(DEFAULT_CHECKS_GRACE_SECS);
+    let age = chrono::Utc::now() - item.updated_at;
+    if age < grace {
+        tracing::info!(work_item = %item.id, cr_number = number, overall = checks.overall.as_str(), age_secs = age.num_seconds(), "approved CR checks not green within grace; deferring react (re-evaluated next tick)");
+        Ok(Some(ReviewerApproval::Defer))
     } else {
-        tracing::info!(work_item = %item.id, cr_number = number, overall = checks.overall.as_str(), "approved CR checks not green; leaving CR approved this tick");
-        Ok(None)
+        tracing::info!(work_item = %item.id, cr_number = number, overall = checks.overall.as_str(), age_secs = age.num_seconds(), "approved CR checks still not green past grace; will escalate needs_decision");
+        Ok(Some(ReviewerApproval::Act(
+            ApprovalDecision::EscalateChecks {
+                cr,
+                overall: checks.overall,
+            },
+        )))
     }
 }
 
-/// What a Succeeded reviewer's approval resolves to (computed pre-claim). Each
-/// variant carries the [`ChangeRequest`] it was computed from; the GitHub number is
-/// `cr.number` (no separate copy).
+/// What a Succeeded reviewer's approval resolves to (computed pre-claim). [`Defer`] is
+/// handled BEFORE the react claim (the item stays terminal-but-unreacted so a later tick
+/// re-evaluates it); every [`Act`] decision flows into the claim tx and is applied by
+/// [`apply_approval`]. Splitting defer out as its own variant — rather than a dead arm in
+/// the in-tx decision — means [`ApprovalDecision`] has NO unreachable variant (FIX 4).
+enum ReviewerApproval {
+    /// Checks not green but still within the grace window: do NOT consume the react
+    /// claim; re-evaluate next tick. The only decision that never opens the claim tx.
+    Defer,
+    /// A real in-tx action (ready handoff, gating conflict, or checks escalation).
+    Act(ApprovalDecision),
+}
+
+/// What an actionable approval resolves to in-tx (computed pre-claim). Each variant
+/// carries the [`ChangeRequest`] it was computed from; the GitHub number is `cr.number`
+/// (no separate copy). EXACTLY three variants — no dead arm (FIX 4).
 enum ApprovalDecision {
     /// Checks green, no gating-path changes: mark ready + hand to a human.
     Ready { cr: ChangeRequest },
     /// The CR weakens its own gating checks: escalate a conflict, never mark ready.
     WeakensGating { cr: ChangeRequest },
+    /// Required checks are still not green past the grace window: escalate
+    /// `needs_decision` exactly once (so a hung/red CR is not polled forever), never
+    /// mark ready. `overall` is the non-green rollup (Pending or Failure) for context.
+    EscalateChecks {
+        cr: ChangeRequest,
+        overall: CheckConclusion,
+    },
 }
 
 /// Manager succeeded → assign a coder for the issue and mark the issue in_progress.
@@ -510,8 +573,11 @@ async fn decide_reviewer_succeeded(
     match cr.factory_state.as_str() {
         "changes_requested" => decide_changes_requested(tx, item, config, &cr).await,
         other => {
-            // approved-but-not-ready (checks pending) and any other state are no-ops
-            // this tick.
+            // An `approved` CR whose checks are not green WITHIN the grace window never
+            // reaches here: it is DEFERRED before the tx (the react claim is not taken).
+            // Past the grace window it arrives as an `Act(EscalateChecks)` approval above,
+            // not as this CR-state fallthrough. So for any other state this tick is a true
+            // no-op.
             tracing::info!(work_item = %item.id, cr = %cr.id, factory_state = other, "reviewer succeeded: no actionable CR state this tick");
             Ok(PostCommit::None)
         }
@@ -525,6 +591,31 @@ async fn apply_approval(
     decision: ApprovalDecision,
 ) -> anyhow::Result<PostCommit> {
     match decision {
+        ApprovalDecision::EscalateChecks { cr, overall } => {
+            // Approved but required checks are still not green past the grace window.
+            // NEVER mark ready. Escalate a decision exactly once (the idempotent
+            // escalation index guarantees one row + one comment + one assignment) so a
+            // hung/red CR is not polled forever.
+            let grace_min = DEFAULT_CHECKS_GRACE_SECS / 60;
+            let (comment_target, assign_issue) = escalation_target(item, Some(&cr));
+            let post = escalate(
+                tx,
+                item,
+                Escalation {
+                    comment_target,
+                    assign_issue,
+                    reason: "needs_decision",
+                    context: format!(
+                        "approved but required checks are not green after {}m: {}",
+                        grace_min,
+                        overall.as_str()
+                    ),
+                },
+            )
+            .await?;
+            tracing::info!(work_item = %item.id, cr_number = ?cr.number, overall = overall.as_str(), "reviewer approved but checks not green past grace; escalated needs_decision");
+            Ok(post)
+        }
         ApprovalDecision::WeakensGating { cr } => {
             // NEVER mark ready. Escalate a conflict and hand to a human.
             let (comment_target, assign_issue) = escalation_target(item, Some(&cr));
@@ -949,11 +1040,12 @@ fn is_gating_path(path: &str, gating_paths: &[String]) -> bool {
     })
 }
 
-/// Whether a check rollup counts as green for marking a CR ready. GitHub treats
-/// neutral/skipped checks as passing, so `Success` and `Neutral` are green;
-/// `Failure` and `Pending` are not.
+/// Whether a check rollup counts as green for marking a CR ready. FIX 6: the green
+/// definition lives in ONE place — [`CheckConclusion::is_green`] in `factory_github` —
+/// which the octocrab rollup also uses, so the coordinator and the client can never
+/// drift. `Success`/`Neutral` are green; `Failure`/`Pending` are not.
 fn is_green(overall: CheckConclusion) -> bool {
-    matches!(overall, CheckConclusion::Success | CheckConclusion::Neutral)
+    overall.is_green()
 }
 
 #[cfg(test)]
@@ -1009,6 +1101,7 @@ mod tests {
             config_sha: "sha".into(),
             lease_owner: None,
             lease_expires_at: None,
+            updated_at: chrono::Utc::now(),
         }
     }
 
