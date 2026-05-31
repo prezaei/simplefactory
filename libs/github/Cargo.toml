@@ -25,4 +25,3 @@ secrecy = "0.10"
 
 [dev-dependencies]
 tokio.workspace = true
-subtle.workspace = true

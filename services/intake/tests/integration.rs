@@ -566,3 +566,47 @@ async fn config_on_push_rejects_invalid_yaml_keeps_last_good() {
     );
     assert_eq!(record::count_for_repo(&pool, id).await.unwrap(), 1);
 }
+
+#[tokio::test]
+async fn apply_config_writes_an_audit_event_for_both_outcomes() {
+    // Every config decision must leave a queryable audit trail, not just a tracing line
+    // (the "every decision logged" mandate) — especially the security-relevant rejection.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let id = record::upsert_repo(&pool, "acme", &format!("cfg-audit-{}", Uuid::now_v7()), 1)
+        .await
+        .unwrap();
+
+    let good = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: manager\n    role: manager\n    on: [issue_labeled]\n";
+    assert_eq!(
+        factory_intake::apply_config(&pool, id, good, "sha-good")
+            .await
+            .unwrap(),
+        ApplyOutcome::Applied
+    );
+    let bad = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: coder\n    role: coder\n    on: [issue_labeled]\n";
+    assert_eq!(
+        factory_intake::apply_config(&pool, id, bad, "sha-bad")
+            .await
+            .unwrap(),
+        ApplyOutcome::RejectedKeptLastGood
+    );
+
+    let applied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE repo_id = $1 AND action = $2")
+            .bind(id)
+            .bind("config_applied")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let rejected: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE repo_id = $1 AND action = $2")
+            .bind(id)
+            .bind("config_rejected_kept_last_good")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(applied, 1, "an Applied decision writes one audit event");
+    assert_eq!(rejected, 1, "a rejection writes one audit event");
+}

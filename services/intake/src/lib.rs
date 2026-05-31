@@ -173,15 +173,38 @@ pub async fn apply_config(
     yaml: &str,
     config_sha: &str,
 ) -> anyhow::Result<ApplyOutcome> {
+    // Every config decision is an auditable event (the "every decision logged" mandate),
+    // not just a tracing line — a rejected-bad-config (last-good kept) is security-relevant
+    // and must leave a queryable trail.
     match factory_config::parse(yaml) {
         Ok(cfg) => {
             let json = serde_json::to_value(&cfg)?;
             record::set_repo_config(pool, repo_id, &json, config_sha).await?;
             tracing::info!(%repo_id, config_sha, "applied config");
+            record::append_event(
+                pool,
+                Some(repo_id),
+                None,
+                None,
+                "intake",
+                "config_applied",
+                serde_json::json!({ "config_sha": config_sha }),
+            )
+            .await?;
             Ok(ApplyOutcome::Applied)
         }
         Err(e) => {
             tracing::warn!(%repo_id, error = %e, "invalid .factory/config.yml; keeping last good");
+            record::append_event(
+                pool,
+                Some(repo_id),
+                None,
+                None,
+                "intake",
+                "config_rejected_kept_last_good",
+                serde_json::json!({ "config_sha": config_sha, "error": e.to_string() }),
+            )
+            .await?;
             Ok(ApplyOutcome::RejectedKeptLastGood)
         }
     }

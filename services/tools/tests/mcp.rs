@@ -508,13 +508,19 @@ async fn mcp_tools_call_conflict_is_retryable_error() {
     };
     let fx = fixture_with(&pool, "issue#120", FakeGitHub::new()).await;
 
-    // Pre-seed a PENDING idempotency claim for escalate's per-task default slot
-    // (scope "escalate", key "task" — the constant default when no dedupe_key is
-    // passed). A claim with no recorded result is the "winner in flight" placeholder:
-    // the next caller for the same slot gets IdempotencyClaim::Pending → Conflict.
-    let claim = record::idempotency_claim(&pool, fx.work_item_id, "escalate", "task")
-        .await
-        .expect("seed claim");
+    // Pre-seed a PENDING idempotency claim for escalate's per-reason default slot
+    // (scope "escalate", key "escalate:needs_decision" — the default when no dedupe_key
+    // is passed, derived from the reason below). A claim with no recorded result is the
+    // "winner in flight" placeholder: the next caller for the same slot gets
+    // IdempotencyClaim::Pending → Conflict.
+    let claim = record::idempotency_claim(
+        &pool,
+        fx.work_item_id,
+        "escalate",
+        "escalate:needs_decision",
+    )
+    .await
+    .expect("seed claim");
     assert_eq!(
         claim,
         record::IdempotencyClaim::Won,
@@ -522,7 +528,8 @@ async fn mcp_tools_call_conflict_is_retryable_error() {
     );
 
     // Drive escalate over MCP with NO dedupe_key → it claims (scope "escalate", key
-    // "task"), finds the pending placeholder, and returns a retryable Conflict.
+    // "escalate:needs_decision"), finds the pending placeholder, and returns a retryable
+    // Conflict.
     let (status, body) = mcp_call(
         fx.state.clone(),
         Some(&fx.raw_token),

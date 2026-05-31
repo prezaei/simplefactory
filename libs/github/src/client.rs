@@ -565,6 +565,17 @@ mod tests {
     }
 
     #[test]
+    fn is_green_covers_every_check_conclusion_variant() {
+        // The SINGLE source of truth for the green definition (FIX 6). GitHub treats
+        // neutral/skipped as passing, so Success and Neutral are green; Failure and
+        // Pending are not. Asserted for ALL variants of CheckConclusion.
+        assert!(CheckConclusion::Success.is_green(), "Success is green");
+        assert!(CheckConclusion::Neutral.is_green(), "Neutral is green");
+        assert!(!CheckConclusion::Failure.is_green(), "Failure is not green");
+        assert!(!CheckConclusion::Pending.is_green(), "Pending is not green");
+    }
+
+    #[test]
     fn rollup_empty_checks_and_empty_statuses_is_success() {
         // Genuinely no gating (zero checks AND zero statuses) → mergeable on GitHub.
         let summary = CheckSummary::rollup(vec![]);

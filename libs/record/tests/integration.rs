@@ -233,6 +233,122 @@ async fn purge_removes_only_old_terminal_items() {
 }
 
 #[tokio::test]
+async fn purge_spares_a_terminal_item_that_still_owns_a_live_cr() {
+    // A coder succeeds (terminal) but its change request is still in review past the
+    // retention window. Purging the work item would null the live CR's owner link
+    // (FK is ON DELETE SET NULL) and strand it — so purge must SPARE it until the CR
+    // itself is terminal (merged/closed).
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("purge-livecr"), 1)
+        .await
+        .unwrap();
+    let EnqueueOutcome::Inserted(coder) = record::enqueue(&pool, &coder_item(repo, "issue#7"))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let cr = record::upsert_change_request_for_item(&pool, repo, coder, "factory/issue-7", Some(7))
+        .await
+        .unwrap();
+    record::set_state(&pool, coder, State::Succeeded)
+        .await
+        .unwrap();
+    // Age the succeeded coder well past any cutoff.
+    sqlx::query("UPDATE work_items SET updated_at = now() - interval '10 days' WHERE id = $1")
+        .bind(coder)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // CR is still 'draft' (non-terminal) → the owning work item is spared.
+    record::purge_terminal(&pool, Utc::now() - chrono::Duration::days(1))
+        .await
+        .unwrap();
+    assert!(
+        record::work_item_by_id(&pool, coder)
+            .await
+            .unwrap()
+            .is_some(),
+        "a terminal item owning a non-terminal CR must NOT be purged"
+    );
+    assert!(
+        record::change_request_for_item(&pool, coder)
+            .await
+            .unwrap()
+            .is_some(),
+        "the live CR's owner link must be intact"
+    );
+
+    // Once the CR reaches a terminal state, the work item becomes purgeable.
+    record::set_change_request_state(&pool, cr.id, "merged")
+        .await
+        .unwrap();
+    record::purge_terminal(&pool, Utc::now() - chrono::Duration::days(1))
+        .await
+        .unwrap();
+    assert!(
+        record::work_item_by_id(&pool, coder)
+            .await
+            .unwrap()
+            .is_none(),
+        "once the CR is terminal, the terminal work item is purged"
+    );
+}
+
+#[tokio::test]
+async fn finish_attempt_persists_each_terminal_status_and_is_idempotent() {
+    // "Every enum variant through every entry point": drive each terminal AttemptStatus
+    // through finish_attempt, assert it persists, and that re-finishing is a no-op
+    // (a terminal attempt is never re-finished).
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("attempt-status"), 1)
+        .await
+        .unwrap();
+    let EnqueueOutcome::Inserted(item) = record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+
+    for status in [
+        record::AttemptStatus::Succeeded,
+        record::AttemptStatus::Failed,
+        record::AttemptStatus::Blocked,
+        record::AttemptStatus::Reclaimed,
+    ] {
+        let attempt = record::start_attempt(&pool, item, None).await.unwrap();
+        // First finish wins.
+        assert!(
+            record::finish_attempt(&pool, attempt, status, Some("done"))
+                .await
+                .unwrap(),
+            "first finish to {} succeeds",
+            status.as_str()
+        );
+        // The status persisted.
+        let persisted: String = sqlx::query_scalar("SELECT status FROM attempts WHERE id = $1")
+            .bind(attempt)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(persisted, status.as_str());
+        // Re-finishing a terminal attempt is a no-op (idempotent).
+        assert!(
+            !record::finish_attempt(&pool, attempt, record::AttemptStatus::Failed, None)
+                .await
+                .unwrap(),
+            "a terminal attempt is not re-finished"
+        );
+    }
+}
+
+#[tokio::test]
 async fn reclaim_also_recovers_expired_running_items() {
     // A worker that reaches `running` and then crashes must be reclaimable too —
     // otherwise it holds a cap slot forever.

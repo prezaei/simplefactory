@@ -496,15 +496,15 @@ async fn escalate_same_item_reason_distinct_keys_is_idempotent_not_db_error() {
 }
 
 #[tokio::test]
-async fn escalate_is_idempotent_per_task_without_a_dedupe_key() {
+async fn escalate_is_idempotent_for_one_reason_without_a_dedupe_key() {
     let Some(pool) = pool_or_skip().await else {
         eprintln!("SKIP: DATABASE_URL not set");
         return;
     };
     let fx = fixture_with(&pool, "issue#131", FakeGitHub::new()).await;
 
-    // No dedupe_key on either call: escalate must still be idempotent per task,
-    // defaulting to a per-task key.
+    // No dedupe_key on either call, same reason: escalate must be idempotent,
+    // defaulting to the per-reason key `escalate:<reason>`.
     let args = json!({ "reason": "needs_decision", "context": "ship it?" });
     let (s1, b1) = http_call(fx.state.clone(), &fx.raw_token, "escalate", args.clone()).await;
     let (s2, b2) = http_call(fx.state.clone(), &fx.raw_token, "escalate", args).await;
@@ -556,12 +556,11 @@ async fn escalate_same_reason_twice_without_key_is_idempotent_and_keeps_state() 
 }
 
 #[tokio::test]
-async fn escalate_is_one_per_task_regardless_of_reason() {
-    // Spec invariant: ONE escalation per task. With no dedupe_key the key defaults to a
-    // per-task constant, so a LATER escalate with a DIFFERENT reason dedupes to the
-    // first — no second escalation row, no second comment, and the state stays as the
-    // FIRST escalation left it. The FIRST escalation defines the task's escalation and
-    // state; a later escalate (any reason) hits Done and is a no-op.
+async fn escalate_dedupes_same_reason_but_allows_a_distinct_reason() {
+    // Invariant: ONE escalation per (task, reason). With no dedupe_key the key defaults
+    // to a per-reason value (`escalate:<reason>`), so a repeat of the SAME reason dedupes
+    // to the first, but a DIFFERENT reason gets its own escalation — it is NOT swallowed.
+    // This mirrors the DB UNIQUE (work_item_id, reason) index.
     let Some(pool) = pool_or_skip().await else {
         eprintln!("SKIP: DATABASE_URL not set");
         return;
@@ -578,14 +577,21 @@ async fn escalate_is_one_per_task_regardless_of_reason() {
     .await;
     assert_eq!(s1, StatusCode::OK);
     assert_eq!(b1["state"], "blocked");
-    let item = record::work_item_by_id(&pool, fx.work_item_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(item.state, State::Blocked);
 
-    // Later: a DIFFERENT reason (retries_exhausted) with no key must dedupe to the
-    // first escalation — same escalation id, no state change.
+    // A REPEAT of the same reason with no key dedupes to the first — same escalation id,
+    // no second row, no second comment.
+    let (s_dup, b_dup) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "escalate",
+        json!({ "reason": "blocked_input", "context": "still waiting" }),
+    )
+    .await;
+    assert_eq!(s_dup, StatusCode::OK);
+    assert_eq!(b1["escalation_id"], b_dup["escalation_id"]);
+
+    // A DIFFERENT reason (retries_exhausted) with no key must escalate on its own —
+    // distinct escalation id, and it moves the item to the terminal escalated state.
     let (s2, b2) = http_call(
         fx.state.clone(),
         &fx.raw_token,
@@ -594,31 +600,28 @@ async fn escalate_is_one_per_task_regardless_of_reason() {
     )
     .await;
     assert_eq!(s2, StatusCode::OK);
-    // Same escalation id as the first (deduped), and the state reflects the FIRST
-    // escalation (Blocked), NOT the second reason's terminal mapping.
-    assert_eq!(b1["escalation_id"], b2["escalation_id"]);
-    assert_eq!(b2["state"], "blocked");
+    assert_ne!(
+        b1["escalation_id"], b2["escalation_id"],
+        "a distinct reason must not dedupe to the first escalation"
+    );
+    assert_eq!(b2["state"], "escalated");
 
-    // Exactly ONE escalation row and exactly ONE comment for the whole task.
+    // Exactly TWO escalation rows (one per distinct reason) and exactly TWO comments.
     assert_eq!(
         record::count_escalations_for_item(&pool, fx.work_item_id)
             .await
             .unwrap(),
-        1,
-        "one escalation per task regardless of reason"
+        2,
+        "one escalation per distinct reason"
     );
-    assert_eq!(count_calls(&fx.gh, "post_comment"), 1);
+    assert_eq!(count_calls(&fx.gh, "post_comment"), 2);
 
-    // The item stays at the first escalation's state (blocked), not escalated.
+    // The item reflects the most recent (terminal) escalation.
     let item = record::work_item_by_id(&pool, fx.work_item_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        item.state,
-        State::Blocked,
-        "the first escalation defines the task's state; the later reason is a no-op"
-    );
+    assert_eq!(item.state, State::Escalated);
 }
 
 #[tokio::test]
@@ -1458,4 +1461,146 @@ async fn concurrent_submit_review_with_key_submits_exactly_once() {
         1,
         "exactly one review submitted despite concurrent calls"
     );
+}
+
+// Variant coverage: submit_review's record_verdict_cr_state side effect — approve →
+// approved, request_changes → changes_requested, comment → no state change — and
+// record_outcome's terminal statuses driven through the REST HTTP route.
+
+#[tokio::test]
+async fn submit_review_verdict_reflects_onto_cr_factory_state() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+
+    // approve → approved
+    let fa = fixture_with(&pool, "cr#601", FakeGitHub::new()).await;
+    let cra = record::upsert_change_request_for_item(
+        &pool,
+        fa.auth.repo_id,
+        fa.work_item_id,
+        "factory/cr-601",
+        Some(1),
+    )
+    .await
+    .unwrap();
+    record::set_change_request_number(&pool, cra.id, 601)
+        .await
+        .unwrap();
+    let (s, _) = http_call(
+        fa.state.clone(),
+        &fa.raw_token,
+        "submit_review",
+        json!({ "cr_number": 601, "verdict": "approve", "body": "lgtm", "dedupe_key": "r" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        record::change_request_by_number(&pool, fa.auth.repo_id, 601)
+            .await
+            .unwrap()
+            .unwrap()
+            .factory_state,
+        "approved"
+    );
+
+    // request_changes → changes_requested
+    let fr = fixture_with(&pool, "cr#602", FakeGitHub::new()).await;
+    let crr = record::upsert_change_request_for_item(
+        &pool,
+        fr.auth.repo_id,
+        fr.work_item_id,
+        "factory/cr-602",
+        Some(1),
+    )
+    .await
+    .unwrap();
+    record::set_change_request_number(&pool, crr.id, 602)
+        .await
+        .unwrap();
+    let (s, _) = http_call(
+        fr.state.clone(),
+        &fr.raw_token,
+        "submit_review",
+        json!({ "cr_number": 602, "verdict": "request_changes", "body": "nope", "dedupe_key": "r" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        record::change_request_by_number(&pool, fr.auth.repo_id, 602)
+            .await
+            .unwrap()
+            .unwrap()
+            .factory_state,
+        "changes_requested"
+    );
+
+    // comment → no state change (stays at its initial draft)
+    let fc = fixture_with(&pool, "cr#603", FakeGitHub::new()).await;
+    let crc = record::upsert_change_request_for_item(
+        &pool,
+        fc.auth.repo_id,
+        fc.work_item_id,
+        "factory/cr-603",
+        Some(1),
+    )
+    .await
+    .unwrap();
+    record::set_change_request_number(&pool, crc.id, 603)
+        .await
+        .unwrap();
+    let initial = record::change_request_by_number(&pool, fc.auth.repo_id, 603)
+        .await
+        .unwrap()
+        .unwrap()
+        .factory_state;
+    let (s, _) = http_call(
+        fc.state.clone(),
+        &fc.raw_token,
+        "submit_review",
+        json!({ "cr_number": 603, "verdict": "comment", "body": "fyi", "dedupe_key": "r" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        record::change_request_by_number(&pool, fc.auth.repo_id, 603)
+            .await
+            .unwrap()
+            .unwrap()
+            .factory_state,
+        initial,
+        "a comment verdict does not change the CR factory state"
+    );
+}
+
+#[tokio::test]
+async fn record_outcome_terminal_statuses_through_rest_route() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    // succeeded and failed are work-item-terminal; blocked is resumable. Drive each
+    // through the REST HTTP route (not just the lib fn) and assert the 200 + state.
+    for (status, want_state) in [
+        ("succeeded", "succeeded"),
+        ("failed", "failed"),
+        ("blocked", "blocked"),
+    ] {
+        let fx = fixture_with(&pool, &format!("issue#{status}"), FakeGitHub::new()).await;
+        let (s, body) = http_call(
+            fx.state.clone(),
+            &fx.raw_token,
+            "record_outcome",
+            json!({ "status": status, "summary": "via rest" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{status} returns 200 over REST");
+        assert_eq!(body["state"], want_state, "{status} sets work item state");
+        let item = record::work_item_by_id(&pool, fx.work_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.state.as_str(), want_state);
+    }
 }
