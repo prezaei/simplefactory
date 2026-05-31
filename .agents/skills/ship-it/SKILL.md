@@ -128,8 +128,8 @@ Run these checks, then hand off to agents. Abort with a clear error if any fail.
    **Step 6a — Classic branch protection:**
 
    ```bash
-   # Add `--hostname <host>` on GHE. Auto-detect from step 5.
-   gh api [--hostname <host>] repos/<owner>/<repo>/branches/<base_branch>/protection \
+   # On GitHub Enterprise, add `--hostname <host>` (the value detected in step 5) to the `gh api` call.
+   gh api repos/<owner>/<repo>/branches/<base_branch>/protection \
      --jq '.required_status_checks.contexts // []' 2>&1
    ```
 
@@ -143,7 +143,8 @@ Run these checks, then hand off to agents. Abort with a clear error if any fail.
    **Step 6b — Rulesets (new GitHub mechanism):**
 
    ```bash
-   gh api [--hostname <host>] repos/<owner>/<repo>/rules/branches/<base_branch> \
+   # On GitHub Enterprise, add `--hostname <host>` (the value detected in step 5) to the `gh api` call.
+   gh api repos/<owner>/<repo>/rules/branches/<base_branch> \
      --jq '[.[] | select(.type == "required_status_checks") | (.parameters.required_status_checks // []) | .[].context]' 2>&1
    ```
 
@@ -179,7 +180,8 @@ Run these checks, then hand off to agents. Abort with a clear error if any fail.
    **Always probe for Copilot availability and request the reviewer now** (no flag — this is default behavior). Attempt to request the fixed Copilot reviewer login during pre-flight so the review actually gets triggered, then record whether Copilot is usable on this repo:
 
    ```bash
-   gh api [--hostname <host>] --method POST \
+   # On GitHub Enterprise, add `--hostname <host>` (the value detected in step 5) to the `gh api` call.
+   gh api --method POST \
      repos/<owner>/<repo>/pulls/<number>/requested_reviewers \
      -f "reviewers[]=copilot-pull-request-reviewer[bot]"
    ```
@@ -328,7 +330,8 @@ This is because `gh pr merge` tries to checkout and update the base branch local
 **Always use the REST API** — it does the merge entirely server-side with no local git manipulation:
 
 ```bash
-gh api [--hostname <host>] --method PUT \
+# On GitHub Enterprise, add `--hostname <host>` to the `gh api` call, where `<host>` is `state.ghe_hostname` (non-null).
+gh api --method PUT \
   repos/<owner>/<repo>/pulls/<N>/merge \
   -f merge_method=squash
 # Response: {"sha": "...", "merged": true, "message": "..."}
@@ -339,7 +342,8 @@ gh api [--hostname <host>] --method PUT \
 Branch deletion is typically handled by the merge (GitHub auto-deletes on squash-merge when configured). If the PR's repo doesn't auto-delete, explicitly:
 
 ```bash
-gh api [--hostname <host>] --method DELETE \
+# On GitHub Enterprise, add `--hostname <host>` to the `gh api` call, where `<host>` is `state.ghe_hostname` (non-null).
+gh api --method DELETE \
   repos/<owner>/<repo>/git/refs/heads/<branch>
 ```
 
@@ -352,7 +356,8 @@ A 422 "Reference does not exist" response from the DELETE means the branch was a
 - **When `copilot_available` is true** (the default on Copilot-enabled repos), NEVER merge unless `copilot-pull-request-reviewer[bot]` has *submitted* a review (`state != "PENDING"` — a PENDING draft does not count) whose `commit_id` equals the exact current HEAD SHA AND every new comment from that review is triaged. PAGINATE both APIs with `--paginate` (the reviews API AND the comments API each cap at 30/page — without pagination the Copilot review/comment can be on a later page and silently missed) and check review-thread resolution via GraphQL (loop the `reviewThreads` cursor to cover ALL threads) — see the playbook. The Copilot-on-HEAD check is computed in the playbook's [Step 3d](references/iteration-playbook-template.md) (wait-check) and [Step 4 Gate 5](references/iteration-playbook-template.md) (merge gate). A review on a superseded commit does NOT count; a pushed fix resets the gate to the new HEAD (re-request the reviewer). When Copilot is unavailable on the repo (`copilot_available: false`), this gate is skipped and behavior is unchanged.
 - **`ACTION_REQUIRED` is a bucket code, not a diagnosis.** Never interpret it in isolation. The same conclusion covers at least three different real states: (1) the check was *skipped because the branch has merge conflicts with the base* (title: `"Skipped due to merge conflicts"`), (2) the check is *waiting for a human to approve the pipeline run* (ADO PR pipelines on GHE do this for external contributors), (3) the check is a *compliance gate asking for a human click* (e.g. GHE `GitOps/GitHubPop` with title `"Proof of presence"`). **Always** fetch `output.title` and `output.summary` from the Check Runs API before classifying:
   ```bash
-  gh api [--hostname <host>] repos/<owner>/<repo>/commits/<head_sha>/check-runs \
+  # On GitHub Enterprise, add `--hostname <host>` to the `gh api` call, where `<host>` is `state.ghe_hostname` (non-null).
+  gh api repos/<owner>/<repo>/commits/<head_sha>/check-runs \
     --jq '.check_runs[] | select(.name=="<name>") | {conclusion, title: .output.title, summary: .output.summary}'
   ```
   Classify by title:

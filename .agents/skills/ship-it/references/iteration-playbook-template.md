@@ -437,11 +437,11 @@ Run the exact-login / current-HEAD check:
 
 ```bash
 HEAD=$(gh pr view {{PR_NUMBER}} --json headRefOid -q .headRefOid)
-gh api --paginate [--hostname <host>] repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
+gh api --paginate repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
   --jq "[.[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\" and .state != \"PENDING\")] | length"   # must be >= 1
 ```
 
-(Add `--hostname` from `state.ghe_hostname` when non-null, per the convention used elsewhere.)
+On GitHub Enterprise, add `--hostname <host>` to the `gh api` calls, where `<host>` is `state.ghe_hostname` (non-null).
 
 **PAGINATE** the reviews endpoint with `--paginate` — it returns at most 30 reviews per page, so on a PR with many reviews the Copilot review can fall onto a later page and be silently missed, breaking the gate. **Exclude PENDING reviews**: a `state == "PENDING"` review is an unsubmitted draft the bot has not yet posted — it must NOT satisfy the gate. Only submitted states count (COMMENTED, APPROVED, CHANGES_REQUESTED, DISMISSED).
 
@@ -453,10 +453,11 @@ gh api --paginate [--hostname <host>] repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews
      # Check whether the reviewer is still in the requested list:
      gh pr view {{PR_NUMBER}} --json reviewRequests -q '.reviewRequests[].login'
      # If absent (or the ~2-iteration threshold is hit), re-request:
-     gh api [--hostname <host>] --method POST \
+     gh api --method POST \
        repos/{{REPO}}/pulls/{{PR_NUMBER}}/requested_reviewers \
        -f "reviewers[]=copilot-pull-request-reviewer[bot]"
      ```
+     On GitHub Enterprise, add `--hostname <host>` to the `gh api` call, where `<host>` is `state.ghe_hostname` (non-null).
      A pushed fix (HEAD moved) also warrants a re-request, since the prior review no longer applies to the new HEAD.
   3. Append an iteration record with `action: "waiting_copilot_review"` and the HEAD SHA in `details`. Update state, **exit the iteration** — the cron retries next cycle.
 
@@ -533,7 +534,7 @@ When true, run the exact-login / current-HEAD assertion and ABORT the merge (exi
 
 ```bash
 HEAD=$(gh pr view {{PR_NUMBER}} --json headRefOid -q .headRefOid)
-COUNT=$(gh api --paginate [--hostname <host>] repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
+COUNT=$(gh api --paginate repos/{{REPO}}/pulls/{{PR_NUMBER}}/reviews \
   --jq "[.[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\" and .state != \"PENDING\")] | length")
 # --paginate: the reviews endpoint caps at 30/page — without it the Copilot review can be on a later page and be missed.
 # .state != "PENDING": skip unsubmitted draft reviews; only submitted reviews (COMMENTED/APPROVED/CHANGES_REQUESTED/DISMISSED) satisfy the gate.
@@ -542,7 +543,7 @@ COUNT=$(gh api --paginate [--hostname <host>] repos/{{REPO}}/pulls/{{PR_NUMBER}}
 # update state, and EXIT the iteration. Do NOT merge.
 ```
 
-(Add `--hostname` from `state.ghe_hostname` when non-null.)
+On GitHub Enterprise, add `--hostname <host>` to the `gh api` calls, where `<host>` is `state.ghe_hostname` (non-null).
 
 Additionally, every NEW inline comment from that HEAD review must already be triaged (its id present in `triaged_comment_ids`) AND no Copilot review thread may be left unresolved. Gate 2 (fresh comment re-check) enforces this — but ONLY if it paginated and matched the right login: re-fetch with `gh api --paginate` (comments cap at 30/page) and match Copilot comments by login "Copilot" (the reviews API uses the bot slug; the comments API uses "Copilot"). Also re-run the GraphQL `reviewThreads { isResolved }` check (the variable-based `-F owner/-F repo/-F pr` query from Step 1 / Agent B — never string-interpolated or quote-escaped), looping the `pageInfo { hasNextPage, endCursor }` cursor until exhausted so ALL threads are covered (>100 threads spill onto later pages) — any unresolved thread routes back to Step 3b. If any comment from the qualifying review is untriaged or any thread is unresolved, do NOT merge; triage it first. A review on a SUPERSEDED commit does not satisfy this gate; a pushed fix resets it to the new HEAD.
 
