@@ -146,15 +146,20 @@ On each ship-it iteration (cron-fired), the loop must:
 1. **Verify Copilot reviewed the current HEAD:**
    ```bash
    HEAD=$(gh pr view <N> --json headRefOid -q .headRefOid)
-   gh api repos/{owner}/{repo}/pulls/<N>/reviews \
-     --jq "[.[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\")] | length"
+   gh api --paginate repos/{owner}/{repo}/pulls/<N>/reviews \
+     --jq ".[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\" and .state != \"PENDING\") | .id" | wc -l   # >= 1
+   # --paginate (the reviews endpoint caps at 30/page) + count lines, NOT `[...] | length`
+   # (with --paginate, --jq runs per page, so length is a per-page count, not the total).
    ```
    If `0`: log "waiting for Copilot review on <HEAD>" and exit the iteration (the cron retries). If still
    absent after ~2 iterations, or Copilot dropped from the requested-reviewers list, re-request it.
 2. **Triage EVERY new comment from that review (rule 1)** — fix in code (then green gate) or rebut inline
    (rule 5). Never silently skip one.
-3. **Run `/code-review` again on the just-pushed fix** (no deferral). Copilot and `/code-review` each
-   catch what the other misses — several rounds routinely catch defects *introduced by the previous fix*.
+3. **When a Copilot comment is fixed in code, run `/code-review` on that fix before pushing** (rule 4 — a
+   fix is new code; Copilot and `/code-review` each catch what the other misses, and rounds routinely
+   catch defects *introduced by the previous fix*). NOTE: `/ship-it` does **not** run `/code-review`
+   itself, so this pass is the fixer's responsibility — it's part of "fix it in code" (step 2), not a step
+   `/ship-it` performs. (For a docs/trivial fix where `/code-review` is N/A per Applicability, say so.)
 4. **Any pushed fix moves HEAD → the Copilot-on-HEAD gate RESETS:** re-request Copilot on the new HEAD
    and let the cron loop again.
 5. **Merge** (squash, via the REST API so it is worktree-safe) only when the exit condition holds.
