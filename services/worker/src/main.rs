@@ -120,9 +120,18 @@ impl ClaudeRunner for ClaudeCli {
         // Register the Factory Tools service as a Streamable-HTTP MCP server so
         // Claude reaches Factory (open CRs, etc.) through the authenticated
         // endpoint. The config carries the token (an Authorization header), so it is
-        // written to a 0600 file inside workdir and passed BY PATH — never on the
-        // command line, where `ps`/`/proc/<pid>/cmdline` would expose it.
-        let config_path = workdir.join(MCP_CONFIG_FILENAME);
+        // written to a 0600 file and passed BY PATH — never on the command line,
+        // where `ps`/`/proc/<pid>/cmdline` would expose it.
+        //
+        // The config file lives in a scratch directory *outside* `workdir` (the
+        // cloned repo's working tree), NOT inside it. Claude runs headless with
+        // `--dangerously-skip-permissions` and can run arbitrary git commands; if
+        // the config were inside the tree, a `git add -A`/`git add .` + commit
+        // would capture the token and the subsequent `push_branch` would publish it
+        // to the remote. Keeping it outside the tree means git never sees it.
+        let scratch_dir = mcp_scratch_dir();
+        tokio::fs::create_dir_all(&scratch_dir).await?;
+        let config_path = scratch_dir.join(MCP_CONFIG_FILENAME);
         write_mcp_config_file(&config_path, tools_url, token).await?;
 
         let args = claude_args(&config_path, prompt);
@@ -132,10 +141,10 @@ impl ClaudeRunner for ClaudeCli {
             .output()
             .await;
 
-        // Best-effort delete the config file once the run is done, whether it
-        // succeeded or failed, so the token does not linger on disk.
-        if let Err(e) = tokio::fs::remove_file(&config_path).await {
-            tracing::warn!(error = %e, "ClaudeCli: failed to remove MCP config file");
+        // Best-effort delete the entire scratch directory once the run is done,
+        // whether it succeeded or failed, so the token does not linger on disk.
+        if let Err(e) = tokio::fs::remove_dir_all(&scratch_dir).await {
+            tracing::warn!(error = %e, "ClaudeCli: failed to remove MCP scratch dir");
         }
 
         let output = run?;
@@ -155,9 +164,16 @@ impl ClaudeRunner for ClaudeCli {
     }
 }
 
-/// The MCP config filename written inside the workdir. Dot-prefixed so it stays out
-/// of the way of the cloned repo's tree.
+/// The MCP config filename. Dot-prefixed by convention.
 const MCP_CONFIG_FILENAME: &str = ".factory-mcp.json";
+
+/// A unique scratch directory under the system temp dir for the MCP config file.
+/// Deliberately *outside* the cloned repo's working tree so the token-bearing
+/// config can never be staged/committed by Claude and pushed to the remote. A
+/// fresh UUID per run keeps concurrent workers from colliding.
+fn mcp_scratch_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("factory-mcp-{}", uuid::Uuid::new_v4()))
+}
 
 /// Write the MCP server config JSON to `path` *atomically* with Unix mode 0600
 /// (owner read/write only) so the embedded token is never world-readable, not even
@@ -377,6 +393,20 @@ mod tests {
         // The token appears exactly once, inside the Authorization header value.
         assert_eq!(raw.matches(TOKEN).count(), 1);
         assert!(raw.contains(&format!("Bearer {TOKEN}")));
+    }
+
+    #[test]
+    fn mcp_scratch_dir_is_outside_temp_dir_root_and_unique() {
+        // The scratch dir lives under the system temp dir (never inside a repo
+        // working tree), so the token-bearing config can't be committed/pushed.
+        let a = mcp_scratch_dir();
+        let b = mcp_scratch_dir();
+        assert!(
+            a.starts_with(std::env::temp_dir()),
+            "scratch dir must be under the system temp dir, not a repo tree"
+        );
+        // A fresh UUID per call → concurrent workers never collide.
+        assert_ne!(a, b, "each call yields a unique scratch dir");
     }
 
     #[test]
