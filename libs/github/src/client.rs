@@ -548,4 +548,68 @@ mod tests {
             .unwrap()
             .is_none());
     }
+
+    // FIX B: the rollup is the PURE function the live `check_status` feeds the UNION of
+    // check-run conclusions AND commit-status conclusions into. These cover the union
+    // semantics without any network: an empty Checks API is NOT green when a failing
+    // status exists, and the merged list rolls up correctly. Conclusions are tagged by
+    // origin (a `check:`/`status:` context prefix) only for readability; `rollup` treats
+    // every entry uniformly.
+
+    fn check(name: &str, c: CheckConclusion) -> (String, CheckConclusion) {
+        (format!("check:{name}"), c)
+    }
+
+    fn status(ctx: &str, c: CheckConclusion) -> (String, CheckConclusion) {
+        (format!("status:{ctx}"), c)
+    }
+
+    #[test]
+    fn rollup_empty_checks_and_empty_statuses_is_success() {
+        // Genuinely no gating (zero checks AND zero statuses) → mergeable on GitHub.
+        let summary = CheckSummary::rollup(vec![]);
+        assert_eq!(summary.overall, CheckConclusion::Success);
+        assert!(summary.checks.is_empty());
+    }
+
+    #[test]
+    fn rollup_empty_checks_with_failing_status_is_failure() {
+        // The exact bug FIX B closes: no check runs, but a failing legacy status → Failure
+        // (NOT green just because the Checks API was empty).
+        let summary = CheckSummary::rollup(vec![status("ci/legacy", CheckConclusion::Failure)]);
+        assert_eq!(summary.overall, CheckConclusion::Failure);
+        assert_eq!(summary.checks.len(), 1, "the status context is retained");
+    }
+
+    #[test]
+    fn rollup_empty_checks_with_pending_status_is_pending() {
+        let summary = CheckSummary::rollup(vec![status("ci/legacy", CheckConclusion::Pending)]);
+        assert_eq!(summary.overall, CheckConclusion::Pending);
+        assert_eq!(summary.checks.len(), 1);
+    }
+
+    #[test]
+    fn rollup_passing_check_with_failing_status_is_failure() {
+        // A green check run cannot mask a failing status: any Failure in the union wins.
+        let summary = CheckSummary::rollup(vec![
+            check("build", CheckConclusion::Success),
+            status("ci/legacy", CheckConclusion::Failure),
+        ]);
+        assert_eq!(summary.overall, CheckConclusion::Failure);
+        assert_eq!(
+            summary.checks.len(),
+            2,
+            "both the check-run name and the status context are kept for telemetry"
+        );
+    }
+
+    #[test]
+    fn rollup_passing_check_with_passing_status_is_success() {
+        let summary = CheckSummary::rollup(vec![
+            check("build", CheckConclusion::Success),
+            status("ci/legacy", CheckConclusion::Success),
+        ]);
+        assert_eq!(summary.overall, CheckConclusion::Success);
+        assert_eq!(summary.checks.len(), 2);
+    }
 }

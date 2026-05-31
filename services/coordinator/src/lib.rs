@@ -65,11 +65,6 @@ use factory_record::{
 };
 use uuid::Uuid;
 
-/// The human handed work on escalation / ready-for-merge. Factory has no per-repo
-/// human identity in scope yet, so a single placeholder assignee is used; a real
-/// owner mapping is a later refinement. (Assignment is idempotent on GitHub.)
-const HANDOFF_ASSIGNEE: &str = "factory-human";
-
 /// Platform-default retry ceiling (mirrors `factory_config`'s `default_retry_cap`).
 /// Used as the floor when a stored config carries a `retry_cap < 1` (F2).
 const DEFAULT_RETRY_CAP: u32 = 3;
@@ -283,7 +278,14 @@ async fn react_to_item(
     // Commit the atomic claim+decision, then run the GitHub side effects. A crash here
     // leaves the decision RECORDED (recoverable) rather than the whole react lost.
     tx.commit().await?;
-    run_post_commit(gh, &repo, item, post_commit).await?;
+    run_post_commit(
+        gh,
+        &repo,
+        item,
+        config.settings.escalation_assignee.as_deref(),
+        post_commit,
+    )
+    .await?;
     Ok(true)
 }
 
@@ -324,6 +326,7 @@ async fn run_post_commit(
     gh: &dyn GitHubClient,
     repo: &RepoRef,
     item: &WorkItem,
+    escalation_assignee: Option<&str>,
     post_commit: PostCommit,
 ) -> anyhow::Result<()> {
     match post_commit {
@@ -339,12 +342,7 @@ async fn run_post_commit(
                 return Ok(());
             }
             gh.post_comment(repo, comment_target, &body).await?;
-            if let Some(issue) = assign_issue {
-                gh.assign_issue(repo, issue, HANDOFF_ASSIGNEE).await?;
-                tracing::info!(work_item = %item.id, issue, "reviewer approved: CR ready, handed to human; issue stays open awaiting merge");
-            } else {
-                tracing::warn!(work_item = %item.id, "approved CR has no linked issue; marked ready without issue handoff");
-            }
+            assign_human(gh, repo, item, escalation_assignee, assign_issue).await?;
             Ok(())
         }
         PostCommit::Escalation {
@@ -366,13 +364,39 @@ async fn run_post_commit(
                     tracing::warn!(work_item = %item.id, reason, "escalation comment target unresolved; recorded escalation without a comment");
                 }
             }
-            if let Some(issue) = assign_issue {
-                gh.assign_issue(repo, issue, HANDOFF_ASSIGNEE).await?;
-            }
+            assign_human(gh, repo, item, escalation_assignee, assign_issue).await?;
             tracing::info!(work_item = %item.id, reason, "escalation created; side effects applied");
             Ok(())
         }
     }
+}
+
+/// Assign the linked issue to the configured escalation assignee, if one is configured
+/// AND there is an issue to assign. When `escalation_assignee` is unset (FIX A) the
+/// handoff/escalation comment was still posted by the caller, but NO assignment is made:
+/// a hardcoded placeholder user would be rejected by GitHub on repos where it isn't
+/// assignable, AFTER the react tx has committed — leaving the handoff recorded with no
+/// retriable assignment. Skipping the assignment keeps the comment as the human signal.
+async fn assign_human(
+    gh: &dyn GitHubClient,
+    repo: &RepoRef,
+    item: &WorkItem,
+    escalation_assignee: Option<&str>,
+    assign_issue: Option<i64>,
+) -> anyhow::Result<()> {
+    match (escalation_assignee, assign_issue) {
+        (Some(assignee), Some(issue)) => {
+            gh.assign_issue(repo, issue, assignee).await?;
+            tracing::info!(work_item = %item.id, issue, assignee, "issue assigned to escalation_assignee");
+        }
+        (None, _) => {
+            tracing::info!(work_item = %item.id, "no escalation_assignee configured; posting comment without assignment");
+        }
+        (Some(_), None) => {
+            tracing::warn!(work_item = %item.id, "no linked issue to assign; comment posted without assignment");
+        }
+    }
+    Ok(())
 }
 
 /// The pre-claim decision for a Succeeded reviewer: inspect the pre-loaded CR and
@@ -399,14 +423,19 @@ async fn load_approval_decision(
         return Ok(None);
     };
 
-    // D3: the two GitHub reads needed for the decision are independent — the CR view
-    // (for the can't-weaken-gating guard) and the check rollup (for the green gate) — so
-    // fetch them CONCURRENTLY rather than serially, halving the GitHub round-trip latency
-    // on the hot approval path. `try_join!` short-circuits on the first error.
-    let (view, checks) = tokio::try_join!(
-        gh.read_change_request(repo, number as i64),
-        gh.check_status(repo, CheckRef::ChangeRequest(number as i64)),
-    )?;
+    // Read the CR view FIRST (for the can't-weaken-gating guard) to resolve the head SHA,
+    // THEN the check rollup for THAT EXACT SHA. Resolving the SHA once and passing it as
+    // `CheckRef::Sha` (rather than letting `check_status` re-fetch the PR head itself):
+    //   1. dedupes the PR fetch — `check_status(ChangeRequest)` would otherwise do its own
+    //      `pulls().get` for the same number; and
+    //   2. closes a TOCTOU split — a concurrent `try_join` of the two reads could straddle
+    //      a force-push, so the guard's file list and the green gate would describe
+    //      DIFFERENT commits. Gating both on `view.head_sha` keeps them consistent.
+    // The lost read-concurrency is a negligible latency cost on this every-N-min path.
+    let view = gh.read_change_request(repo, number as i64).await?;
+    let checks = gh
+        .check_status(repo, CheckRef::Sha(view.head_sha.clone()))
+        .await?;
 
     // Can't-weaken-own-checks guard: if any changed file touches a configured gating
     // path, the change alters the very checks that gate it → never mark ready. The

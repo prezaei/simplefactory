@@ -277,6 +277,7 @@ settings:
   loop_cap: 5                    # review-rework cycles before the loop escalates loop_cap instead of dispatching another coder (default: 5)
   gating_paths:                  # path prefixes whose changes weaken a CR's own gating checks; such a CR is escalated, never marked ready (default: [".github/workflows/"])
     - ".github/workflows/"
+  escalation_assignee: octo-human # optional GitHub login assigned the linked issue on a ready-for-merge handoff / escalation; when unset, the comment is posted but NO assignment is made (default: unset/none)
 
 limits:
   max_concurrent_workers: 5      # global ceiling across all workers in this repo (platform default: 5)
@@ -456,6 +457,7 @@ Starting values. Per-repo `.factory/config.yml` may override the **capacity caps
 | Failed-attempt retries (`settings.retry_cap`) | **3** | Then escalate `retries_exhausted`; per-repo overridable. |
 | Per-issue review-rework loop cap (`settings.loop_cap`) | **5** | Coder↔Reviewer cycles; then escalate `loop_cap`; per-repo overridable. |
 | Gating paths (`settings.gating_paths`) | **`[".github/workflows/"]`** | A CR touching one weakens its own gating checks → escalated, never marked ready; per-repo overridable. |
+| Escalation/handoff assignee (`settings.escalation_assignee`) | **unset (none)** | GitHub login assigned the linked issue on a ready-for-merge handoff / escalation; when unset, the comment is posted but no assignment is made; per-repo overridable. |
 | Deterministic-crash resumes | **3** | Before falling through to a fresh attempt / escalation. |
 | Dispatcher poll interval | **5 s** | Ready-queue scan cadence (backs prompt-pickup-in-minutes). |
 | Worker lease | **15 min** | Extended by heartbeat; sweeper reclaims past expiry. |

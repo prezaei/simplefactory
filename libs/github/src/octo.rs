@@ -9,10 +9,16 @@
 //! with `Octocrab::builder().app(AppId, jsonwebtoken::EncodingKey)`. `secrecy`
 //! and `jsonwebtoken` are now direct dependencies, so the App/installation client
 //! can be constructed and every method is wired for real, including
-//! [`OctocrabGitHub::check_status`]: rather than `combined_status_for_ref` (which
-//! only accepts a `heads/`/`tags/`-prefixed `params::repos::Reference`, not a raw
-//! SHA), it reads the Checks API via `checks().list_check_runs_for_git_ref(..)`,
-//! which accepts a raw commit SHA as a `Commitish`. `read_change_request` populates
+//! [`OctocrabGitHub::check_status`]: it reads the Checks API via
+//! `checks().list_check_runs_for_git_ref(..)` (which accepts a raw commit SHA as a
+//! `Commitish`) AND folds in the legacy combined commit status for the same SHA, read
+//! via a raw REST GET to `/repos/{owner}/{name}/commits/{sha}/status` (FIX B —
+//! `combined_status_for_ref` only accepts a `heads/`/`tags/`-prefixed
+//! `params::repos::Reference`, not a raw SHA). It uses that endpoint's server-computed
+//! top-level `state` (authoritative over every context, pagination-immune) and merges it
+//! with the check runs before the rollup, so an empty Checks API result is never treated
+//! as green when a failing status exists.
+//! `read_change_request` populates
 //! the changed-file list for real (the coordinator's can't-weaken-own-gating guard
 //! depends on it) but still reports checks as `Pending` (the coordinator reads checks
 //! via `check_status` directly, so the CR-view check rollup is not on the hot approval
@@ -111,6 +117,30 @@ fn map_conclusion(conclusion: Option<&str>) -> CheckConclusion {
         | Some("action_required")
         | Some("startup_failure") => CheckConclusion::Failure,
         Some("neutral") | Some("skipped") => CheckConclusion::Neutral,
+        _ => CheckConclusion::Pending,
+    }
+}
+
+/// The minimal shape of the combined commit-status REST response
+/// (`GET /repos/{owner}/{name}/commits/{sha}/status`). We read the SERVER-computed
+/// top-level `state` (authoritative over EVERY context, so it cannot miss a failing
+/// status on a later page — unlike paging the `statuses` array, which defaults to 30)
+/// plus `total_count` to tell "no statuses at all" (which must stay green) apart from a
+/// pending/failing rollup. The rest of the (large) payload is ignored (FIX B).
+#[derive(serde::Deserialize)]
+struct CombinedStatus {
+    state: String,
+    total_count: u64,
+}
+
+/// Map a combined commit-status `state` to our [`CheckConclusion`] (FIX B). The Statuses
+/// API uses a small fixed vocabulary: success → Success; failure/error → Failure;
+/// pending → Pending. Anything unrecognized is conservatively `Pending` so an unknown
+/// state can never be read as green.
+fn map_status_state(state: &str) -> CheckConclusion {
+    match state {
+        "success" => CheckConclusion::Success,
+        "failure" | "error" => CheckConclusion::Failure,
         _ => CheckConclusion::Pending,
     }
 }
@@ -394,10 +424,34 @@ impl GitHubClient for OctocrabGitHub {
             page += 1;
         }
 
-        // FIX 2 + FIX 6: roll up through the SHARED rollup so the green definition lives
-        // in one place and the empty-is-green semantics match `FakeGitHub` exactly. Zero
-        // check runs → Success (a ref with no required checks is mergeable on GitHub), so
-        // a no-CI repo is handed off rather than wedged forever.
+        // FIX B: the Checks API (above) does NOT see legacy *commit statuses* (the older
+        // `/status` API many CI providers still post to). An empty Checks API result is
+        // NOT "green" when failing statuses exist — so ALSO fold in the combined commit
+        // status for the same SHA. `combined_status_for_ref` only accepts a `heads/`/
+        // `tags/` Reference (not a raw SHA), so we read the REST endpoint directly. We use
+        // the SERVER-computed top-level `state` (a single authoritative rollup over EVERY
+        // status context) rather than paging the `statuses` array — so a failing status on
+        // a later page can never be missed (the false-green a first-page-only read had).
+        let route = format!("/repos/{}/{}/commits/{}/status", repo.owner, repo.name, sha);
+        let status: CombinedStatus = client
+            .get(&route, None::<&()>)
+            .await
+            .map_err(|e| anyhow::anyhow!("reading combined commit status for {sha}: {e}"))?;
+        // Only fold the combined status when there is ≥1 status context. GitHub reports
+        // `state = "pending"` for a SHA with ZERO statuses, so without this guard a
+        // no-status repo would roll up Pending forever — the empty case must stay green.
+        if status.total_count > 0 {
+            checks.push((
+                "combined-status".to_owned(),
+                map_status_state(&status.state),
+            ));
+        }
+
+        // FIX 2 + FIX 6 + FIX B: roll up through the SHARED rollup over the UNION of
+        // check-run conclusions AND the commit-status conclusion, so the green definition
+        // lives in one place and the empty-is-green semantics match `FakeGitHub` exactly.
+        // Zero checks AND zero statuses → Success (a ref with no gating is mergeable on
+        // GitHub), so a no-CI repo is handed off rather than wedged forever.
         let summary = CheckSummary::rollup(checks);
         tracing::info!(owner = %repo.owner, name = %repo.name, %sha, overall = summary.overall.as_str(), count = summary.checks.len(), "read check status");
         Ok(summary)

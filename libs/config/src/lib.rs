@@ -55,6 +55,15 @@ pub struct Settings {
     /// `serde(default)` for back-compat with older stored config jsonb.
     #[serde(default = "default_loop_cap")]
     pub loop_cap: u32,
+    /// The GitHub login a ready-for-merge handoff / escalation assigns the linked issue
+    /// to. OPTIONAL: when unset (`None`) the coordinator posts the handoff/escalation
+    /// comment but performs NO assignment (a hardcoded placeholder user would be rejected
+    /// by GitHub on repos where it isn't assignable, after the react has already
+    /// committed). When `Some`, it must be a non-empty, trimmed login (validated at
+    /// [`parse`]). Defaults to unset. `serde(default)` so config jsonb stored before this
+    /// field existed still deserializes (back-compat for already-connected repos).
+    #[serde(default)]
+    pub escalation_assignee: Option<String>,
 }
 
 /// Global capacity limits.
@@ -127,6 +136,8 @@ pub enum ConfigError {
     MultipleIssueLabeledSubscribers { first: String, second: String },
     #[error("worker '{0}': instructions_file must be a non-empty path")]
     EmptyInstructionsFile(String),
+    #[error("settings.escalation_assignee must be a non-empty, trimmed GitHub login when set")]
+    EmptyEscalationAssignee,
 }
 
 /// Parse and validate a `.factory/config.yml` document.
@@ -145,6 +156,18 @@ pub fn parse(yaml: &str) -> Result<Config, ConfigError> {
     if raw.settings.loop_cap == 0 {
         return Err(ConfigError::NonPositiveLoopCap);
     }
+    // An escalation_assignee, when set, must be a real (non-empty, trimmed) login.
+    // A blank/whitespace value would assign to no one yet suppress the unset-skip path.
+    let escalation_assignee = match &raw.settings.escalation_assignee {
+        Some(a) => {
+            let trimmed = a.trim();
+            if trimmed.is_empty() {
+                return Err(ConfigError::EmptyEscalationAssignee);
+            }
+            Some(trimmed.to_owned())
+        }
+        None => None,
+    };
 
     let mut seen = HashSet::new();
     // Tracks the single worker allowed to subscribe to issue_labeled. A labelled
@@ -209,6 +232,7 @@ pub fn parse(yaml: &str) -> Result<Config, ConfigError> {
             gating_paths: raw.settings.gating_paths,
             retry_cap: raw.settings.retry_cap,
             loop_cap: raw.settings.loop_cap,
+            escalation_assignee,
         },
         limits: Limits {
             max_concurrent_workers: raw.limits.max_concurrent_workers,
@@ -325,6 +349,8 @@ struct RawSettings {
     retry_cap: u32,
     #[serde(default = "default_loop_cap")]
     loop_cap: u32,
+    #[serde(default)]
+    escalation_assignee: Option<String>,
 }
 
 impl Default for RawSettings {
@@ -336,6 +362,7 @@ impl Default for RawSettings {
             gating_paths: default_gating_paths(),
             retry_cap: default_retry_cap(),
             loop_cap: default_loop_cap(),
+            escalation_assignee: None,
         }
     }
 }
@@ -475,6 +502,28 @@ workers:
         // The retry/loop caps default when omitted (the platform defaults).
         assert_eq!(cfg.settings.retry_cap, 3);
         assert_eq!(cfg.settings.loop_cap, 5);
+        // escalation_assignee defaults to unset (no hardcoded human).
+        assert_eq!(cfg.settings.escalation_assignee, None);
+    }
+
+    #[test]
+    fn reads_escalation_assignee_trimmed() {
+        let cfg = parse(
+            "version: 1\nsettings:\n  label: factory\n  escalation_assignee: \"  octo-human  \"\n",
+        )
+        .expect("config with escalation_assignee should parse");
+        assert_eq!(
+            cfg.settings.escalation_assignee,
+            Some("octo-human".to_owned()),
+            "a set escalation_assignee is read and trimmed"
+        );
+    }
+
+    #[test]
+    fn rejects_blank_escalation_assignee() {
+        let err =
+            parse("version: 1\nsettings:\n  label: factory\n  escalation_assignee: \"   \"\n");
+        assert!(matches!(err, Err(ConfigError::EmptyEscalationAssignee)));
     }
 
     #[test]
@@ -624,6 +673,8 @@ workers:
         // The retry/loop caps also default for jsonb stored before they existed.
         assert_eq!(cfg.settings.retry_cap, 3);
         assert_eq!(cfg.settings.loop_cap, 5);
+        // escalation_assignee defaults to unset for jsonb stored before it existed.
+        assert_eq!(cfg.settings.escalation_assignee, None);
     }
 
     #[test]

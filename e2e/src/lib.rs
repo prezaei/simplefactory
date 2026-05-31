@@ -592,9 +592,12 @@ mod acceptance {
         repo: Uuid,
     ) -> (&'static str, &'static str, &'static str) {
         let (manager, coder, reviewer) = ("manager", "bug-fixer", "reviewer");
+        // `escalation_assignee` is set so handoff/escalation paths assign a human (FIX A):
+        // these tests assert exactly one assignment, which requires a configured assignee.
+        // The unset (no-assignment) case is covered by its own dedicated test.
         let yaml = format!(
             "version: 1\n\
-             settings:\n  label: factory\n\
+             settings:\n  label: factory\n  escalation_assignee: octo-human\n\
              limits:\n  max_concurrent_workers: 5\n\
              workers:\n\
              \x20 - name: {manager}\n    role: manager\n    on: [issue_labeled]\n\
@@ -832,6 +835,149 @@ mod acceptance {
             issue_state(&pool, repo, 1).await.as_deref(),
             Some("in_progress"),
             "the issue stays open (in_progress) awaiting the human's merge; NOT closed at handoff"
+        );
+    }
+
+    /// FIX A: with NO `escalation_assignee` configured, a ready-for-merge handoff posts
+    /// the handoff comment but performs NO assignment — exactly one comment, ZERO
+    /// assignments. (A hardcoded placeholder assignee would be rejected by GitHub on a
+    /// repo where it isn't assignable, after the react tx already committed.)
+    #[tokio::test]
+    async fn ready_handoff_without_escalation_assignee_posts_comment_but_no_assignment() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let serial = P4_SERIAL.lock().await;
+        drain_terminal(&pool).await;
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-p4-noassignee"), 1)
+            .await
+            .unwrap();
+
+        // A three-role config with escalation_assignee UNSET (the field is omitted).
+        let (manager, coder, reviewer) = ("manager", "bug-fixer", "reviewer");
+        let yaml = format!(
+            "version: 1\n\
+             settings:\n  label: factory\n\
+             limits:\n  max_concurrent_workers: 5\n\
+             workers:\n\
+             \x20 - name: {manager}\n    role: manager\n    on: [issue_labeled]\n\
+             \x20 - name: {coder}\n    role: coder\n    on: [manager, cr_changes_requested]\n\
+             \x20 - name: {reviewer}\n    role: reviewer\n    on: [cr_opened]\n"
+        );
+        let cfg = factory_config::parse(&yaml).expect("valid no-assignee config");
+        assert_eq!(
+            cfg.settings.escalation_assignee, None,
+            "this fixture deliberately leaves escalation_assignee unset"
+        );
+        let cfg_json = serde_json::to_value(&cfg).unwrap();
+        record::set_repo_config(&pool, repo, &cfg_json, "p4-sha")
+            .await
+            .unwrap();
+        let _ = manager;
+
+        // Open a CR on issue#1 (open_cr links the CR to issue 1) via a throwaway client.
+        let setup_gh = Arc::new(FakeGitHub::new());
+        let setup_state = tools_state(&pool, setup_gh.clone());
+        let (cr_number, _cr_row) = open_cr(&pool, repo, coder, &setup_state, "implemented").await;
+        let cr_subject = format!("cr#{cr_number}");
+
+        // The reviewer approves; checks are green so the approval path marks the CR ready.
+        let gh = Arc::new(FakeGitHub::new().with_checks(
+            &format!("sha-{cr_number}"),
+            CheckSummary {
+                overall: CheckConclusion::Success,
+                checks: vec![("ci".into(), CheckConclusion::Success)],
+            },
+        ));
+        let state = tools_state(&pool, gh.clone());
+        let reviewer_id =
+            enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, &cr_subject).await;
+        let reviewer_auth = task_auth(reviewer_id, repo, record::Kind::Reviewer);
+        factory_tools::submit_review(
+            &state,
+            &reviewer_auth,
+            cr_number,
+            "approve",
+            "LGTM",
+            Some("rev-1"),
+        )
+        .await
+        .unwrap();
+        mark_succeeded(&pool, reviewer_id).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        // The CR is marked ready and exactly one handoff comment was posted, but with NO
+        // assignee configured ZERO assignments ran.
+        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .expect("CR row");
+        assert_eq!(cr_row.factory_state, "ready", "CR is ready-for-human-merge");
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one handoff comment even without an assignee"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            0,
+            "no assignment when escalation_assignee is unset"
+        );
+        drop(serial);
+    }
+
+    /// FIX C: a terminal work item already marked `reacted = true` is NOT acted on by a
+    /// coordinator tick — it is filtered out of the un-reacted scan. This is exactly the
+    /// state the migration 0004 backfill (`UPDATE work_items SET reacted = true WHERE
+    /// state IN ('succeeded','failed','escalated')`) leaves PRE-EXISTING terminal rows in
+    /// on upgrade, so the first tick after upgrade never replays historical terminal rows
+    /// (no re-enqueued coders for old manager successes, no retry/escalate of old
+    /// failures). Here we mark the item reacted directly to simulate that backfilled state.
+    #[tokio::test]
+    async fn preexisting_reacted_terminal_item_is_skipped() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let (_serial, repo, (manager, _coder, _reviewer), gh, _state) =
+            p4_fixture(&pool, "e2e-p4-reacted").await;
+
+        // A succeeded manager item that — like a pre-coordinator historical row after the
+        // migration backfill — is already marked reacted. A NON-reacted succeeded manager
+        // would have the coordinator enqueue a coder; the backfilled reacted=true must
+        // suppress exactly that.
+        let manager_item =
+            enqueue_item(&pool, repo, record::Kind::Manager, manager, "issue#1").await;
+        mark_succeeded(&pool, manager_item).await;
+        assert!(
+            record::mark_reacted(&pool, manager_item).await.unwrap(),
+            "simulate the migration backfill: mark the pre-existing terminal row reacted"
+        );
+
+        let acted = coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        // The tick acted on ZERO items for this already-reacted row, enqueued no coder,
+        // left the issue untouched, and made no GitHub calls.
+        assert_eq!(
+            acted, 0,
+            "an already-reacted terminal item is acted on zero times"
+        );
+        assert!(
+            find_item(&pool, repo, record::Kind::Coder, "issue#1")
+                .await
+                .is_none(),
+            "no coder is enqueued for an already-reacted manager success"
+        );
+        assert_eq!(
+            issue_state(&pool, repo, 1).await,
+            None,
+            "the issue is never touched for an already-reacted item"
+        );
+        assert_eq!(
+            gh.calls().len(),
+            0,
+            "no GitHub side effects for an already-reacted item"
         );
     }
 
@@ -1190,7 +1336,7 @@ mod acceptance {
         let (manager, coder, reviewer) = ("manager", "bug-fixer", "reviewer");
         let yaml = format!(
             "version: 1\n\
-             settings:\n  label: factory\n  gating_paths:\n    - \"ci/\"\n\
+             settings:\n  label: factory\n  escalation_assignee: octo-human\n  gating_paths:\n    - \"ci/\"\n\
              limits:\n  max_concurrent_workers: 5\n\
              workers:\n\
              \x20 - name: {manager}\n    role: manager\n    on: [issue_labeled]\n\
