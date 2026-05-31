@@ -25,7 +25,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
-use crate::{audit_and_dispatch, authorize, bearer_token, Tool, ToolCallError, ToolsState};
+use crate::{
+    audit_and_dispatch, authorize, bearer_token, Tool, ToolCallError, ToolError, ToolsState,
+};
 
 /// JSON-RPC 2.0 error codes used by this transport.
 const PARSE_ERROR: i64 = -32700;
@@ -138,9 +140,12 @@ fn initialize_result(_state: &ToolsState) -> Value {
 }
 
 /// Route a `tools/call` to the existing tool function through the SAME audited
-/// choke point the REST layer uses. Per MCP convention, a tool error is a normal
-/// result with `isError: true` (not a JSON-RPC error); only envelope/param problems
-/// (unknown/missing tool name, malformed params) become JSON-RPC errors.
+/// choke point the REST layer uses. Error classification mirrors the REST layer's
+/// 400/500 split: a bad-request (caller's fault) becomes a JSON-RPC invalid-params
+/// error (like the REST 400), an internal failure becomes a normal result with
+/// `isError: true` so the model can see it (mapping the REST 500 to MCP convention),
+/// and a failed audit write becomes a JSON-RPC internal error. Envelope/param
+/// problems (unknown/missing tool name) are JSON-RPC errors as before.
 async fn handle_tools_call(
     state: &ToolsState,
     auth: &factory_record::TaskAuth,
@@ -171,9 +176,15 @@ async fn handle_tools_call(
             tracing::info!(tool = tool.as_str(), "mcp: tools/call ok");
             rpc_result_response(id, tool_content(&value, false))
         }
-        Err(ToolCallError::Tool(e)) => {
-            // MCP convention: tool-level errors are results with isError, so the
-            // client can show them to the model rather than failing the RPC.
+        Err(ToolCallError::Tool(ToolError::BadRequest(msg))) => {
+            // Invalid arguments are a JSON-RPC params problem, mirroring the REST
+            // layer's 400.
+            tracing::warn!(tool = tool.as_str(), error = %msg, "mcp: tools/call invalid params");
+            rpc_error_response(id, INVALID_PARAMS, &format!("Invalid params: {msg}"))
+        }
+        Err(ToolCallError::Tool(ToolError::Internal(e))) => {
+            // MCP convention: an internal tool failure is a result with isError, so
+            // the client can show it to the model rather than failing the RPC.
             tracing::error!(tool = tool.as_str(), error = %e, "mcp: tools/call tool error");
             rpc_result_response(id, tool_error_content(&e.to_string()))
         }

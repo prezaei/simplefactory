@@ -384,18 +384,23 @@ async fn mcp_notifications_initialized_has_no_body() {
 }
 
 // ===========================================================================
-// 8. tools/call get_check_status with no args → tool error result (isError)
+// 8. tools/call with bad args → JSON-RPC invalid-params error (FIX 4).
+// A client (bad-request) error maps to JSON-RPC -32602, mirroring the REST 400.
 // ===========================================================================
 
+/// JSON-RPC invalid-params code.
+const INVALID_PARAMS: i64 = -32602;
+
 #[tokio::test]
-async fn mcp_tools_call_tool_error_is_is_error_result() {
+async fn mcp_tools_call_bad_request_is_invalid_params_error() {
     let Some(pool) = pool_or_skip().await else {
         eprintln!("SKIP: DATABASE_URL not set");
         return;
     };
     let fx = fixture_with(&pool, "cr#12", FakeGitHub::new()).await;
 
-    // get_check_status with neither cr_number nor sha is a tool-level error.
+    // get_check_status with neither cr_number nor sha is a bad request (caller's
+    // fault) → JSON-RPC invalid-params error, not an isError result.
     let (status, body) = mcp_call(
         fx.state.clone(),
         Some(&fx.raw_token),
@@ -409,13 +414,13 @@ async fn mcp_tools_call_tool_error_is_is_error_result() {
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    // MCP convention: tool errors are results with isError, not JSON-RPC errors.
-    assert!(
-        body["error"].is_null(),
-        "tool error is not a JSON-RPC error"
-    );
-    assert_eq!(body["result"]["isError"], true);
-    assert!(body["result"]["content"][0]["text"].is_string());
+    // A bad request is a JSON-RPC error (invalid params), not a result.
+    assert!(body["result"].is_null(), "bad request is not a tool result");
+    assert_eq!(body["error"]["code"], INVALID_PARAMS);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Invalid params"));
 }
 
 // ===========================================================================

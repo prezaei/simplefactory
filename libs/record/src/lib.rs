@@ -910,28 +910,61 @@ pub async fn change_request_for_item(
     row.map(map_change_request).transpose()
 }
 
-/// Get-or-set a tool idempotency record. Returns the result stored by the FIRST
-/// caller for `(work_item, scope, dedupe_key)` — so a re-run sees the original
-/// external ref and updates the same object instead of creating a duplicate.
-pub async fn idempotency_get_or_set(
+/// The outcome of trying to claim a tool-idempotency slot for
+/// `(work_item, scope, dedupe_key)`.
+///
+/// This is the claim-first ("intent") pattern: a caller atomically inserts a
+/// placeholder row BEFORE performing its (non-idempotent) external side effect.
+/// Only the caller that wins the insert ([`IdempotencyClaim::Won`]) is allowed to
+/// run the side effect; it then records the result with [`idempotency_complete`].
+/// Concurrent or retried callers observe either [`IdempotencyClaim::Pending`] (the
+/// winner's side effect is still in flight — they must back off and retry) or
+/// [`IdempotencyClaim::Done`] (the result is already recorded — return it without
+/// any side effect). This guarantees the side effect runs at most once even under
+/// concurrent retries, where the old get→side-effect→store sequence could not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdempotencyClaim {
+    /// This caller inserted the placeholder and now owns the side effect.
+    Won,
+    /// Another caller holds the claim and its side effect has not completed yet.
+    Pending,
+    /// The side effect already completed; this is the recorded result.
+    Done(serde_json::Value),
+}
+
+/// Claim a tool-idempotency slot, the first step of the claim-first pattern.
+///
+/// Atomically inserts a placeholder row (`result = 'null'::jsonb`) for
+/// `(work_item, scope, dedupe_key)`:
+/// - if the insert wins, the caller owns the side effect → [`IdempotencyClaim::Won`];
+/// - otherwise the existing row is read back: a JSON-null result means the winner's
+///   side effect is still in flight → [`IdempotencyClaim::Pending`]; a non-null
+///   result is the recorded outcome → [`IdempotencyClaim::Done`].
+pub async fn idempotency_claim(
     pool: &Pool,
     work_item_id: Uuid,
     scope: &str,
     dedupe_key: &str,
-    result: &serde_json::Value,
-) -> Result<serde_json::Value> {
-    // First writer wins; losers read the stored value back.
-    sqlx::query(
+) -> Result<IdempotencyClaim> {
+    // Try to win the claim by inserting a placeholder. A returned row means we won.
+    let won = sqlx::query_scalar::<_, i32>(
         "INSERT INTO tool_idempotency (work_item_id, scope, dedupe_key, result)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (work_item_id, scope, dedupe_key) DO NOTHING",
+         VALUES ($1, $2, $3, 'null'::jsonb)
+         ON CONFLICT (work_item_id, scope, dedupe_key) DO NOTHING
+         RETURNING 1",
     )
     .bind(work_item_id)
     .bind(scope)
     .bind(dedupe_key)
-    .bind(result)
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
+
+    if won.is_some() {
+        tracing::info!(%work_item_id, scope, dedupe_key, "idempotency: claim won");
+        return Ok(IdempotencyClaim::Won);
+    }
+
+    // Someone else holds the claim; read the stored result back.
     let stored: serde_json::Value = sqlx::query_scalar(
         "SELECT result FROM tool_idempotency
           WHERE work_item_id = $1 AND scope = $2 AND dedupe_key = $3",
@@ -941,7 +974,38 @@ pub async fn idempotency_get_or_set(
     .bind(dedupe_key)
     .fetch_one(pool)
     .await?;
-    Ok(stored)
+
+    if stored.is_null() {
+        tracing::info!(%work_item_id, scope, dedupe_key, "idempotency: claim pending (side effect in flight)");
+        Ok(IdempotencyClaim::Pending)
+    } else {
+        tracing::info!(%work_item_id, scope, dedupe_key, "idempotency: claim already done");
+        Ok(IdempotencyClaim::Done(stored))
+    }
+}
+
+/// Record the side-effect result for a slot previously won via [`idempotency_claim`],
+/// the second step of the claim-first pattern. Replaces the placeholder JSON-null
+/// with the real result so later callers observe [`IdempotencyClaim::Done`].
+pub async fn idempotency_complete(
+    pool: &Pool,
+    work_item_id: Uuid,
+    scope: &str,
+    dedupe_key: &str,
+    result: &serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE tool_idempotency SET result = $4
+          WHERE (work_item_id, scope, dedupe_key) = ($1, $2, $3)",
+    )
+    .bind(work_item_id)
+    .bind(scope)
+    .bind(dedupe_key)
+    .bind(result)
+    .execute(pool)
+    .await?;
+    tracing::info!(%work_item_id, scope, dedupe_key, "idempotency: completed");
+    Ok(())
 }
 
 /// A repo's GitHub identity (for the Tools service to scope API calls).
@@ -994,24 +1058,6 @@ pub async fn work_item_by_id(pool: &Pool, id: Uuid) -> Result<Option<WorkItem>> 
     .fetch_optional(pool)
     .await?;
     row.map(map_work_item).transpose()
-}
-
-/// Look up a previously stored tool idempotency result, if any.
-pub async fn idempotency_get(
-    pool: &Pool,
-    work_item_id: Uuid,
-    scope: &str,
-    dedupe_key: &str,
-) -> Result<Option<serde_json::Value>> {
-    Ok(sqlx::query_scalar(
-        "SELECT result FROM tool_idempotency
-          WHERE work_item_id = $1 AND scope = $2 AND dedupe_key = $3",
-    )
-    .bind(work_item_id)
-    .bind(scope)
-    .bind(dedupe_key)
-    .fetch_optional(pool)
-    .await?)
 }
 
 /// Extend the lease on a work item by `ttl_secs`, authorized by the task token

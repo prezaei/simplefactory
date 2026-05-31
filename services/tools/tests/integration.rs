@@ -441,6 +441,120 @@ async fn escalate_is_idempotent_and_escalates_the_item() {
 }
 
 #[tokio::test]
+async fn escalate_is_idempotent_per_task_without_a_dedupe_key() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#131", FakeGitHub::new()).await;
+
+    // No dedupe_key on either call: escalate must still be idempotent per task,
+    // defaulting to a per-task key.
+    let args = json!({ "reason": "needs_decision", "context": "ship it?" });
+    let (s1, b1) = http_call(fx.state.clone(), &fx.raw_token, "escalate", args.clone()).await;
+    let (s2, b2) = http_call(fx.state.clone(), &fx.raw_token, "escalate", args).await;
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(b1["escalation_id"], b2["escalation_id"]);
+
+    // Exactly ONE escalation row and exactly ONE comment, even with no dedupe_key.
+    assert_eq!(
+        record::count_escalations_for_item(&pool, fx.work_item_id)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(count_calls(&fx.gh, "post_comment"), 1);
+}
+
+#[tokio::test]
+async fn concurrent_escalate_files_exactly_one_escalation() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#132", FakeGitHub::new()).await;
+
+    // Spawn several concurrent escalate calls for the SAME task with NO dedupe_key.
+    // The claim-first pattern guarantees exactly one side effect; the losers either
+    // observe the recorded result (200) or are told to retry while the winner's side
+    // effect is in flight (500). Either way, only ONE escalation/comment is created.
+    let mut handles = Vec::new();
+    for _ in 0..6 {
+        let state = fx.state.clone();
+        let token = fx.raw_token.clone();
+        handles.push(tokio::spawn(async move {
+            http_call(
+                state,
+                &token,
+                "escalate",
+                json!({ "reason": "conflict", "context": "merge conflict" }),
+            )
+            .await
+        }));
+    }
+    for h in handles {
+        let _ = h.await.unwrap();
+    }
+
+    // EXACTLY ONE escalation row, EXACTLY ONE GitHub comment.
+    assert_eq!(
+        record::count_escalations_for_item(&pool, fx.work_item_id)
+            .await
+            .unwrap(),
+        1,
+        "exactly one escalation despite concurrent calls"
+    );
+    assert_eq!(
+        count_calls(&fx.gh, "post_comment"),
+        1,
+        "exactly one comment posted despite concurrent calls"
+    );
+
+    // The work item is escalated.
+    let item = record::work_item_by_id(&pool, fx.work_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.state, State::Escalated);
+}
+
+#[tokio::test]
+async fn concurrent_post_comment_with_key_posts_exactly_once() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#133", FakeGitHub::new()).await;
+
+    // Concurrent post_comment with the SAME dedupe_key: the claim winner posts once,
+    // losers either return the stored result or are told to retry — never a 2nd post.
+    let mut handles = Vec::new();
+    for _ in 0..6 {
+        let state = fx.state.clone();
+        let token = fx.raw_token.clone();
+        handles.push(tokio::spawn(async move {
+            http_call(
+                state,
+                &token,
+                "post_comment",
+                json!({ "target": "issue#133", "body": "hi", "dedupe_key": "greet" }),
+            )
+            .await
+        }));
+    }
+    for h in handles {
+        let _ = h.await.unwrap();
+    }
+
+    assert_eq!(
+        count_calls(&fx.gh, "post_comment"),
+        1,
+        "exactly one comment posted despite concurrent calls"
+    );
+}
+
+#[tokio::test]
 async fn escalate_rejects_bad_reason() {
     let Some(pool) = pool_or_skip().await else {
         eprintln!("SKIP: DATABASE_URL not set");
@@ -768,4 +882,61 @@ async fn audit_event_has_correlation_id_and_tool_actor() {
     );
     assert_eq!(row.1, "tool:heartbeat", "actor is tool:<name>");
     assert_eq!(row.2, "heartbeat", "action is the tool name");
+}
+
+// ===========================================================================
+// FIX 4 — client (400) vs internal (500) error classification.
+// A missing required arg and an invalid enum value are the CALLER's fault → 400,
+// with the message echoed back. (Internal failures map to 500 with a generic body;
+// see the unit-level mapping — simulating real DB/GitHub I/O failures here is not
+// feasible against a live Postgres + fake GitHub, so the 500 path is asserted by
+// construction in the lib's `ToolError::Internal` mapping.)
+// ===========================================================================
+
+#[tokio::test]
+async fn missing_required_arg_is_400_bad_request() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#201", FakeGitHub::new()).await;
+
+    // read_issue requires issue_number; omitting it is a bad request.
+    let (status, body) = http_call(fx.state.clone(), &fx.raw_token, "read_issue", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("issue_number"),
+        "400 echoes the offending argument, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn invalid_verdict_is_400_bad_request() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "cr#202", FakeGitHub::new()).await;
+
+    // An unknown verdict value is rejected as a bad request before any side effect.
+    let (status, body) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "submit_review",
+        json!({ "cr_number": 202, "verdict": "lgtm", "body": "x" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("verdict"),
+        "400 explains the bad verdict, got {body}"
+    );
+    // No review was submitted.
+    assert_eq!(count_calls(&fx.gh, "submit_review"), 0);
 }

@@ -66,6 +66,13 @@ impl Workspace for GitCli {
 ///
 /// Only `https://` URLs are accepted; `http://` and `ssh`/`git@` forms are
 /// rejected so a token is never sent over a plaintext or non-matching transport.
+///
+/// Precondition: `token` must contain only URL-safe userinfo characters. GitHub
+/// installation tokens are `[A-Za-z0-9_]`; the token is injected verbatim into the
+/// URL userinfo, so a token carrying `@`, `:`, `/`, or any other character could
+/// change the host or otherwise corrupt the URL. Such a token is rejected with an
+/// error rather than silently producing a malformed URL.
+///
 /// The returned string contains the token and MUST NOT be logged.
 fn authed_url(repo_url: &str, token: &str) -> anyhow::Result<String> {
     let rest = repo_url
@@ -74,7 +81,21 @@ fn authed_url(repo_url: &str, token: &str) -> anyhow::Result<String> {
     if rest.is_empty() {
         anyhow::bail!("repo_url has no host");
     }
+    if !is_url_safe_token(token) {
+        // Do NOT include the token in the error: it must never be logged.
+        anyhow::bail!("install token contains characters that are not URL-safe userinfo");
+    }
     Ok(format!("https://x-access-token:{token}@{rest}"))
+}
+
+/// Whether `token` is safe to inject verbatim into URL userinfo. GitHub
+/// installation tokens are `[A-Za-z0-9_]`; anything else (empty, or containing
+/// `@`/`:`/`/`/etc.) is rejected so it can never change the host or corrupt the URL.
+fn is_url_safe_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// The refspec that pushes the current HEAD to the named remote branch.
@@ -98,14 +119,26 @@ impl ClaudeRunner for ClaudeCli {
         tracing::info!(workdir = %workdir.display(), tools_url, "ClaudeCli: running claude headless");
         // Register the Factory Tools service as a Streamable-HTTP MCP server so
         // Claude reaches Factory (open CRs, etc.) through the authenticated
-        // endpoint. The config and args carry the token but are never logged.
-        let mcp_config = mcp_config_json(tools_url, token);
-        let args = claude_args(&mcp_config, prompt);
-        let output = tokio::process::Command::new("claude")
+        // endpoint. The config carries the token (an Authorization header), so it is
+        // written to a 0600 file inside workdir and passed BY PATH — never on the
+        // command line, where `ps`/`/proc/<pid>/cmdline` would expose it.
+        let config_path = workdir.join(MCP_CONFIG_FILENAME);
+        write_mcp_config_file(&config_path, tools_url, token).await?;
+
+        let args = claude_args(&config_path, prompt);
+        let run = tokio::process::Command::new("claude")
             .current_dir(workdir)
             .args(&args)
             .output()
-            .await?;
+            .await;
+
+        // Best-effort delete the config file once the run is done, whether it
+        // succeeded or failed, so the token does not linger on disk.
+        if let Err(e) = tokio::fs::remove_file(&config_path).await {
+            tracing::warn!(error = %e, "ClaudeCli: failed to remove MCP config file");
+        }
+
+        let output = run?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::error!(status = ?output.status.code(), stderr = %stderr, "claude run failed");
@@ -120,6 +153,23 @@ impl ClaudeRunner for ClaudeCli {
         tracing::info!("ClaudeCli: run completed");
         Ok(RunResult { summary })
     }
+}
+
+/// The MCP config filename written inside the workdir. Dot-prefixed so it stays out
+/// of the way of the cloned repo's tree.
+const MCP_CONFIG_FILENAME: &str = ".factory-mcp.json";
+
+/// Write the MCP server config JSON to `path` with Unix mode 0600 (owner read/write
+/// only) so the embedded token is not world-readable. The token lives only in this
+/// file, never on the `claude` command line.
+async fn write_mcp_config_file(path: &Path, tools_url: &str, token: &str) -> anyhow::Result<()> {
+    let json = mcp_config_json(tools_url, token);
+    tokio::fs::write(path, json.as_bytes()).await?;
+    // This crate targets Linux/Unix; restrict the file to the owner.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    tracing::info!(path = %path.display(), "ClaudeCli: wrote MCP config (mode 0600)");
+    Ok(())
 }
 
 /// Build the MCP server config JSON that registers the Factory Tools service as a
@@ -142,13 +192,16 @@ fn mcp_config_json(tools_url: &str, token: &str) -> String {
 }
 
 /// The argv passed to the `claude` binary for a headless run: print mode, skip
-/// interactive permission prompts, attach the MCP config, then the prompt.
-fn claude_args(mcp_config: &str, prompt: &str) -> Vec<String> {
+/// interactive permission prompts, attach the MCP config BY PATH, then the prompt.
+///
+/// The config is passed as a file path (not inline JSON), so the token it contains
+/// never appears in argv (and thus never in `ps`/`/proc/<pid>/cmdline`).
+fn claude_args(mcp_config_path: &Path, prompt: &str) -> Vec<String> {
     vec![
         "--print".to_string(),
         "--dangerously-skip-permissions".to_string(),
         "--mcp-config".to_string(),
-        mcp_config.to_string(),
+        mcp_config_path.display().to_string(),
         prompt.to_string(),
     ]
 }
@@ -260,28 +313,66 @@ mod tests {
     }
 
     #[test]
-    fn claude_args_are_headless_with_config_and_prompt() {
-        let config = mcp_config_json("https://tools.factory.test", TOKEN);
-        let args = claude_args(&config, "Fix the bug");
+    fn claude_args_are_headless_with_config_path_and_prompt() {
+        let path = Path::new("/work/.factory-mcp.json");
+        let args = claude_args(path, "Fix the bug");
         assert_eq!(args[0], "--print");
         assert_eq!(args[1], "--dangerously-skip-permissions");
         assert_eq!(args[2], "--mcp-config");
-        assert_eq!(args[3], config);
+        // The config is referenced BY PATH, not as inline JSON.
+        assert_eq!(args[3], "/work/.factory-mcp.json");
         // The prompt is the final positional argument.
         assert_eq!(args.last().unwrap(), "Fix the bug");
     }
 
     #[test]
-    fn claude_args_keep_token_only_inside_the_config_arg() {
-        let config = mcp_config_json("https://tools.factory.test", TOKEN);
-        let args = claude_args(&config, "Fix the bug");
-        // Only the --mcp-config payload (args[3]) carries the token.
+    fn claude_args_never_carry_the_token() {
+        // The args reference the config file path; the token (which lives only inside
+        // that file) must not appear anywhere in argv.
+        let path = Path::new("/work/.factory-mcp.json");
+        let args = claude_args(path, "Fix the bug");
         for (i, a) in args.iter().enumerate() {
-            if i == 3 {
-                assert!(a.contains(TOKEN));
-            } else {
-                assert!(!a.contains(TOKEN), "arg {i} leaked the token: {a}");
-            }
+            assert!(!a.contains(TOKEN), "arg {i} leaked the token: {a}");
         }
+    }
+
+    #[test]
+    fn authed_url_rejects_tokens_with_unsafe_userinfo_chars() {
+        // Tokens carrying URL-meaningful characters would corrupt or redirect the
+        // URL; they must be rejected outright.
+        for bad in [
+            "tok@evil.example",
+            "tok:secret",
+            "tok/with/slash",
+            "tok with space",
+            "tok#frag",
+            "",
+        ] {
+            let err = authed_url("https://github.com/acme/repo.git", bad)
+                .expect_err("unsafe token must be rejected");
+            // The error must never leak the token value.
+            assert!(!err.to_string().contains(bad) || bad.is_empty());
+        }
+    }
+
+    #[test]
+    fn authed_url_accepts_normal_ghs_token() {
+        // A normal GitHub installation token ([A-Za-z0-9_]) is accepted.
+        let url = authed_url("https://github.com/acme/repo.git", "ghs_AbC123_def").unwrap();
+        assert_eq!(
+            url,
+            "https://x-access-token:ghs_AbC123_def@github.com/acme/repo.git"
+        );
+    }
+
+    #[test]
+    fn is_url_safe_token_classifies_correctly() {
+        assert!(is_url_safe_token("ghs_AbC123_def"));
+        assert!(is_url_safe_token("ABCdef0123456789_"));
+        assert!(!is_url_safe_token(""));
+        assert!(!is_url_safe_token("has@at"));
+        assert!(!is_url_safe_token("has:colon"));
+        assert!(!is_url_safe_token("has/slash"));
+        assert!(!is_url_safe_token("has space"));
     }
 }

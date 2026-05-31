@@ -17,8 +17,51 @@ use factory_blob::TranscriptStore;
 use factory_github::{
     CheckRef, CommentTarget, GitHubClient, OpenPrRequest, RepoRef, ReviewVerdict,
 };
-use factory_record::{self as record, AttemptStatus, State, TaskAuth};
+use factory_record::{self as record, AttemptStatus, IdempotencyClaim, State, TaskAuth};
 use serde_json::{json, Value};
+
+/// A tool-call error split by who is at fault, so the HTTP layer can map it to the
+/// right status: a [`ToolError::BadRequest`] is the caller's fault (malformed or
+/// invalid arguments) and becomes a `400` with the message echoed back; a
+/// [`ToolError::Internal`] is Factory's fault (DB / GitHub / blob I/O) and becomes a
+/// `500` with a generic body, the real error logged server-side.
+#[derive(Debug)]
+pub enum ToolError {
+    /// Invalid or missing arguments — the caller must fix the request (HTTP 400).
+    BadRequest(String),
+    /// An internal failure (DB, GitHub, blob, …) — not the caller's fault (HTTP 500).
+    Internal(anyhow::Error),
+}
+
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolError::BadRequest(msg) => write!(f, "{msg}"),
+            ToolError::Internal(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ToolError {}
+
+/// Any plain `anyhow` error coming up through `?` (record / GitHub / blob I/O) is an
+/// internal failure by default. Validation paths construct [`ToolError::BadRequest`]
+/// explicitly instead of going through this conversion.
+impl From<anyhow::Error> for ToolError {
+    fn from(e: anyhow::Error) -> Self {
+        ToolError::Internal(e)
+    }
+}
+
+/// Record-book errors surfacing through `?` are internal failures.
+impl From<record::RecordError> for ToolError {
+    fn from(e: record::RecordError) -> Self {
+        ToolError::Internal(e.into())
+    }
+}
+
+/// A tool result: a JSON value on success, or a classified [`ToolError`].
+type ToolResult = std::result::Result<Value, ToolError>;
 
 /// Shared dependencies for every tool call: the record book, the GitHub client
 /// (real or fake), and the transcript store.
@@ -94,12 +137,7 @@ impl Tool {
 /// Dispatch a parsed tool to its implementation. Centralizing dispatch (and the
 /// audit event written by the HTTP layer around it) guarantees every tool call is
 /// authorized and recorded; no tool can be reached except through here.
-pub async fn dispatch(
-    state: &ToolsState,
-    auth: &TaskAuth,
-    tool: Tool,
-    args: &Value,
-) -> anyhow::Result<Value> {
+pub async fn dispatch(state: &ToolsState, auth: &TaskAuth, tool: Tool, args: &Value) -> ToolResult {
     match tool {
         Tool::GetTask => get_task(state, auth).await,
         Tool::ReadIssue => read_issue(state, auth, arg_i64(args, "issue_number")?).await,
@@ -180,7 +218,7 @@ pub async fn dispatch(
 /// Return this task's facts (role, subject, correlation). If the subject is an
 /// issue or change request, the referenced GitHub object is read and embedded so
 /// the worker gets the task in a single call.
-pub async fn get_task(state: &ToolsState, auth: &TaskAuth) -> anyhow::Result<Value> {
+pub async fn get_task(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
     let item = record::work_item_by_id(&state.pool, auth.work_item_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("work item {} not found", auth.work_item_id))?;
@@ -242,11 +280,7 @@ pub async fn get_task(state: &ToolsState, auth: &TaskAuth) -> anyhow::Result<Val
 }
 
 /// Read an issue in the token's repo.
-pub async fn read_issue(
-    state: &ToolsState,
-    auth: &TaskAuth,
-    issue_number: i64,
-) -> anyhow::Result<Value> {
+pub async fn read_issue(state: &ToolsState, auth: &TaskAuth, issue_number: i64) -> ToolResult {
     let repo = resolve_repo(state, auth).await?;
     let issue = state.gh.read_issue(&repo, issue_number).await?;
     tracing::info!(work_item = %auth.work_item_id, issue_number, "read_issue");
@@ -263,7 +297,7 @@ pub async fn read_change_request(
     state: &ToolsState,
     auth: &TaskAuth,
     cr_number: i64,
-) -> anyhow::Result<Value> {
+) -> ToolResult {
     let repo = resolve_repo(state, auth).await?;
     let cr = state.gh.read_change_request(&repo, cr_number).await?;
     tracing::info!(work_item = %auth.work_item_id, cr_number, "read_change_request");
@@ -289,7 +323,7 @@ pub async fn open_or_update_change_request(
     head_branch: &str,
     base: &str,
     linked_issue: Option<i64>,
-) -> anyhow::Result<Value> {
+) -> ToolResult {
     let repo = resolve_repo(state, auth).await?;
 
     // One CR row per work item — a re-dispatch returns the SAME row.
@@ -329,45 +363,55 @@ pub async fn open_or_update_change_request(
 }
 
 /// Post a comment on the subject (`issue#N` or `cr#N`). When `dedupe_key` is
-/// provided the call is idempotent: the first post is recorded under
-/// `(work_item, "comment", key)` and a repeat returns the stored result WITHOUT
-/// posting again.
+/// provided the call is idempotent via the claim-first pattern: the first caller
+/// claims `(work_item, "comment", key)`, posts to GitHub, then records the result;
+/// a concurrent caller that loses the claim while the post is in flight is told to
+/// retry, and any later caller returns the stored result WITHOUT posting again.
+/// Without a `dedupe_key` the comment is posted every time (no idempotency).
 pub async fn post_comment(
     state: &ToolsState,
     auth: &TaskAuth,
     target: &str,
     body: &str,
     dedupe_key: Option<&str>,
-) -> anyhow::Result<Value> {
+) -> ToolResult {
     let repo = resolve_repo(state, auth).await?;
     let comment_target = parse_comment_target(target)?;
 
-    if let Some(key) = dedupe_key {
-        if let Some(prev) =
-            record::idempotency_get(&state.pool, auth.work_item_id, "comment", key).await?
-        {
+    // No dedupe_key: preserve the post-every-time behavior.
+    let Some(key) = dedupe_key else {
+        let comment_id = state.gh.post_comment(&repo, comment_target, body).await?;
+        tracing::info!(work_item = %auth.work_item_id, ?target, "post_comment (no dedupe)");
+        return Ok(json!({ "comment_id": comment_id }));
+    };
+
+    match record::idempotency_claim(&state.pool, auth.work_item_id, "comment", key).await? {
+        IdempotencyClaim::Done(v) => {
             tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "post_comment: deduped (no-op)");
-            return Ok(prev);
+            Ok(v)
+        }
+        IdempotencyClaim::Pending => {
+            tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "post_comment: claim pending; ask caller to retry");
+            Err(ToolError::Internal(anyhow::anyhow!(
+                "a comment for this task is already in progress"
+            )))
+        }
+        IdempotencyClaim::Won => {
+            let comment_id = state.gh.post_comment(&repo, comment_target, body).await?;
+            let result = json!({ "comment_id": comment_id });
+            record::idempotency_complete(&state.pool, auth.work_item_id, "comment", key, &result)
+                .await?;
+            tracing::info!(work_item = %auth.work_item_id, ?target, "post_comment");
+            Ok(result)
         }
     }
-
-    let comment_id = state.gh.post_comment(&repo, comment_target, body).await?;
-    let result = json!({ "comment_id": comment_id });
-
-    let stored = match dedupe_key {
-        Some(key) => {
-            record::idempotency_get_or_set(&state.pool, auth.work_item_id, "comment", key, &result)
-                .await?
-        }
-        None => result,
-    };
-    tracing::info!(work_item = %auth.work_item_id, ?target, "post_comment");
-    Ok(stored)
 }
 
 /// Submit a review verdict on a change request. Idempotent by `dedupe_key` under
-/// scope `"review"` — a repeat returns the stored result and submits no second
-/// review.
+/// scope `"review"` via the claim-first pattern: the claim winner submits the review
+/// and records the result; a concurrent loser is told to retry; any later caller
+/// returns the stored result and submits no second review. Without a `dedupe_key`
+/// the review is submitted every time (no idempotency).
 pub async fn submit_review(
     state: &ToolsState,
     auth: &TaskAuth,
@@ -375,34 +419,43 @@ pub async fn submit_review(
     verdict: &str,
     body: &str,
     dedupe_key: Option<&str>,
-) -> anyhow::Result<Value> {
+) -> ToolResult {
     let repo = resolve_repo(state, auth).await?;
     let verdict = parse_verdict(verdict)?;
 
-    if let Some(key) = dedupe_key {
-        if let Some(prev) =
-            record::idempotency_get(&state.pool, auth.work_item_id, "review", key).await?
-        {
+    // No dedupe_key: preserve the submit-every-time behavior.
+    let Some(key) = dedupe_key else {
+        let review_id = state
+            .gh
+            .submit_review(&repo, cr_number, verdict, body)
+            .await?;
+        tracing::info!(work_item = %auth.work_item_id, cr_number, verdict = verdict.as_str(), "submit_review (no dedupe)");
+        return Ok(json!({ "review_id": review_id }));
+    };
+
+    match record::idempotency_claim(&state.pool, auth.work_item_id, "review", key).await? {
+        IdempotencyClaim::Done(v) => {
             tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "submit_review: deduped (no-op)");
-            return Ok(prev);
+            Ok(v)
+        }
+        IdempotencyClaim::Pending => {
+            tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "submit_review: claim pending; ask caller to retry");
+            Err(ToolError::Internal(anyhow::anyhow!(
+                "a review for this task is already in progress"
+            )))
+        }
+        IdempotencyClaim::Won => {
+            let review_id = state
+                .gh
+                .submit_review(&repo, cr_number, verdict, body)
+                .await?;
+            let result = json!({ "review_id": review_id });
+            record::idempotency_complete(&state.pool, auth.work_item_id, "review", key, &result)
+                .await?;
+            tracing::info!(work_item = %auth.work_item_id, cr_number, verdict = verdict.as_str(), "submit_review");
+            Ok(result)
         }
     }
-
-    let review_id = state
-        .gh
-        .submit_review(&repo, cr_number, verdict, body)
-        .await?;
-    let result = json!({ "review_id": review_id });
-
-    let stored = match dedupe_key {
-        Some(key) => {
-            record::idempotency_get_or_set(&state.pool, auth.work_item_id, "review", key, &result)
-                .await?
-        }
-        None => result,
-    };
-    tracing::info!(work_item = %auth.work_item_id, cr_number, verdict = verdict.as_str(), "submit_review");
-    Ok(stored)
 }
 
 /// Read required-check status for either a CR number or an explicit sha. Exactly
@@ -412,15 +465,21 @@ pub async fn get_check_status(
     auth: &TaskAuth,
     cr_number: Option<i64>,
     sha: Option<&str>,
-) -> anyhow::Result<Value> {
+) -> ToolResult {
     let repo = resolve_repo(state, auth).await?;
     let what = match (cr_number, sha) {
         (Some(n), None) => CheckRef::ChangeRequest(n),
         (None, Some(s)) => CheckRef::Sha(s.to_owned()),
         (Some(_), Some(_)) => {
-            anyhow::bail!("get_check_status: provide exactly one of cr_number or sha, not both")
+            return Err(ToolError::BadRequest(
+                "get_check_status: provide exactly one of cr_number or sha, not both".to_owned(),
+            ))
         }
-        (None, None) => anyhow::bail!("get_check_status: one of cr_number or sha is required"),
+        (None, None) => {
+            return Err(ToolError::BadRequest(
+                "get_check_status: one of cr_number or sha is required".to_owned(),
+            ))
+        }
     };
     let summary = state.gh.check_status(&repo, what).await?;
     tracing::info!(work_item = %auth.work_item_id, overall = summary.overall.as_str(), "get_check_status");
@@ -429,11 +488,7 @@ pub async fn get_check_status(
 
 /// Append a chunk to this task's transcript. The transcript URI is derived from
 /// the work item id, so a worker can never write to another task's transcript.
-pub async fn append_transcript(
-    state: &ToolsState,
-    auth: &TaskAuth,
-    chunk: &str,
-) -> anyhow::Result<Value> {
+pub async fn append_transcript(state: &ToolsState, auth: &TaskAuth, chunk: &str) -> ToolResult {
     let uri = transcript_uri(auth);
     state.blob.append(&uri, chunk).await?;
     tracing::info!(work_item = %auth.work_item_id, bytes = chunk.len(), "append_transcript");
@@ -449,11 +504,11 @@ pub async fn record_outcome(
     auth: &TaskAuth,
     status: &str,
     summary: &str,
-) -> anyhow::Result<Value> {
+) -> ToolResult {
     let (attempt_status, work_state) = parse_outcome(status)?;
-    let attempt_id = auth
-        .attempt_id
-        .ok_or_else(|| anyhow::anyhow!("record_outcome: token has no attempt to finish"))?;
+    let attempt_id = auth.attempt_id.ok_or_else(|| {
+        ToolError::BadRequest("record_outcome: token has no attempt to finish".to_owned())
+    })?;
 
     let finished =
         record::finish_attempt(&state.pool, attempt_id, attempt_status, Some(summary)).await?;
@@ -482,7 +537,7 @@ pub async fn record_outcome(
 
 /// Extend this task's lease (default 15 min). Returns the new expiry, or null if
 /// the item is no longer in flight (e.g. already terminal or reclaimed).
-pub async fn heartbeat(state: &ToolsState, auth: &TaskAuth) -> anyhow::Result<Value> {
+pub async fn heartbeat(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
     let expires =
         record::heartbeat_task(&state.pool, auth.work_item_id, HEARTBEAT_TTL_SECS).await?;
     tracing::info!(work_item = %auth.work_item_id, extended = expires.is_some(), "heartbeat");
@@ -490,28 +545,38 @@ pub async fn heartbeat(state: &ToolsState, auth: &TaskAuth) -> anyhow::Result<Va
 }
 
 /// Escalate to a human — the single human channel. Idempotent per task under scope
-/// `"escalate"`: one escalation row per task even if called repeatedly with the
-/// same dedupe_key. On first call it records the escalation, posts the question on
-/// the subject, and moves the work item to `escalated`.
+/// `"escalate"` via the claim-first pattern: the claim winner records the escalation,
+/// posts the question on the subject, moves the work item to `escalated`, then stores
+/// the result. Even when the caller passes NO `dedupe_key` the key defaults to a
+/// per-task constant, so escalate is idempotent per work item by default — exactly one
+/// escalation row per task no matter how many concurrent or retried calls arrive.
 pub async fn escalate(
     state: &ToolsState,
     auth: &TaskAuth,
     reason: &str,
     context: &str,
     dedupe_key: Option<&str>,
-) -> anyhow::Result<Value> {
+) -> ToolResult {
     // Escalation reason is constrained by the record book; reject bad values up
     // front with a clear message rather than surfacing a DB constraint error.
     validate_escalation_reason(reason)?;
 
-    // One escalation per task. The dedupe key defaults to the reason when the
-    // caller omits one, so a retry of the same escalation never double-files.
-    let key = dedupe_key.unwrap_or(reason);
-    if let Some(prev) =
-        record::idempotency_get(&state.pool, auth.work_item_id, "escalate", key).await?
-    {
-        tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "escalate: deduped (no-op)");
-        return Ok(prev);
+    // One escalation per task: when the caller omits a dedupe_key, fall back to a
+    // per-task constant so escalate is idempotent per work item by default.
+    let key = dedupe_key.unwrap_or(ESCALATE_DEFAULT_KEY);
+
+    match record::idempotency_claim(&state.pool, auth.work_item_id, "escalate", key).await? {
+        IdempotencyClaim::Done(v) => {
+            tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "escalate: deduped (no-op)");
+            return Ok(v);
+        }
+        IdempotencyClaim::Pending => {
+            tracing::info!(work_item = %auth.work_item_id, dedupe_key = key, "escalate: claim pending; ask caller to retry");
+            return Err(ToolError::Internal(anyhow::anyhow!(
+                "an escalate for this task is already in progress"
+            )));
+        }
+        IdempotencyClaim::Won => {}
     }
 
     let repo = resolve_repo(state, auth).await?;
@@ -544,11 +609,9 @@ pub async fn escalate(
         "delivered_comment_id": delivered,
         "state_changed": state_changed,
     });
-    let stored =
-        record::idempotency_get_or_set(&state.pool, auth.work_item_id, "escalate", key, &result)
-            .await?;
+    record::idempotency_complete(&state.pool, auth.work_item_id, "escalate", key, &result).await?;
     tracing::info!(work_item = %auth.work_item_id, reason, "escalate");
-    Ok(stored)
+    Ok(result)
 }
 
 // ===========================================================================
@@ -557,6 +620,11 @@ pub async fn escalate(
 
 /// Default heartbeat lease extension (15 minutes), per the spec.
 const HEARTBEAT_TTL_SECS: f64 = 900.0;
+
+/// The dedupe key used for `escalate` when the caller supplies none. Escalation is
+/// "one per task", so the default key is a per-task constant — every escalate for a
+/// work item shares this slot and only the first runs the side effect.
+const ESCALATE_DEFAULT_KEY: &str = "task";
 
 /// The built-in, role-specific base prompt. Repo-wide and per-worker instructions
 /// are layered on top of this by [`compose_prompt`].
@@ -663,38 +731,46 @@ fn subject_comment_target(subject_ref: &str) -> Option<CommentTarget> {
     }
 }
 
-/// Parse a `post_comment` target argument (`issue#N` / `cr#N`).
-fn parse_comment_target(target: &str) -> anyhow::Result<CommentTarget> {
+/// Parse a `post_comment` target argument (`issue#N` / `cr#N`). An unparseable
+/// target is a bad request (HTTP 400).
+fn parse_comment_target(target: &str) -> std::result::Result<CommentTarget, ToolError> {
     parse_subject(target)
         .map(|s| match s {
             Subject::Issue(n) => CommentTarget::Issue(n),
             Subject::ChangeRequest(n) => CommentTarget::ChangeRequest(n),
         })
         .ok_or_else(|| {
-            anyhow::anyhow!("post_comment: target must be 'issue#N' or 'cr#N', got {target:?}")
+            ToolError::BadRequest(format!(
+                "post_comment: target must be 'issue#N' or 'cr#N', got {target:?}"
+            ))
         })
 }
 
-/// Parse a review verdict string.
-fn parse_verdict(verdict: &str) -> anyhow::Result<ReviewVerdict> {
+/// Parse a review verdict string. An unknown verdict is a bad request (HTTP 400).
+fn parse_verdict(verdict: &str) -> std::result::Result<ReviewVerdict, ToolError> {
     Ok(match verdict {
         "approve" => ReviewVerdict::Approve,
         "request_changes" => ReviewVerdict::RequestChanges,
         "comment" => ReviewVerdict::Comment,
-        other => anyhow::bail!(
-            "submit_review: verdict must be approve|request_changes|comment, got {other:?}"
-        ),
+        other => {
+            return Err(ToolError::BadRequest(format!(
+                "submit_review: verdict must be approve|request_changes|comment, got {other:?}"
+            )))
+        }
     })
 }
 
-/// Map a `record_outcome` status to (attempt status, work-item state).
-fn parse_outcome(status: &str) -> anyhow::Result<(AttemptStatus, State)> {
+/// Map a `record_outcome` status to (attempt status, work-item state). An unknown
+/// status is a bad request (HTTP 400).
+fn parse_outcome(status: &str) -> std::result::Result<(AttemptStatus, State), ToolError> {
     Ok(match status {
         "succeeded" => (AttemptStatus::Succeeded, State::Succeeded),
         "failed" => (AttemptStatus::Failed, State::Failed),
         "blocked" => (AttemptStatus::Blocked, State::Blocked),
         other => {
-            anyhow::bail!("record_outcome: status must be succeeded|failed|blocked, got {other:?}")
+            return Err(ToolError::BadRequest(format!(
+                "record_outcome: status must be succeeded|failed|blocked, got {other:?}"
+            )))
         }
     })
 }
@@ -709,14 +785,13 @@ const ESCALATION_REASONS: [&str; 5] = [
     "conflict",
 ];
 
-fn validate_escalation_reason(reason: &str) -> anyhow::Result<()> {
+fn validate_escalation_reason(reason: &str) -> std::result::Result<(), ToolError> {
     if ESCALATION_REASONS.contains(&reason) {
         Ok(())
     } else {
-        anyhow::bail!(
-            "escalate: reason must be one of {:?}, got {reason:?}",
-            ESCALATION_REASONS
-        )
+        Err(ToolError::BadRequest(format!(
+            "escalate: reason must be one of {ESCALATION_REASONS:?}, got {reason:?}"
+        )))
     }
 }
 
@@ -734,20 +809,20 @@ fn check_summary_json(summary: &factory_github::CheckSummary) -> Value {
 
 // --- argument extraction (typed accessors over the JSON request body) ---
 
-fn arg_str<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
+fn arg_str<'a>(args: &'a Value, key: &str) -> std::result::Result<&'a str, ToolError> {
     args.get(key)
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("missing or non-string argument {key:?}"))
+        .ok_or_else(|| ToolError::BadRequest(format!("missing or non-string argument {key:?}")))
 }
 
 fn arg_opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
 
-fn arg_i64(args: &Value, key: &str) -> anyhow::Result<i64> {
+fn arg_i64(args: &Value, key: &str) -> std::result::Result<i64, ToolError> {
     args.get(key)
         .and_then(Value::as_i64)
-        .ok_or_else(|| anyhow::anyhow!("missing or non-integer argument {key:?}"))
+        .ok_or_else(|| ToolError::BadRequest(format!("missing or non-integer argument {key:?}")))
 }
 
 fn arg_opt_i64(args: &Value, key: &str) -> Option<i64> {
@@ -818,22 +893,32 @@ async fn handle_tool(
             tracing::error!(tool = tool.as_str(), error = %e, "audit write failed");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "audit error")
         }
-        Err(ToolCallError::Tool(e)) => {
+        // A bad request is the caller's fault: 400 with the message echoed back.
+        Err(ToolCallError::Tool(ToolError::BadRequest(msg))) => {
+            tracing::warn!(tool = tool.as_str(), work_item = %auth.work_item_id, error = %msg, "tool rejected bad request");
+            error_response(StatusCode::BAD_REQUEST, &msg)
+        }
+        // An internal failure is Factory's fault: 500 with a generic body; the real
+        // error is logged server-side, never leaked to the caller.
+        Err(ToolCallError::Tool(ToolError::Internal(e))) => {
             tracing::error!(tool = tool.as_str(), work_item = %auth.work_item_id, error = %e, "tool failed");
-            error_response(StatusCode::BAD_REQUEST, &e.to_string())
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }
     }
 }
 
 /// Outcome of running a tool through the audited choke point: either an
 /// infrastructure failure writing the audit row, or a failure inside the tool
-/// itself. The HTTP layer maps `Audit` → 500 and `Tool` → 400; the MCP layer maps
-/// `Audit` → a JSON-RPC internal error and `Tool` → an `isError` content result.
+/// itself. The HTTP layer maps `Audit` → 500, `Tool(BadRequest)` → 400, and
+/// `Tool(Internal)` → 500; the MCP layer maps `Audit` → a JSON-RPC internal error,
+/// `Tool(BadRequest)` → JSON-RPC invalid-params, and `Tool(Internal)` → an `isError`
+/// content result.
 pub enum ToolCallError {
     /// Writing the mandatory audit event failed; the call did not run.
     Audit(anyhow::Error),
-    /// The tool ran (or its arguments were rejected) and returned an error.
-    Tool(anyhow::Error),
+    /// The tool ran (or its arguments were rejected) and returned an error,
+    /// classified as a bad request (caller's fault) or internal (Factory's fault).
+    Tool(ToolError),
 }
 
 /// The single audited choke point shared by the REST and MCP surfaces: thread the
