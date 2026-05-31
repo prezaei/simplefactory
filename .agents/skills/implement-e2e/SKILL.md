@@ -150,14 +150,21 @@ On each ship-it iteration (cron-fired), the loop must:
    ```bash
    HEAD=$(gh pr view <N> --json headRefOid -q .headRefOid)
    gh api --paginate repos/{owner}/{repo}/pulls/<N>/reviews \
-     --jq ".[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\" and .state != \"PENDING\") | .id" | wc -l   # >= 1
+     --jq ".[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\" and (.state==\"COMMENTED\" or .state==\"APPROVED\" or .state==\"CHANGES_REQUESTED\")) | .id" | wc -l   # >= 1
+   # Match active submitted states explicitly — NOT `.state != "PENDING"`, which also admits
+   # DISMISSED reviews (no longer an active signal), letting a dismissed review satisfy the gate.
    # --paginate (the reviews endpoint caps at 30/page) + count lines, NOT `[...] | length`
    # (with --paginate, --jq runs per page, so length is a per-page count, not the total).
    ```
    If `0`: log "waiting for Copilot review on <HEAD>" and exit the iteration (the cron retries). If still
    absent after ~2 iterations, or Copilot dropped from the requested-reviewers list, re-request it.
-2. **Triage EVERY new comment from that review (rule 1)** — fix in code (then green gate) or rebut inline
-   (rule 5). Never silently skip one.
+2. **Triage EVERY new piece of feedback from that review (rule 1)** — fix in code (then green gate) or
+   rebut inline (rule 5). Never silently skip one. This means BOTH (a) every inline comment
+   (`pulls/<N>/comments`, login `Copilot`) AND (b) the review's **summary body** (`reviews[].body`,
+   login `copilot-pull-request-reviewer[bot]`) when non-empty — Copilot routinely puts findings only in
+   the review-summary body with no inline comment, so a summary-only finding must be triaged too or it
+   slips through the gate. `/ship-it` triages inline comments; the review-summary body is the fixer's
+   responsibility (like the `/code-review` pass below) — read it each round and fix or rebut every point.
 3. **When a Copilot comment is fixed in code, run `/code-review` on that fix before pushing** (rule 4 — a
    fix is new code; Copilot and `/code-review` each catch what the other misses, and rounds routinely
    catch defects *introduced by the previous fix*). NOTE: `/ship-it` does **not** run `/code-review`
