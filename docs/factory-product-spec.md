@@ -16,7 +16,7 @@ Think of it as a **factory floor**:
 
 Two things the factory always does keep it healthy and make it smarter over time:
 
-- **It never loses work.** If the coordinator itself restarts, any half-finished jobs are simply marked failed and started over from the to-do list — nothing is left dangling.
+- **It never loses work.** A worker's session is checkpointed continuously, so if a worker or the coordinator itself restarts, half-finished jobs are rehydrated from their exact state and resumed where they left off — and only if that state can't be recovered are they started over from the to-do list. Nothing is left dangling.
 - **It learns.** Successful jobs are distilled into short reusable notes, and the team's own documentation is indexed, so future workers can look up "how was something like this done before?"
 
 ## Onboarding a repo (the one-time setup)
