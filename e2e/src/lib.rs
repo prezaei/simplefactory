@@ -652,6 +652,23 @@ mod acceptance {
         );
     }
 
+    /// Retire the bootstrap coder item that opened a CR: mark it `succeeded` AND `reacted`
+    /// so it neither occupies the active `(repo, issue, coder)` slot (which would make a
+    /// rework dispatch dedupe against it) nor shows up as an extra terminal item for the
+    /// coordinator to react to. Mirrors the retirement step in the rework-loop test.
+    async fn retire_bootstrap_coder(pool: &record::Pool, repo: Uuid, subject: &str) {
+        let id = find_item(pool, repo, record::Kind::Coder, subject)
+            .await
+            .expect("the bootstrap coder item exists");
+        mark_succeeded(pool, id).await;
+        let updated_at = record::work_item_by_id(pool, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at;
+        assert!(record::mark_reacted(pool, id, updated_at).await.unwrap());
+    }
+
     /// A `TaskAuth` for driving Tools fns as the worker for `work_item`. No attempt
     /// is needed: the P4 tests use the GitHub-facing tool fns (open CR / submit
     /// review), not `record_outcome`.
@@ -1334,6 +1351,673 @@ mod acceptance {
             1,
             "exactly one escalation assignment"
         );
+    }
+
+    /// Store a config for `repo` from a raw `yaml`, returning nothing. Used by the
+    /// missing-next-role tests, which need a config that deliberately OMITS a role.
+    async fn set_config_yaml(pool: &record::Pool, repo: Uuid, yaml: &str) {
+        let cfg = factory_config::parse(yaml).expect("valid config yaml");
+        let cfg_json = serde_json::to_value(&cfg).unwrap();
+        record::set_repo_config(pool, repo, &cfg_json, "p4-sha")
+            .await
+            .unwrap();
+    }
+
+    /// A manager-only config (manager + coder + reviewer YAML with the coder REMOVED).
+    /// Used by the no-coder defer/escalate test before the operator adds a coder back.
+    fn manager_only_yaml() -> &'static str {
+        "version: 1\n\
+         settings:\n  label: factory\n  escalation_assignee: octo-human\n\
+         limits:\n  max_concurrent_workers: 5\n\
+         workers:\n  - name: manager\n    role: manager\n    on: [issue_labeled]\n"
+    }
+
+    /// A full three-role config YAML (manager + coder + reviewer). Used to FIX the missing
+    /// precondition mid-test (add the worker the operator had omitted) and prove self-heal.
+    fn three_role_yaml() -> &'static str {
+        "version: 1\n\
+         settings:\n  label: factory\n  escalation_assignee: octo-human\n\
+         limits:\n  max_concurrent_workers: 5\n\
+         workers:\n\
+         \x20 - name: manager\n    role: manager\n    on: [issue_labeled]\n\
+         \x20 - name: bug-fixer\n    role: coder\n    on: [manager, cr_changes_requested]\n\
+         \x20 - name: reviewer\n    role: reviewer\n    on: [cr_opened]\n"
+    }
+
+    /// FIX P4-followup (path 1: manager succeeded, no coder configured). This was the WRONG
+    /// fix before: escalate-on-first-tick committed the claim, leaving the issue
+    /// `succeeded, reacted=true` — STRANDED (requeue_blocked only revives `blocked` items),
+    /// VISIBLE but unrecoverable even after the operator added a coder. The correct behavior
+    /// is DEFER-WITH-GRACE: within the grace window the react is NOT consumed and NOTHING is
+    /// escalated/enqueued, so adding a coder lets a later tick SELF-HEAL; only PAST the grace
+    /// window does it escalate `needs_decision` exactly once.
+    #[tokio::test]
+    async fn manager_no_coder_defers_then_self_heals_or_escalates_past_grace() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let serial = P4_SERIAL.lock().await;
+        drain_terminal(&pool).await;
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-p4-nocoder"), 1)
+            .await
+            .unwrap();
+        set_config_yaml(&pool, repo, manager_only_yaml()).await;
+        let gh = Arc::new(FakeGitHub::new());
+
+        let manager_id =
+            enqueue_item(&pool, repo, record::Kind::Manager, "manager", "issue#7").await;
+        mark_succeeded(&pool, manager_id).await;
+
+        // (A) DEFER within grace: a FRESH terminal manager item with no coder configured is
+        // NOT reacted, NOT escalated, and delegates NOTHING.
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+        assert!(
+            !is_reacted(&pool, manager_id).await,
+            "no coder within grace DEFERS: the manager item stays unreacted (not stranded)"
+        );
+        assert_eq!(
+            record::count_escalations_for_item(&pool, manager_id)
+                .await
+                .unwrap(),
+            0,
+            "no coder within grace does not escalate"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            0,
+            "no comment while deferring"
+        );
+        assert!(
+            find_item(&pool, repo, record::Kind::Coder, "issue#7")
+                .await
+                .is_none(),
+            "nothing is delegated while deferring"
+        );
+
+        // (B) SELF-HEAL: the operator ADDS a coder to config; the SAME still-unreacted item
+        // now makes progress on the next tick — a coder is enqueued and the issue moves to
+        // in_progress. This is the recovery the old escalate-on-first-tick fix made impossible.
+        set_config_yaml(&pool, repo, three_role_yaml()).await;
+        let gh_healed = Arc::new(FakeGitHub::new());
+        coordinator_tick(&pool, gh_healed.as_ref()).await.unwrap();
+        assert!(
+            is_reacted(&pool, manager_id).await,
+            "once a coder is configured the deferred item is consumed"
+        );
+        assert!(
+            find_item(&pool, repo, record::Kind::Coder, "issue#7")
+                .await
+                .is_some(),
+            "self-heal: a coder is enqueued once one is configured"
+        );
+        assert_eq!(
+            issue_state(&pool, repo, 7).await.as_deref(),
+            Some("in_progress"),
+            "self-heal: the issue moves to in_progress"
+        );
+        assert_eq!(
+            record::count_escalations_for_item(&pool, manager_id)
+                .await
+                .unwrap(),
+            0,
+            "self-heal never escalated"
+        );
+        drop(serial);
+    }
+
+    /// FIX P4-followup (path 1, escalate-past-grace): a manager item with no coder configured
+    /// that has aged PAST the grace window escalates `needs_decision` EXACTLY ONCE — one row,
+    /// one comment, one assignment — never delegates, and re-dispatch escalates no second time.
+    #[tokio::test]
+    async fn manager_no_coder_escalates_exactly_once_past_grace() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let serial = P4_SERIAL.lock().await;
+        drain_terminal(&pool).await;
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-p4-nocoder-grace"), 1)
+            .await
+            .unwrap();
+        set_config_yaml(&pool, repo, manager_only_yaml()).await;
+        let gh = Arc::new(FakeGitHub::new());
+
+        let manager_id =
+            enqueue_item(&pool, repo, record::Kind::Manager, "manager", "issue#7").await;
+        mark_succeeded(&pool, manager_id).await;
+        // Backdate past the grace window: a still-missing coder now ESCALATES instead of
+        // deferring forever.
+        backdate_past_grace(&pool, manager_id).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        let escalations: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'needs_decision' AND work_item_id = $1",
+        )
+        .bind(manager_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(escalations, 1, "exactly one needs_decision escalation");
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one escalation assignment"
+        );
+        assert!(
+            find_item(&pool, repo, record::Kind::Coder, "issue#7")
+                .await
+                .is_none(),
+            "no coder is enqueued when none is configured"
+        );
+        assert_ne!(
+            issue_state(&pool, repo, 7).await.as_deref(),
+            Some("in_progress"),
+            "the issue is not moved to in_progress when it could not be delegated"
+        );
+
+        // Re-dispatch: clear the claim, backdate again, tick again → still exactly one
+        // escalation, no second comment/assignment (idempotent escalation + deliver-once).
+        sqlx::query("UPDATE work_items SET reacted = false WHERE id = $1")
+            .bind(manager_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        backdate_past_grace(&pool, manager_id).await;
+        let gh2 = Arc::new(FakeGitHub::new());
+        coordinator_tick(&pool, gh2.as_ref()).await.unwrap();
+        let escalations: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'needs_decision' AND work_item_id = $1",
+        )
+        .bind(manager_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            escalations, 1,
+            "re-dispatch escalates exactly once, not twice"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh2, "post_comment").len(),
+            0,
+            "no second escalation comment on re-dispatch"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh2, "assign_issue").len(),
+            0,
+            "no second escalation assignment on re-dispatch"
+        );
+        drop(serial);
+    }
+
+    /// A manager+coder config with the reviewer REMOVED. Used by the no-reviewer
+    /// defer/escalate test before the operator adds a reviewer back.
+    fn no_reviewer_yaml() -> &'static str {
+        "version: 1\n\
+         settings:\n  label: factory\n  escalation_assignee: octo-human\n\
+         limits:\n  max_concurrent_workers: 5\n\
+         workers:\n\
+         \x20 - name: manager\n    role: manager\n    on: [issue_labeled]\n\
+         \x20 - name: bug-fixer\n    role: coder\n    on: [manager]\n"
+    }
+
+    /// FIX P4-followup (path 3: coder succeeded with a CR, but no reviewer configured). The
+    /// old fix escalated on the first tick after committing the claim — STRANDING the CR
+    /// `succeeded, reacted=true` even after a reviewer was added. The correct behavior is
+    /// DEFER-WITH-GRACE: within grace the react is NOT consumed and nothing is escalated, so
+    /// adding a reviewer lets a later tick SELF-HEAL (enqueue the reviewer for the CR).
+    #[tokio::test]
+    async fn coder_no_reviewer_defers_then_self_heals() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let serial = P4_SERIAL.lock().await;
+        drain_terminal(&pool).await;
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-p4-noreviewer"), 1)
+            .await
+            .unwrap();
+        set_config_yaml(&pool, repo, no_reviewer_yaml()).await;
+        let gh = Arc::new(FakeGitHub::new());
+        let state = tools_state(&pool, gh.clone());
+
+        // A coder opens a CR on issue#1 (open_cr links the CR to issue 1), then succeeds.
+        let (cr_number, _cr_row) = open_cr(&pool, repo, "bug-fixer", &state, "needs review").await;
+        let cr_subject = format!("cr#{cr_number}");
+        let coder_id = find_item(&pool, repo, record::Kind::Coder, "issue#1")
+            .await
+            .expect("the CR-opening coder item exists");
+        mark_succeeded(&pool, coder_id).await;
+
+        // (A) DEFER within grace: the coder item is NOT reacted, NOT escalated, and no
+        // reviewer is enqueued.
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+        assert!(
+            !is_reacted(&pool, coder_id).await,
+            "no reviewer within grace DEFERS: the coder item stays unreacted (not stranded)"
+        );
+        assert_eq!(
+            record::count_escalations_for_item(&pool, coder_id)
+                .await
+                .unwrap(),
+            0,
+            "no reviewer within grace does not escalate"
+        );
+        assert!(
+            find_item(&pool, repo, record::Kind::Reviewer, &cr_subject)
+                .await
+                .is_none(),
+            "no reviewer is enqueued while deferring"
+        );
+
+        // (B) SELF-HEAL: add a reviewer to config; the SAME unreacted coder item now wakes a
+        // reviewer for the CR on the next tick.
+        set_config_yaml(&pool, repo, three_role_yaml()).await;
+        let gh_healed = Arc::new(FakeGitHub::new());
+        coordinator_tick(&pool, gh_healed.as_ref()).await.unwrap();
+        assert!(
+            is_reacted(&pool, coder_id).await,
+            "once a reviewer is configured the deferred coder item is consumed"
+        );
+        assert!(
+            find_item(&pool, repo, record::Kind::Reviewer, &cr_subject)
+                .await
+                .is_some(),
+            "self-heal: a reviewer is enqueued for the CR once one is configured"
+        );
+        assert_eq!(
+            record::count_escalations_for_item(&pool, coder_id)
+                .await
+                .unwrap(),
+            0,
+            "self-heal never escalated"
+        );
+        drop(serial);
+    }
+
+    /// FIX P4-followup (path 3, escalate-past-grace): a coder item with a CR but no reviewer
+    /// configured, aged PAST the grace window, escalates `needs_decision` EXACTLY ONCE — one
+    /// row, one comment, one assignment (the CR's linked issue) — enqueues no reviewer, and
+    /// re-dispatch escalates no second time.
+    #[tokio::test]
+    async fn coder_no_reviewer_escalates_exactly_once_past_grace() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let serial = P4_SERIAL.lock().await;
+        drain_terminal(&pool).await;
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-p4-noreviewer-grace"), 1)
+            .await
+            .unwrap();
+        set_config_yaml(&pool, repo, no_reviewer_yaml()).await;
+        let gh = Arc::new(FakeGitHub::new());
+        let state = tools_state(&pool, gh.clone());
+
+        let (cr_number, _cr_row) = open_cr(&pool, repo, "bug-fixer", &state, "needs review").await;
+        let cr_subject = format!("cr#{cr_number}");
+        let coder_id = find_item(&pool, repo, record::Kind::Coder, "issue#1")
+            .await
+            .expect("the CR-opening coder item exists");
+        mark_succeeded(&pool, coder_id).await;
+        backdate_past_grace(&pool, coder_id).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        let escalations: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'needs_decision' AND work_item_id = $1",
+        )
+        .bind(coder_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(escalations, 1, "exactly one needs_decision escalation");
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one escalation assignment (the CR's linked issue)"
+        );
+        assert!(
+            find_item(&pool, repo, record::Kind::Reviewer, &cr_subject)
+                .await
+                .is_none(),
+            "no reviewer is enqueued when none is configured"
+        );
+
+        // Re-dispatch: still exactly one escalation, no second comment/assignment.
+        sqlx::query("UPDATE work_items SET reacted = false WHERE id = $1")
+            .bind(coder_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        backdate_past_grace(&pool, coder_id).await;
+        let gh2 = Arc::new(FakeGitHub::new());
+        coordinator_tick(&pool, gh2.as_ref()).await.unwrap();
+        let escalations: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'needs_decision' AND work_item_id = $1",
+        )
+        .bind(coder_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            escalations, 1,
+            "re-dispatch escalates exactly once, not twice"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh2, "post_comment").len(),
+            0,
+            "no second escalation comment on re-dispatch"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh2, "assign_issue").len(),
+            0,
+            "no second escalation assignment on re-dispatch"
+        );
+        drop(serial);
+    }
+
+    /// FIX P4-followup (path 2: coder succeeded but its CR isn't visible yet — the pre-tx
+    /// `load_cr_for_item` TOCTOU). The old code returned `None` and called this "NOT a
+    /// strand", but the claim WAS committed, so the CR would never get a reviewer even once
+    /// the row/number appeared. The correct behavior is DEFER-WITH-GRACE: within grace the
+    /// react is NOT consumed; once the CR becomes visible a later tick SELF-HEALS by waking
+    /// a reviewer.
+    #[tokio::test]
+    async fn coder_cr_not_visible_yet_defers_then_self_heals_when_cr_appears() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        // Full three-role config so a reviewer IS available — the ONLY missing precondition
+        // under test is the not-yet-visible CR, isolating path 2 from path 3.
+        let (_serial, repo, (_manager, coder, _reviewer), gh, _setup_state) =
+            p4_fixture(&pool, "e2e-p4-nocr").await;
+
+        // A coder item that SUCCEEDED without (yet) a CR row keyed to it — exactly the
+        // TOCTOU window where load_cr_for_item finds nothing.
+        let coder_id = enqueue_item(&pool, repo, record::Kind::Coder, coder, "issue#1").await;
+        mark_succeeded(&pool, coder_id).await;
+        assert!(
+            record::change_request_for_item(&pool, coder_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "precondition: no CR is visible for the coder item yet"
+        );
+
+        // (A) DEFER within grace: the coder item is NOT reacted, NOT escalated.
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+        assert!(
+            !is_reacted(&pool, coder_id).await,
+            "a not-yet-visible CR DEFERS: the coder item stays unreacted (not stranded)"
+        );
+        assert_eq!(
+            record::count_escalations_for_item(&pool, coder_id)
+                .await
+                .unwrap(),
+            0,
+            "a not-yet-visible CR does not escalate within grace"
+        );
+
+        // (B) SELF-HEAL: the CR row + number become visible (the coder's tool call lands,
+        // keyed to this same work item). The next tick now wakes a reviewer for the CR.
+        let coder_auth = task_auth(coder_id, repo, record::Kind::Coder);
+        let cr = factory_tools::open_or_update_change_request(
+            &state_for(&pool),
+            &coder_auth,
+            "[coder] issue#1",
+            "now visible",
+            "factory/issue-1",
+            "main",
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let cr_number = cr["cr_number"].as_i64().unwrap();
+        let gh_healed = Arc::new(FakeGitHub::new());
+        coordinator_tick(&pool, gh_healed.as_ref()).await.unwrap();
+        assert!(
+            is_reacted(&pool, coder_id).await,
+            "once the CR is visible the deferred coder item is consumed"
+        );
+        assert!(
+            find_item(
+                &pool,
+                repo,
+                record::Kind::Reviewer,
+                &format!("cr#{cr_number}")
+            )
+            .await
+            .is_some(),
+            "self-heal: a reviewer is woken once the CR appears"
+        );
+        assert_eq!(
+            record::count_escalations_for_item(&pool, coder_id)
+                .await
+                .unwrap(),
+            0,
+            "self-heal never escalated"
+        );
+    }
+
+    /// A manager+reviewer config with NO coder. Used by the changes-requested-no-coder
+    /// (path 4) test: a reviewer can drive the CR to `changes_requested`, but there is no
+    /// coder to dispatch rework to until the operator adds one.
+    fn no_coder_with_reviewer_yaml() -> &'static str {
+        "version: 1\n\
+         settings:\n  label: factory\n  escalation_assignee: octo-human\n\
+         limits:\n  max_concurrent_workers: 5\n\
+         workers:\n\
+         \x20 - name: manager\n    role: manager\n    on: [issue_labeled]\n\
+         \x20 - name: reviewer\n    role: reviewer\n    on: [cr_opened]\n"
+    }
+
+    /// FIX P4-followup (path 4: reviewer requested changes below the loop cap, but no coder
+    /// configured — the rework dispatch path). The old code returned `PostCommit::None`
+    /// below the cap, committing the claim and STRANDING the CR (the loop count was bumped
+    /// but no coder was dispatched and no escalation surfaced). The correct behavior is
+    /// DEFER-WITH-GRACE: within grace the react is NOT consumed (and the loop count is NOT
+    /// bumped — the increment is in-tx, which never opens on a defer), so adding a coder lets
+    /// a later tick SELF-HEAL by dispatching rework.
+    #[tokio::test]
+    async fn changes_requested_no_coder_defers_then_self_heals() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let serial = P4_SERIAL.lock().await;
+        drain_terminal(&pool).await;
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-p4-cr-nocoder"), 1)
+            .await
+            .unwrap();
+        set_config_yaml(&pool, repo, no_coder_with_reviewer_yaml()).await;
+        let gh = Arc::new(FakeGitHub::new());
+        let state = tools_state(&pool, gh.clone());
+
+        // Open a CR on issue#1 (the open tool doesn't need a configured coder role), then a
+        // reviewer requests changes → CR factory_state = changes_requested. Retire the
+        // bootstrap coder so `find_item(Coder, issue#1)` only ever finds a genuine rework
+        // dispatch.
+        let (cr_number, cr_row) = open_cr(&pool, repo, "bug-fixer", &state, "first attempt").await;
+        retire_bootstrap_coder(&pool, repo, "issue#1").await;
+        let cr_subject = format!("cr#{cr_number}");
+        let reviewer_id =
+            enqueue_item(&pool, repo, record::Kind::Reviewer, "reviewer", &cr_subject).await;
+        let reviewer_auth = task_auth(reviewer_id, repo, record::Kind::Reviewer);
+        factory_tools::submit_review(
+            &state,
+            &reviewer_auth,
+            cr_number,
+            "request_changes",
+            "needs work",
+            Some("rev-1"),
+        )
+        .await
+        .unwrap();
+        mark_succeeded(&pool, reviewer_id).await;
+
+        // (A) DEFER within grace: the reviewer item is NOT reacted, NOT escalated, the loop
+        // count is NOT bumped (the in-tx increment never runs on a defer), and no coder is
+        // dispatched.
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+        assert!(
+            !is_reacted(&pool, reviewer_id).await,
+            "no coder within grace DEFERS the rework dispatch (not stranded)"
+        );
+        assert_eq!(
+            record::count_escalations_for_item(&pool, reviewer_id)
+                .await
+                .unwrap(),
+            0,
+            "no coder within grace does not escalate"
+        );
+        assert_eq!(
+            record::cr_loop_count(&pool, cr_row.id).await.unwrap(),
+            0,
+            "a deferred rework does NOT bump the loop count (the in-tx increment never ran)"
+        );
+        assert!(
+            find_item(&pool, repo, record::Kind::Coder, "issue#1")
+                .await
+                .is_none(),
+            "no rework coder is dispatched while deferring"
+        );
+
+        // (B) SELF-HEAL: add a coder; the SAME unreacted reviewer item now dispatches rework
+        // (a coder for issue#1) and bumps the loop count exactly once.
+        set_config_yaml(&pool, repo, three_role_yaml()).await;
+        let gh_healed = Arc::new(FakeGitHub::new());
+        coordinator_tick(&pool, gh_healed.as_ref()).await.unwrap();
+        assert!(
+            is_reacted(&pool, reviewer_id).await,
+            "once a coder is configured the deferred rework is consumed"
+        );
+        assert!(
+            find_item(&pool, repo, record::Kind::Coder, "issue#1")
+                .await
+                .is_some(),
+            "self-heal: a rework coder is dispatched once one is configured"
+        );
+        assert_eq!(
+            record::cr_loop_count(&pool, cr_row.id).await.unwrap(),
+            1,
+            "self-heal bumps the loop count exactly once (the rework cycle counts)"
+        );
+        assert_eq!(
+            record::count_escalations_for_item(&pool, reviewer_id)
+                .await
+                .unwrap(),
+            0,
+            "self-heal never escalated"
+        );
+        drop(serial);
+    }
+
+    /// FIX P4-followup (path 4, escalate-past-grace): a changes-requested CR below the cap
+    /// with no coder, aged PAST the grace window, escalates `needs_decision` EXACTLY ONCE —
+    /// one row, one comment, one assignment — dispatches no rework, and re-dispatch escalates
+    /// no second time.
+    #[tokio::test]
+    async fn changes_requested_no_coder_escalates_exactly_once_past_grace() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let serial = P4_SERIAL.lock().await;
+        drain_terminal(&pool).await;
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-p4-cr-nocoder-grace"), 1)
+            .await
+            .unwrap();
+        set_config_yaml(&pool, repo, no_coder_with_reviewer_yaml()).await;
+        let gh = Arc::new(FakeGitHub::new());
+        let state = tools_state(&pool, gh.clone());
+
+        let (cr_number, cr_row) = open_cr(&pool, repo, "bug-fixer", &state, "first attempt").await;
+        retire_bootstrap_coder(&pool, repo, "issue#1").await;
+        let cr_subject = format!("cr#{cr_number}");
+        let reviewer_id =
+            enqueue_item(&pool, repo, record::Kind::Reviewer, "reviewer", &cr_subject).await;
+        let reviewer_auth = task_auth(reviewer_id, repo, record::Kind::Reviewer);
+        factory_tools::submit_review(
+            &state,
+            &reviewer_auth,
+            cr_number,
+            "request_changes",
+            "needs work",
+            Some("rev-1"),
+        )
+        .await
+        .unwrap();
+        mark_succeeded(&pool, reviewer_id).await;
+        backdate_past_grace(&pool, reviewer_id).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        let escalations: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'needs_decision' AND work_item_id = $1",
+        )
+        .bind(reviewer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(escalations, 1, "exactly one needs_decision escalation");
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one escalation assignment (the CR's linked issue)"
+        );
+        assert!(
+            find_item(&pool, repo, record::Kind::Coder, "issue#1")
+                .await
+                .is_none(),
+            "no rework coder is dispatched when none is configured"
+        );
+        assert_eq!(
+            record::cr_loop_count(&pool, cr_row.id).await.unwrap(),
+            0,
+            "the escalate-past-grace path does not bump the loop count"
+        );
+
+        // Re-dispatch: still exactly one escalation, no second comment/assignment.
+        sqlx::query("UPDATE work_items SET reacted = false WHERE id = $1")
+            .bind(reviewer_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        backdate_past_grace(&pool, reviewer_id).await;
+        let gh2 = Arc::new(FakeGitHub::new());
+        coordinator_tick(&pool, gh2.as_ref()).await.unwrap();
+        let escalations: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'needs_decision' AND work_item_id = $1",
+        )
+        .bind(reviewer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            escalations, 1,
+            "re-dispatch escalates exactly once, not twice"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh2, "post_comment").len(),
+            0,
+            "no second escalation comment on re-dispatch"
+        );
+        drop(serial);
     }
 
     /// Like the happy/gating tests, but the gating prefix is a CUSTOM, non-default

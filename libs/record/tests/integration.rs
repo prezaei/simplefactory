@@ -692,7 +692,9 @@ async fn create_escalation_idempotent_reports_created_then_conflict() {
     // The `created` bool distinguishes the first insert from a later conflict-update:
     // first call → created=true; a second call for the same (work_item, reason) →
     // created=false (same row id), so the coordinator runs the human-facing side
-    // effects exactly once.
+    // effects exactly once. The conflict path is a no-op self-assign: it leaves the
+    // existing row (and its context) UNCHANGED even when the second call passes a
+    // different context, so the DB always matches the already-delivered escalation.
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -744,6 +746,19 @@ async fn create_escalation_idempotent_reports_created_then_conflict() {
             .unwrap(),
         1,
         "exactly one escalation row for the item",
+    );
+
+    // The conflict did NOT overwrite the original context with "second context": the
+    // stored row still carries the context delivered to the human on the first call.
+    let stored_context: String =
+        sqlx::query_scalar("SELECT context FROM escalations WHERE id = $1")
+            .bind(id1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored_context, "first context",
+        "the conflict path leaves the original context unchanged (no DO UPDATE SET context)"
     );
 }
 

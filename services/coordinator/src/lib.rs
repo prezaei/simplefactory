@@ -80,6 +80,17 @@ const DEFAULT_LOOP_CAP: u32 = 5;
 /// nor a stuck red CR is polled forever. 30 minutes balances both.
 const DEFAULT_CHECKS_GRACE_SECS: i64 = 1800;
 
+/// Whether a terminal item is still WITHIN the defer grace window, measured from its
+/// `updated_at` (the terminal-transition time — the stable anchor the defer paths never
+/// touch). Shared by the checks-not-green defer (FIX 4) and the missing-precondition
+/// defer (FIX P4-followup) so both use ONE age model: within the window a not-yet-actionable
+/// item is DEFERRED (re-evaluated next tick → self-heals); past it, ESCALATED exactly once.
+fn within_grace(item: &WorkItem) -> bool {
+    let grace = chrono::Duration::seconds(DEFAULT_CHECKS_GRACE_SECS);
+    let age = chrono::Utc::now() - item.updated_at;
+    age < grace
+}
+
 /// Read an effective retry cap from config, defending against a `< 1` value (F2).
 /// `config::parse()` rejects a 0 cap, but a directly-written jsonb config could
 /// bypass that validation; a 0 cap would disable the retry bound entirely (every
@@ -226,6 +237,23 @@ async fn react_to_item(
         None => None,
     };
 
+    // DEFER-WITH-GRACE for a missing-but-recoverable precondition (FIX P4-followup):
+    // resolved from the pre-tx config + pre-loaded CR + item age, BEFORE the claim. Within
+    // the grace window a missing worker / not-yet-visible CR is DEFERRED — do NOT consume
+    // the claim, so the item stays terminal-but-unreacted and a later tick self-heals once
+    // the operator fixes config / the CR appears. Past the window it becomes an
+    // `Escalate` that flows into the tx and surfaces the config error exactly once. The
+    // reviewer-approval decision was already resolved above; an `Act` approval never has a
+    // missing precondition here (its CR is approved + numbered), so the two never conflict.
+    let escalate_precondition = match terminal_precondition(item, config, cr.as_ref()) {
+        Precondition::Ready => None,
+        Precondition::Defer { reason } => {
+            tracing::info!(work_item = %item.id, reason, "deferring react: precondition missing (within grace); re-evaluated next tick");
+            return Ok(false);
+        }
+        Precondition::Escalate { cr, context } => Some((cr, context)),
+    };
+
     // The per-issue serialization key for the advisory lock. Derived from the item's
     // subject (issue#N directly; cr#N via the pre-loaded CR's linked issue) so two
     // replicas reacting to different terminal items for the SAME issue serialize. When
@@ -249,6 +277,38 @@ async fn react_to_item(
         subject = %item.subject_ref,
         "reacting to terminal item"
     );
+
+    // A past-grace missing precondition escalates `needs_decision` exactly once INSTEAD
+    // of running the normal decision (FIX P4-followup). The claim is committed in this
+    // same tx, so the escalation is bound atomically with it; the idempotent escalation +
+    // deliver-once guard keep it exactly-once under re-dispatch. We escalate here rather
+    // than inside each decision fn so the normal decisions can assume their precondition
+    // holds (it was checked pre-tx) and never strand.
+    if let Some((esc_cr, context)) = escalate_precondition {
+        let (comment_target, assign_issue) = escalation_target(item, esc_cr.as_ref());
+        let post = escalate(
+            &mut tx,
+            item,
+            Escalation {
+                comment_target,
+                assign_issue,
+                reason: "needs_decision",
+                context,
+            },
+        )
+        .await?;
+        tracing::warn!(work_item = %item.id, kind = item.kind.as_str(), "missing precondition past grace; escalated needs_decision instead of stranding");
+        tx.commit().await?;
+        run_post_commit(
+            gh,
+            &repo,
+            item,
+            config.settings.escalation_assignee.as_deref(),
+            post,
+        )
+        .await?;
+        return Ok(true);
+    }
 
     // Apply the DB decision INSIDE the tx; it returns the GitHub side effects to run
     // after the commit (a no-op for most paths). All DB access here uses `&mut *tx`;
@@ -464,13 +524,11 @@ async fn load_approval_decision(
     // touches the row, so it is a stable anchor). Within the grace window DEFER (a hung
     // pending can still settle; a flaky red can self-heal). Past the grace window
     // ESCALATE exactly once (neither a hung pending nor a stuck red is polled forever).
-    let grace = chrono::Duration::seconds(DEFAULT_CHECKS_GRACE_SECS);
-    let age = chrono::Utc::now() - item.updated_at;
-    if age < grace {
-        tracing::info!(work_item = %item.id, cr_number = number, overall = checks.overall.as_str(), age_secs = age.num_seconds(), "approved CR checks not green within grace; deferring react (re-evaluated next tick)");
+    if within_grace(item) {
+        tracing::info!(work_item = %item.id, cr_number = number, overall = checks.overall.as_str(), "approved CR checks not green within grace; deferring react (re-evaluated next tick)");
         Ok(Some(ReviewerApproval::Defer))
     } else {
-        tracing::info!(work_item = %item.id, cr_number = number, overall = checks.overall.as_str(), age_secs = age.num_seconds(), "approved CR checks still not green past grace; will escalate needs_decision");
+        tracing::info!(work_item = %item.id, cr_number = number, overall = checks.overall.as_str(), "approved CR checks still not green past grace; will escalate needs_decision");
         Ok(Some(ReviewerApproval::Act(
             ApprovalDecision::EscalateChecks {
                 cr,
@@ -510,19 +568,167 @@ enum ApprovalDecision {
     },
 }
 
+/// A missing-but-recoverable precondition for a terminal-react decision, resolved
+/// BEFORE the claim (FIX P4-followup). The terminal-react paths each require a
+/// precondition the operator can still supply (a worker role added to config) or that a
+/// later tick can observe (the coder's CR row/number becoming visible). Mirrors the
+/// checks-not-green model EXACTLY: within the grace window the precondition's absence is
+/// transient → DEFER (do NOT claim; re-evaluate next tick → self-heals when config is
+/// fixed / the CR appears); past the window it is treated as a permanent config error →
+/// claim and ESCALATE `needs_decision` exactly once (visible, not stranded).
+///
+/// This replaces the earlier escalate-on-first-tick approach, which committed the claim
+/// and wrote an escalation row but left the item `succeeded, reacted=true` — `requeue_blocked`
+/// only revives `blocked` items, so the escalated item was VISIBLE but STRANDED (never
+/// recovered even after the operator added the worker).
+enum Precondition {
+    /// The precondition is present (or this path has none): proceed with the normal decision.
+    Ready,
+    /// Missing within the grace window: do NOT consume the react claim; re-evaluate next
+    /// tick (self-heals when the operator fixes config / the CR becomes visible).
+    Defer { reason: &'static str },
+    /// Missing past the grace window: claim and escalate `needs_decision` exactly once
+    /// (idempotent) so the permanent config error surfaces instead of being polled forever.
+    Escalate {
+        cr: Option<ChangeRequest>,
+        context: String,
+    },
+}
+
+/// Resolve the missing-but-recoverable precondition for a terminal item BEFORE the claim
+/// (FIX P4-followup). Covers the four strand-prone terminal-react paths uniformly:
+/// 1. Manager succeeded but no Coder worker is configured (can't delegate the issue).
+/// 2. Coder succeeded but its CR row / number isn't visible yet (the pre-tx
+///    `load_cr_for_item` TOCTOU — a later tick re-reads and finds it).
+/// 3. Coder succeeded with a visible CR but no Reviewer worker is configured.
+/// 4. Reviewer requested changes (below the loop cap) but no Coder worker is configured
+///    (the rework dispatch path).
+///
+/// Every other (kind, state) — and the at/over-cap changes-requested path, which escalates
+/// `loop_cap` regardless of the coder — resolves to [`Precondition::Ready`] and flows into
+/// the normal in-tx decision unchanged. `cr` is the SAME pre-loaded CR threaded through the
+/// react (C4): no extra `&Pool` read happens here.
+fn terminal_precondition(
+    item: &WorkItem,
+    config: &Config,
+    cr: Option<&ChangeRequest>,
+) -> Precondition {
+    match (item.kind, item.state) {
+        (Kind::Manager, State::Succeeded) => {
+            // The manager's subject must be an issue and a coder must exist to delegate to.
+            // (An unparseable subject is a real decode error, not a recoverable precondition:
+            // let the in-tx decision surface it.)
+            if !matches!(item.subject_ref.parse::<Subject>(), Ok(Subject::Issue(_))) {
+                return Precondition::Ready;
+            }
+            if worker_with_role(config, Role::Coder).is_some() {
+                return Precondition::Ready;
+            }
+            grace_gate(
+                item,
+                None,
+                "no_coder",
+                "no coder worker configured for this repo; cannot delegate the issue",
+            )
+        }
+        (Kind::Coder, State::Succeeded) => {
+            // The coder opened a CR; we need both the CR row AND its GitHub number to wake a
+            // reviewer. Until both are visible (the load_cr_for_item TOCTOU) the claim must
+            // NOT be consumed, or the CR is stranded with no review. With the CR visible, a
+            // reviewer worker must exist.
+            let Some(cr) = cr else {
+                return grace_gate(
+                    item,
+                    None,
+                    "no_cr_yet",
+                    "coder succeeded but its change request is not visible yet",
+                );
+            };
+            if cr.number.is_none() {
+                return grace_gate(
+                    item,
+                    Some(cr),
+                    "no_cr_number_yet",
+                    "coder's change request has no number yet; cannot wake review",
+                );
+            }
+            if worker_with_role(config, Role::Reviewer).is_some() {
+                return Precondition::Ready;
+            }
+            grace_gate(
+                item,
+                Some(cr),
+                "no_reviewer",
+                "no reviewer worker configured; cannot wake review for the change request",
+            )
+        }
+        (Kind::Reviewer, State::Succeeded) => {
+            // Only the changes-requested rework dispatch needs a coder, and only BELOW the
+            // loop cap (at/over the cap the in-tx decision escalates `loop_cap` regardless of
+            // the coder, so that path stays Ready). The loop cap is predicted from the CR's
+            // current `loop_count + 1` (the in-tx increment is authoritative; the per-issue
+            // advisory lock serializes reworks, so this prediction can't race for one issue).
+            let Some(cr) = cr else {
+                return Precondition::Ready;
+            };
+            if cr.factory_state != "changes_requested" {
+                return Precondition::Ready;
+            }
+            let loop_cap = i64::from(effective_loop_cap(config));
+            let would_hit_cap = i64::from(cr.loop_count) + 1 >= loop_cap;
+            if would_hit_cap || worker_with_role(config, Role::Coder).is_some() {
+                return Precondition::Ready;
+            }
+            grace_gate(
+                item,
+                Some(cr),
+                "no_coder",
+                "no coder worker configured; cannot dispatch rework for the change request",
+            )
+        }
+        _ => Precondition::Ready,
+    }
+}
+
+/// Resolve a missing precondition to DEFER (within grace) or ESCALATE (past grace),
+/// using the shared [`within_grace`] age model. The `reason` tags the defer log line;
+/// the `context` is the human-facing escalation copy past grace.
+fn grace_gate(
+    item: &WorkItem,
+    cr: Option<&ChangeRequest>,
+    reason: &'static str,
+    context: &str,
+) -> Precondition {
+    if within_grace(item) {
+        Precondition::Defer { reason }
+    } else {
+        Precondition::Escalate {
+            cr: cr.cloned(),
+            context: context.to_owned(),
+        }
+    }
+}
+
 /// Manager succeeded → assign a coder for the issue and mark the issue in_progress.
 async fn decide_manager_succeeded(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     item: &WorkItem,
     config: &Config,
 ) -> anyhow::Result<PostCommit> {
-    let Some(coder) = worker_with_role(config, Role::Coder) else {
-        tracing::warn!(work_item = %item.id, "no coder worker in config; cannot delegate");
-        return Ok(PostCommit::None);
-    };
     // The manager's subject is the issue it triaged.
     let Subject::Issue(issue) = parse_subject(&item.subject_ref)? else {
         tracing::warn!(work_item = %item.id, subject = %item.subject_ref, "manager subject is not an issue; cannot delegate");
+        return Ok(PostCommit::None);
+    };
+
+    // The coder presence was resolved BEFORE the claim (FIX P4-followup): within grace a
+    // missing coder DEFERS (no claim → self-heals); past grace it escalates `needs_decision`
+    // before this decision runs. So by here a coder must exist — but defend without a panic
+    // (a config racing to drop the coder between the pre-tx check and here just no-ops this
+    // tick; the item stays terminal-but-unreacted only if the claim hadn't committed, which
+    // it has, so the next failure path is the standard retry/escalate machinery).
+    let Some(coder) = worker_with_role(config, Role::Coder) else {
+        tracing::warn!(work_item = %item.id, issue, "coder worker disappeared after pre-tx check; no-op this tick");
         return Ok(PostCommit::None);
     };
 
@@ -549,16 +755,18 @@ async fn decide_coder_succeeded(
     config: &Config,
     cr: Option<ChangeRequest>,
 ) -> anyhow::Result<PostCommit> {
-    let Some(reviewer) = worker_with_role(config, Role::Reviewer) else {
-        tracing::warn!(work_item = %item.id, "no reviewer worker in config; cannot request review");
-        return Ok(PostCommit::None);
-    };
-    let Some(cr) = cr else {
-        tracing::info!(work_item = %item.id, "coder succeeded but no CR row yet; nothing to review");
+    // The CR presence (row + number) AND the reviewer worker were resolved BEFORE the
+    // claim (FIX P4-followup): a not-yet-visible CR / missing reviewer DEFERS within grace
+    // (no claim → a later tick re-reads and finds the CR / the operator adds the reviewer)
+    // and escalates `needs_decision` past grace. So by here the CR, its number, and the
+    // reviewer all exist — but defend without a panic against a config/CR race after the
+    // pre-tx check (the claim has committed, so a no-op this tick is the safe fallback).
+    let (Some(cr), Some(reviewer)) = (cr, worker_with_role(config, Role::Reviewer)) else {
+        tracing::warn!(work_item = %item.id, "CR or reviewer worker disappeared after pre-tx check; no-op this tick");
         return Ok(PostCommit::None);
     };
     let Some(number) = cr.number else {
-        tracing::info!(work_item = %item.id, "coder's CR has no number yet; nothing to review");
+        tracing::warn!(work_item = %item.id, "CR number disappeared after pre-tx check; no-op this tick");
         return Ok(PostCommit::None);
     };
 
@@ -705,7 +913,8 @@ async fn apply_approval(
             // the transport layer. `run_post_commit` only delivers this body.
             let body = format!(
                 "Factory: change request #{cr_number} is approved and all checks are green. \
-                 Ready for a human to merge; the linked issue is closed once you merge."
+                 Ready for a human to review and merge. The linked issue stays open; close \
+                 it yourself after merging (automatic closure on merge is not yet available)."
             );
             tracing::info!(work_item = %item.id, cr_number, "reviewer approved: CR marked ready for human merge; issue left in_progress");
             Ok(PostCommit::ReadyHandoff {
@@ -753,9 +962,13 @@ async fn decide_changes_requested(
         return Ok(post);
     }
 
-    // Below the cap: send the coder back for rework on the linked issue.
+    // Below the cap: send the coder back for rework on the linked issue. The coder's
+    // presence (below the cap) was resolved BEFORE the claim (FIX P4-followup): within
+    // grace a missing coder DEFERS this rework dispatch (no claim → self-heals when the
+    // operator adds the coder), past grace it escalates `needs_decision`. So by here a
+    // coder must exist — defend without a panic against a config race after the check.
     let Some(coder) = worker_with_role(config, Role::Coder) else {
-        tracing::warn!(work_item = %item.id, "no coder worker in config; cannot rework");
+        tracing::warn!(work_item = %item.id, "coder worker disappeared after pre-tx check; no-op this rework tick");
         return Ok(PostCommit::None);
     };
     // C2: with no linked issue there is nothing to rework against — re-dispatching a
@@ -1151,6 +1364,7 @@ mod tests {
             linked_issue,
             work_item_id: None,
             factory_state: "open".into(),
+            loop_count: 0,
         }
     }
 

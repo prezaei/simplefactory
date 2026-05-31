@@ -626,6 +626,13 @@ pub async fn heartbeat(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
 /// row, no second comment, and the state stays as the first escalation left it. A
 /// caller who genuinely needs to distinguish multiple escalations may pass an explicit
 /// `dedupe_key`, which is honored as the claim key instead of the default.
+///
+/// Escalation is ALSO idempotent at the record layer per `(work_item, reason)`: the
+/// DB holds a UNIQUE (work_item_id, reason) index, so even an explicit distinct
+/// `dedupe_key` that wins a fresh task claim cannot create a second escalation row for
+/// the same `(work_item, reason)`. In that case the write is a no-op success
+/// (`created = false`): the original row/context is preserved, no second comment is
+/// posted, and the work-item state is left as the first escalation set it.
 pub async fn escalate(
     state: &ToolsState,
     auth: &TaskAuth,
@@ -677,8 +684,36 @@ async fn escalate_won(
         .await?
         .ok_or_else(|| anyhow::anyhow!("work item {} not found", auth.work_item_id))?;
 
-    let escalation_id =
-        record::create_escalation(&state.pool, auth.work_item_id, reason, context, None).await?;
+    // Escalation is idempotent per (work_item, reason): the DB carries a UNIQUE
+    // (work_item_id, reason) index (migration 0004), so a second escalate for the same
+    // (work_item, reason) — e.g. via a distinct caller `dedupe_key` that bypasses the
+    // task-level idempotency claim above — is a no-op success (`created = false`), not a
+    // DB unique-violation. On conflict the original escalation row (and its context) is
+    // preserved, matching the already-delivered human-facing question.
+    let (escalation_id, created) =
+        record::create_escalation_idempotent(&state.pool, auth.work_item_id, reason, context, None)
+            .await?;
+
+    // A repeat (work_item, reason) escalation already has a delivered question and a
+    // settled work-item state; do not post a second comment or re-set the state.
+    if !created {
+        tracing::info!(
+            work_item = %auth.work_item_id,
+            reason,
+            %escalation_id,
+            "escalate: idempotent no-op (escalation already exists for this work_item+reason)"
+        );
+        let item_state = record::work_item_by_id(&state.pool, auth.work_item_id)
+            .await?
+            .map(|w| w.state)
+            .unwrap_or(item.state);
+        return Ok(json!({
+            "escalation_id": escalation_id.to_string(),
+            "delivered_comment_id": Option::<String>::None,
+            "state": item_state.as_str(),
+            "state_changed": false,
+        }));
+    }
 
     // Post the human-facing question on the subject (best-effort delivery target).
     let delivered = if let Some(target) = subject_comment_target(&item.subject_ref) {

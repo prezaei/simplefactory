@@ -868,6 +868,10 @@ pub struct ChangeRequest {
     pub linked_issue: Option<i32>,
     pub work_item_id: Option<Uuid>,
     pub factory_state: String,
+    /// The bounded review-rework counter (advanced by [`increment_cr_loop_count`]).
+    /// Loaded with the row so a pre-tx decision can predict whether the NEXT
+    /// changes-requested cycle would hit the loop cap without a second read.
+    pub loop_count: i32,
 }
 
 /// Idempotent-by-head-branch CR row. The CR identity is `(repo_id, head_branch)`
@@ -909,7 +913,7 @@ pub async fn upsert_change_request_for_item(
                                  ELSE COALESCE(EXCLUDED.linked_issue, change_requests.linked_issue) END,
              updated_at   = CASE WHEN change_requests.factory_state IN ('ready', 'merged', 'closed')
                                  THEN change_requests.updated_at ELSE now() END
-         RETURNING id, repo_id, number, head_branch, linked_issue, work_item_id, factory_state",
+         RETURNING id, repo_id, number, head_branch, linked_issue, work_item_id, factory_state, loop_count",
     )
     .bind(Uuid::now_v7())
     .bind(repo_id)
@@ -957,7 +961,7 @@ pub async fn change_request_for_item(
     work_item_id: Uuid,
 ) -> Result<Option<ChangeRequest>> {
     let row = sqlx::query(
-        "SELECT id, repo_id, number, head_branch, linked_issue, work_item_id, factory_state
+        "SELECT id, repo_id, number, head_branch, linked_issue, work_item_id, factory_state, loop_count
            FROM change_requests WHERE work_item_id = $1",
     )
     .bind(work_item_id)
@@ -1215,31 +1219,6 @@ pub async fn heartbeat_task(
     })
 }
 
-/// Record an escalation against a work item (the single human channel). Returns
-/// the new escalation id.
-pub async fn create_escalation(
-    pool: &Pool,
-    work_item_id: Uuid,
-    reason: &str,
-    context: &str,
-    delivered_to: Option<&str>,
-) -> Result<Uuid> {
-    let id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO escalations (id, work_item_id, reason, context, delivered_to)
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(id)
-    .bind(work_item_id)
-    .bind(reason)
-    .bind(context)
-    .bind(delivered_to)
-    .execute(pool)
-    .await?;
-    tracing::info!(%work_item_id, reason, "escalation recorded");
-    Ok(id)
-}
-
 /// Count escalations recorded for a work item (test helper).
 pub async fn count_escalations_for_item(pool: &Pool, work_item_id: Uuid) -> Result<i64> {
     Ok(
@@ -1449,7 +1428,7 @@ pub async fn change_request_by_number(
     number: i32,
 ) -> Result<Option<ChangeRequest>> {
     let row = sqlx::query(
-        "SELECT id, repo_id, number, head_branch, linked_issue, work_item_id, factory_state
+        "SELECT id, repo_id, number, head_branch, linked_issue, work_item_id, factory_state, loop_count
            FROM change_requests WHERE repo_id = $1 AND number = $2",
     )
     .bind(repo_id)
@@ -1495,6 +1474,12 @@ pub async fn cr_loop_count(pool: &Pool, cr_id: Uuid) -> Result<i32> {
 /// conflict-update without a second statement. Because it is one statement it is
 /// `impl PgExecutor` like its siblings; the coordinator runs it INSIDE its per-react
 /// transaction via `&mut **tx`.
+///
+/// On conflict the existing row is left **unchanged** — the `DO UPDATE` is a no-op
+/// self-assign (`work_item_id = excluded.work_item_id`) chosen only so the row is
+/// returned (a `DO NOTHING` would return no row). The original `context` is preserved,
+/// matching the already-delivered human-facing escalation; the second call is a pure
+/// no-op success (`created = false`).
 pub async fn create_escalation_idempotent(
     executor: impl sqlx::PgExecutor<'_>,
     work_item_id: Uuid,
@@ -1505,7 +1490,7 @@ pub async fn create_escalation_idempotent(
     let row = sqlx::query(
         "INSERT INTO escalations (id, work_item_id, reason, context, delivered_to)
          VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (work_item_id, reason) DO UPDATE SET context = excluded.context
+         ON CONFLICT (work_item_id, reason) DO UPDATE SET work_item_id = excluded.work_item_id
          RETURNING id, (xmax = 0) AS created",
     )
     .bind(Uuid::now_v7())
@@ -1530,6 +1515,7 @@ fn map_change_request(row: sqlx::postgres::PgRow) -> Result<ChangeRequest> {
         linked_issue: row.try_get("linked_issue")?,
         work_item_id: row.try_get("work_item_id")?,
         factory_state: row.try_get("factory_state")?,
+        loop_count: row.try_get("loop_count")?,
     })
 }
 
