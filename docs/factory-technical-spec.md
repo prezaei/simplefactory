@@ -117,7 +117,7 @@ Every role runs Claude Code over the same MCP/Tools channel, but the harness's t
 | **Coder** | the issue / CR | writes code on a fresh clone | push branch → `open_or_update_change_request` → `record_outcome` | **Yes** (the only role that does) |
 | **Reviewer** | the CR (`read_change_request`) | reviews the diff + checks | `submit_review` verdict (approve / request changes) → `record_outcome` | **No** |
 
-A Manager or Reviewer therefore never pushes a branch or opens a CR. (The Coder→CR lifecycle ships in P3; the Manager-triage and Reviewer-verdict lifecycles are **P4.5** in the implementation plan.)
+A Manager or Reviewer therefore never pushes a branch or opens a CR. (The Coder→CR lifecycle ships in P3; the Manager-triage and Reviewer-verdict lifecycles are **P4.5** in the implementation plan.) This table defines the **manager / coder / reviewer** lifecycles only; the **`tester`** role is reserved (no shipped lifecycle yet — consistent with the config note below), so it has no terminal-action contract here.
 
 ### Factory Tools (MCP server)
 Axum-hosted MCP server exposing the worker's only channel to Factory: read the ticket/diff, open/update the change request, leave a comment, submit a review, read check status, append to the transcript, record outcome, heartbeat the lease, raise an escalation. A worker sees only its own task's context (no cross-task lookup). Authenticates the per-task token, enforces that a token may only act on its own task/repo, and writes every call to the record book + audit log. Tools (not the worker) own writes to Postgres/Blob. Full surface in [Factory Tools (MCP) surface](#factory-tools-mcp-surface).
@@ -377,13 +377,13 @@ The worker's only channel to Factory, exposed by the Tools service as a **remote
 
 ## Key workflows
 
-**Issue → merged change (the worked example).** Webhook → Intake writes a Manager work item → Dispatcher leases it → Manager assigns a Coder (enqueues a coder work item, comments via Tools) → Dispatcher starts a Container Apps Job → Worker clones, runs Claude Code (tests-first, then code), opens a CR via Tools, records success → Manager (reacting to completion) + the new-CR webhook wake a Reviewer job → Reviewer verdict via Tools → on *changes requested*, Manager re-enqueues a Coder against the same CR (counts toward the per-issue loop cap); on *approved* + required checks green, Manager marks ready and hands to a human to merge → human merges → Manager closes the issue.
+**Issue → merged change (the worked example).** Webhook → Intake writes a Manager-role work item → Dispatcher leases it → the Manager worker triages; on its success the **Coordinator** assigns a Coder (enqueues a coder work item, comments via Tools) → Dispatcher starts a Container Apps Job → Worker clones, runs Claude Code (tests-first, then code), opens a CR via Tools, records success → the **Coordinator** (reacting to completion) + the new-CR webhook wake a Reviewer job → Reviewer verdict via Tools → on *changes requested*, the **Coordinator** re-enqueues a Coder against the same CR (counts toward the per-issue loop cap); on *approved* + required checks green, the **Coordinator** marks ready and hands to a human to merge → human merges → the **Coordinator** closes the issue.
 
 **No-double-starts.** Every pickup is a single `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)` transaction; the row's lease columns are set atomically. Two dispatcher replicas can never lease the same row.
 
 **Crash-resume.** The worker harness streams Claude Code's session state + a worktree snapshot to Blob on a short interval and at each tool boundary. If the job dies (or the coordinator restarts), the work item's lease expires; the next dispatch restores the worktree from Blob and runs `claude --resume <session>` to continue the *same* session. Repeated resumes failing at the same point fall through, after a few, to a fresh attempt (idempotent on the same CR) or escalation — bounding deterministic crash loops. If checkpoint state is unrecoverable, it's a fresh attempt.
 
-**Escalation.** When work exhausts retries / hits the loop cap / needs a human decision, the Manager (or worker, for blocked-on-input) writes the question as an **issue/CR comment and assigns the issue** — the single human channel — and records an `escalations` row. Blocked-on-human time does not count against retry/loop caps.
+**Escalation.** When work exhausts retries / hits the loop cap / needs a human decision, the Coordinator (or a worker, for blocked-on-input) writes the question as an **issue/CR comment and assigns the issue** — the single human channel — and records an `escalations` row. Blocked-on-human time does not count against retry/loop caps.
 
 **Blocked → resume on reply (also the human-steer path).** A `blocked: waiting on a human` item has freed its slot and sits in `state='blocked'`. When the human comments on or edits the issue/CR, the `issue_comment` webhook reaches Intake, which flips the matching item to `state='queued'` and sets `available_at = now()`; the next dispatch re-leases it and `claude --resume` continues the *same* session. The same path lets a human **steer** an item proactively (PROD "comment or edit … to steer it"). The dashboard stays read-only by design — steering happens in GitHub, not the dashboard.
 
@@ -483,7 +483,7 @@ Starting values. Per-repo `.factory/config.yml` may override the **capacity caps
 services/
   intake/         # webhook + scheduler (Axum)
   dispatcher/     # capacity caps + SKIP LOCKED leasing + job launch
-  coordinator/    # Manager: decide-and-delegate, lease sweeper
+  coordinator/    # Coordinator: decide-and-delegate, lease sweeper
   tools/          # Factory Tools MCP server (Axum)
   dashboard-api/  # Axum + SSE; serves the SPA
   worker/         # workroom harness: clone, drive Claude Code, checkpoint

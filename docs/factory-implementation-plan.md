@@ -109,7 +109,7 @@ The real subprocess seams are implemented too: `GitCli` (shallow clone + `--forc
 **Goal:** the manager decides/delegates and review closes the loop to a human merge.
 
 **Tasks**
-- `services/coordinator` (Manager): react to completions → assign Coder, wake Reviewer on new CR, hand approved+green CR to a human, close the loop, or escalate. Per-issue decisions serialized by an issue row-lock; enqueue next-steps idempotently.
+- `services/coordinator` (the Coordinator): react to completions → assign Coder, wake Reviewer on new CR, hand approved+green CR to a human, close the loop, or escalate. Per-issue decisions serialized by an issue row-lock; enqueue next-steps idempotently.
 - Reviewer flow: event-driven on `cr_opened`; Tools added here — `read_change_request` (diff + threads), `submit_review` (with `dedupe_key`), `get_check_status`.
 - **Bounded loops:** `loop_count` increments on changes-requested rework; escalate at cap.
 - **Escalation:** `escalate` tool (with `dedupe_key`) → comment + assign issue + `escalations` row; the single human channel.
@@ -126,7 +126,7 @@ The real subprocess seams are implemented too: `GitCli` (shallow clone + `--forc
 > **Naming:** "Manager" is two different things. The **Coordinator** service (P4) is deterministic Rust — it reacts to outcomes and never calls a model. The **Manager *role*** is an AI worker that triages an issue via Claude. This step is about the **worker roles**; the Coordinator is unchanged.
 
 **Tasks**
-- `services/worker`: make `run_task` **role-aware** (branch on `task.role` from `get_task`):
+- `services/worker`: make `run_task` **role-aware** (branch on `task.role` from `get_task`) — the branch covers **manager / coder / reviewer**; **`tester` is reserved/unsupported for now**. `tester` is accepted as a valid role (`validate_role` in `services/worker` admits all four), but it has **no P4.5 lifecycle**, so reaching the run path with a `tester` (or any unknown) role is an explicit **unsupported/no-op rejected loudly at the seam** — never given a coder-style default:
   - **Coder** (unchanged): clone → Claude edits → push branch → `open_or_update_change_request` → `record_outcome`.
   - **Reviewer**: read the CR (`read_change_request`) → Claude reviews → `submit_review` verdict (approve / request changes) → `record_outcome`. **No** branch push, **no** CR.
   - **Manager**: read the issue (`read_issue`) → Claude triages. On an **actionable** issue: optionally `post_comment` a triage note, then `record_outcome` **success** — and only a *succeeded* Manager item makes the Coordinator assign a Coder. On a **non-actionable** issue: `escalate` (a terminal escalated outcome; the Coordinator parks it and does **not** assign a Coder). Either way: **no** clone-edit-push, **no** CR. (No label-mutating Tool exists in the Tools surface, so triage acts via comments/escalation, not labels; a manager may not need a clone at all — keep it lean.)
