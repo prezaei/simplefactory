@@ -557,6 +557,54 @@ async fn mcp_tools_call_conflict_is_retryable_error() {
 }
 
 // ===========================================================================
+// 8c. tools/call hitting an internal tool failure → isError result whose
+// client-visible text is the GENERIC "internal error", NOT the raw error string.
+// The internal error is logged server-side only and must never leak to the client.
+// ===========================================================================
+
+#[tokio::test]
+async fn mcp_tools_call_internal_error_returns_generic_message() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    // No issue seeded → read_issue surfaces a GitHub error ("fake: no seeded
+    // issue #404"), which the tool layer classifies as ToolError::Internal.
+    let fx = fixture_with(&pool, "issue#404", FakeGitHub::new()).await;
+
+    let (status, body) = mcp_call(
+        fx.state.clone(),
+        Some(&fx.raw_token),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": { "name": "read_issue", "arguments": { "issue_number": 404 } }
+        }),
+    )
+    .await;
+
+    // MCP convention: an internal failure is a result with isError:true (not a
+    // JSON-RPC error envelope), so the model can see it.
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], 11);
+    assert!(
+        body["error"].is_null(),
+        "an internal failure is a result, not a JSON-RPC error"
+    );
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    // The client-visible text is the GENERIC message — never the raw error.
+    assert_eq!(text, "internal error");
+    assert!(
+        !text.contains("seeded") && !text.contains("404") && !text.contains("fake"),
+        "raw internal error detail must not leak to the client: {text}"
+    );
+}
+
+// ===========================================================================
 // 9. malformed body → parse error -32700
 // ===========================================================================
 

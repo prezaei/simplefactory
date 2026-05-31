@@ -42,6 +42,12 @@ const CONFLICT_RETRYABLE: i64 = -32009;
 /// The MCP protocol revision this server implements.
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// The GENERIC client-visible message for an internal tool failure. The raw error
+/// (which may carry internal DB/GitHub/blob detail) is logged server-side only and
+/// never returned to the client — mirroring the REST layer's opaque "internal error"
+/// 500 body.
+const INTERNAL_ERROR_MESSAGE: &str = "internal error";
+
 /// `GET /mcp` — the SSE stream. Factory emits no server-initiated messages, so
 /// there is nothing to stream; report that the method is not allowed.
 pub async fn handle_get() -> Response {
@@ -195,9 +201,13 @@ async fn handle_tools_call(
         }
         Err(ToolCallError::Tool(ToolError::Internal(e))) => {
             // MCP convention: an internal tool failure is a result with isError, so
-            // the client can show it to the model rather than failing the RPC.
+            // the client can show it to the model rather than failing the RPC. The
+            // raw error is Factory's fault (DB/GitHub/blob I/O) and may carry internal
+            // detail, so it is logged server-side only; the client-visible content is
+            // a GENERIC message — mirroring the REST layer's opaque "internal error"
+            // 500 body — never `e.to_string()`.
             tracing::error!(tool = tool.as_str(), error = %e, "mcp: tools/call tool error");
-            rpc_result_response(id, tool_error_content(&e.to_string()))
+            rpc_result_response(id, internal_error_content())
         }
         Err(ToolCallError::Audit(e)) => {
             // Failing to write the mandatory audit row is an infrastructure failure,
@@ -219,6 +229,14 @@ fn tool_content(value: &Value, is_error: bool) -> Value {
         "content": [ { "type": "text", "text": text } ],
         "isError": is_error,
     })
+}
+
+/// The MCP error result for an internal tool failure: `isError: true` carrying the
+/// GENERIC [`INTERNAL_ERROR_MESSAGE`] — never the raw error string. Factored out so a
+/// unit test can assert the client-visible text is the opaque message regardless of
+/// what internal error triggered it.
+fn internal_error_content() -> Value {
+    tool_error_content(INTERNAL_ERROR_MESSAGE)
 }
 
 /// An MCP error result (`isError: true`) carrying the error message as text.
@@ -437,6 +455,24 @@ mod tests {
         let e = tool_error_content("boom");
         assert_eq!(e["isError"], true);
         assert_eq!(e["content"][0]["text"], "boom");
+    }
+
+    #[test]
+    fn internal_error_content_is_generic_never_the_raw_error() {
+        // The internal-failure mapping returns isError with the GENERIC message; the
+        // raw internal error text must never reach the client.
+        let raw = "connection refused to postgres at 10.0.0.5:5432";
+        let e = internal_error_content();
+        assert_eq!(e["isError"], true);
+        assert_eq!(e["content"][0]["text"], "internal error");
+        assert_eq!(
+            e["content"][0]["text"], INTERNAL_ERROR_MESSAGE,
+            "client-visible text is the generic message"
+        );
+        // Sanity: the generic content carries none of a realistic raw error's detail.
+        let text = e["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("postgres"));
+        assert!(!text.contains(raw));
     }
 
     #[test]

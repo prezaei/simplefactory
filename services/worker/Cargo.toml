@@ -17,6 +17,7 @@ path = "src/main.rs"
 factory-telemetry.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+base64 = "0.22"
 async-trait.workspace = true
 reqwest.workspace = true
 serde.workspace = true

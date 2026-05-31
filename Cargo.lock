@@ -706,6 +706,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "factory-blob",
  "factory-config",
  "factory-github",

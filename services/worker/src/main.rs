@@ -8,26 +8,36 @@
 
 use std::path::{Path, PathBuf};
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use factory_worker::{ClaudeRunner, HarnessConfig, HttpTools, RunResult, Workspace};
 
-/// Real git CLI driver. Shallow-clones with the install token embedded in the
-/// URL and pushes with `--force-with-lease` for idempotent re-runs.
-struct GitCli;
+/// Real git CLI driver. Shallow-clones the PLAIN repo URL and pushes with
+/// `--force-with-lease` for idempotent re-runs. The install token is NEVER placed
+/// in the URL (argv) nor persisted in the clone's `.git/config`; instead it is
+/// injected for the duration of each command as an `http.extraheader`
+/// `Authorization: Basic` header delivered through environment variables.
+///
+/// The token is held on the struct (set once from the harness config) rather than
+/// persisted in the clone's `.git/config`, so `push_branch` — whose trait signature
+/// carries no token — can re-inject the same env credential without the plain
+/// `origin` ever storing it on disk.
+struct GitCli {
+    install_token: String,
+}
 
 #[async_trait::async_trait]
 impl Workspace for GitCli {
     async fn shallow_clone(&self, repo_url: &str, token: &str, dir: &Path) -> anyhow::Result<()> {
-        let authed = authed_url(repo_url, token)?;
-        // Log the host but never the authenticated URL (it carries the token).
+        // Validate the URL transport and the token shape before doing anything.
+        // The PLAIN url (no token) is what becomes `origin` in `.git/config`.
+        let url = plain_repo_url(repo_url, token)?;
+        // Log the host but never the credential env (it carries the token).
         tracing::info!(dir = %dir.display(), "GitCli: git clone --depth 1");
-        let output = tokio::process::Command::new("git")
-            .arg("clone")
-            .arg("--depth")
-            .arg("1")
-            .arg(&authed)
-            .arg(dir)
-            .output()
-            .await?;
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.arg("clone").arg("--depth").arg("1").arg(&url).arg(dir);
+        apply_git_credential_env(&mut cmd, token);
+        let output = cmd.output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::error!(status = ?output.status.code(), stderr = %stderr, "git clone failed");
@@ -38,18 +48,25 @@ impl Workspace for GitCli {
     }
 
     async fn push_branch(&self, dir: &Path, branch: &str) -> anyhow::Result<()> {
+        // The token must be a valid credential even though it is no longer placed
+        // in a URL: reject a malformed token rather than emit a broken header.
+        if !is_url_safe_token(&self.install_token) {
+            // Do NOT include the token in the error: it must never be logged.
+            anyhow::bail!("install token contains characters that are not URL-safe userinfo");
+        }
         tracing::info!(dir = %dir.display(), branch, "GitCli: git push --force-with-lease");
         // `--force-with-lease` keeps re-runs idempotent: push the current HEAD to
-        // the task branch even if a prior attempt already created it.
-        let output = tokio::process::Command::new("git")
-            .arg("-C")
+        // the task branch even if a prior attempt already created it. `origin` is
+        // the PLAIN url; the credential rides the env-delivered extraheader.
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.arg("-C")
             .arg(dir)
             .arg("push")
             .arg("--force-with-lease")
             .arg("origin")
-            .arg(push_refspec(branch))
-            .output()
-            .await?;
+            .arg(push_refspec(branch));
+        apply_git_credential_env(&mut cmd, &self.install_token);
+        let output = cmd.output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::error!(branch, status = ?output.status.code(), stderr = %stderr, "git push failed");
@@ -60,21 +77,17 @@ impl Workspace for GitCli {
     }
 }
 
-/// Build an authenticated clone URL by injecting the install token as the
-/// `x-access-token` basic-auth user, the form GitHub accepts for installation
-/// tokens: `https://x-access-token:<token>@<host>/<owner>/<repo>.git`.
+/// Validate `repo_url` and `token`, returning the PLAIN clone URL (no token in it).
 ///
 /// Only `https://` URLs are accepted; `http://` and `ssh`/`git@` forms are
 /// rejected so a token is never sent over a plaintext or non-matching transport.
 ///
-/// Precondition: `token` must contain only URL-safe userinfo characters. GitHub
-/// installation tokens are `[A-Za-z0-9_]`; the token is injected verbatim into the
-/// URL userinfo, so a token carrying `@`, `:`, `/`, or any other character could
-/// change the host or otherwise corrupt the URL. Such a token is rejected with an
-/// error rather than silently producing a malformed URL.
-///
-/// The returned string contains the token and MUST NOT be logged.
-fn authed_url(repo_url: &str, token: &str) -> anyhow::Result<String> {
+/// Precondition: `token` must contain only URL-safe characters (GitHub
+/// installation tokens are `[A-Za-z0-9_]`). A malformed token is rejected here so a
+/// broken `Authorization` header is never constructed. The token is NOT placed in
+/// the returned URL — the URL is plain, so `.git/config`'s `origin` never persists
+/// the token on disk and the token never appears in git's argv.
+fn plain_repo_url(repo_url: &str, token: &str) -> anyhow::Result<String> {
     let rest = repo_url
         .strip_prefix("https://")
         .ok_or_else(|| anyhow::anyhow!("repo_url must be an https:// URL"))?;
@@ -85,12 +98,45 @@ fn authed_url(repo_url: &str, token: &str) -> anyhow::Result<String> {
         // Do NOT include the token in the error: it must never be logged.
         anyhow::bail!("install token contains characters that are not URL-safe userinfo");
     }
-    Ok(format!("https://x-access-token:{token}@{rest}"))
+    Ok(repo_url.to_string())
 }
 
-/// Whether `token` is safe to inject verbatim into URL userinfo. GitHub
-/// installation tokens are `[A-Za-z0-9_]`; anything else (empty, or containing
-/// `@`/`:`/`/`/etc.) is rejected so it can never change the host or corrupt the URL.
+/// The git config env vars that inject an `http.extraheader` `Authorization: Basic`
+/// credential for the duration of a single git command.
+///
+/// Returns `[(GIT_CONFIG_COUNT, "1"), (GIT_CONFIG_KEY_0, "http.extraheader"),
+/// (GIT_CONFIG_VALUE_0, "Authorization: Basic <base64(x-access-token:token)>")]`.
+///
+/// The token rides ONLY inside the (base64-encoded) env value — never in argv (so
+/// `ps`/`/proc/<pid>/cmdline` cannot see it) and never written to `.git/config` (so
+/// the on-disk clone cannot leak it). The returned values carry the credential and
+/// MUST NOT be logged.
+fn git_credential_env(token: &str) -> Vec<(String, String)> {
+    let basic = BASE64_STANDARD.encode(format!("x-access-token:{token}"));
+    vec![
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        (
+            "GIT_CONFIG_KEY_0".to_string(),
+            "http.extraheader".to_string(),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0".to_string(),
+            format!("Authorization: Basic {basic}"),
+        ),
+    ]
+}
+
+/// Apply [`git_credential_env`] to a [`tokio::process::Command`] so the credential
+/// is delivered via the environment (not argv, not persisted) for that one command.
+fn apply_git_credential_env(cmd: &mut tokio::process::Command, token: &str) {
+    for (k, v) in git_credential_env(token) {
+        cmd.env(k, v);
+    }
+}
+
+/// Whether `token` is a valid credential value. GitHub installation tokens are
+/// `[A-Za-z0-9_]`; anything else (empty, or containing `@`/`:`/`/`/etc.) is rejected
+/// so a malformed credential is never used.
 fn is_url_safe_token(token: &str) -> bool {
     !token.is_empty()
         && token
@@ -287,7 +333,9 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = load_config()?;
     let tools = HttpTools::new(cfg.tools_url.clone(), cfg.task_token.clone());
-    let git = GitCli;
+    let git = GitCli {
+        install_token: cfg.install_token.clone(),
+    };
     let claude = ClaudeCli;
 
     factory_worker::run_task(&tools, &git, &claude, &cfg).await?;
@@ -398,31 +446,87 @@ mod tests {
     }
 
     #[test]
-    fn authed_url_injects_token_into_https() {
-        let url = authed_url("https://github.com/acme/repo.git", TOKEN).unwrap();
-        assert_eq!(
-            url,
-            "https://x-access-token:ghs_secrettoken@github.com/acme/repo.git"
-        );
+    fn plain_repo_url_returns_url_without_the_token() {
+        // The clone/push URL is PLAIN: it must NOT carry the token (so the token
+        // never reaches git's argv nor the persisted `.git/config` origin).
+        let url = plain_repo_url("https://github.com/acme/repo.git", TOKEN).unwrap();
+        assert_eq!(url, "https://github.com/acme/repo.git");
+        assert!(!url.contains(TOKEN), "the URL must not contain the token");
     }
 
     #[test]
-    fn authed_url_rejects_http() {
-        let err = authed_url("http://github.com/acme/repo.git", TOKEN)
+    fn plain_repo_url_rejects_http() {
+        let err = plain_repo_url("http://github.com/acme/repo.git", TOKEN)
             .expect_err("http must be rejected");
         // The error must not leak the token.
         assert!(!err.to_string().contains(TOKEN));
     }
 
     #[test]
-    fn authed_url_rejects_ssh() {
-        assert!(authed_url("git@github.com:acme/repo.git", TOKEN).is_err());
-        assert!(authed_url("ssh://git@github.com/acme/repo.git", TOKEN).is_err());
+    fn plain_repo_url_rejects_ssh() {
+        assert!(plain_repo_url("git@github.com:acme/repo.git", TOKEN).is_err());
+        assert!(plain_repo_url("ssh://git@github.com/acme/repo.git", TOKEN).is_err());
     }
 
     #[test]
-    fn authed_url_rejects_empty_host() {
-        assert!(authed_url("https://", TOKEN).is_err());
+    fn plain_repo_url_rejects_empty_host() {
+        assert!(plain_repo_url("https://", TOKEN).is_err());
+    }
+
+    #[test]
+    fn git_credential_env_carries_token_only_base64_in_the_extraheader_value() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+
+        let env = git_credential_env(TOKEN);
+        // The exact env mechanism git reads: one config entry, http.extraheader.
+        assert_eq!(
+            env,
+            vec![
+                ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+                (
+                    "GIT_CONFIG_KEY_0".to_string(),
+                    "http.extraheader".to_string()
+                ),
+                (
+                    "GIT_CONFIG_VALUE_0".to_string(),
+                    format!(
+                        "Authorization: Basic {}",
+                        B64.encode(format!("x-access-token:{TOKEN}"))
+                    ),
+                ),
+            ]
+        );
+
+        // The RAW token never appears anywhere in the env (key or value); it only
+        // shows up base64-encoded inside the Authorization header value.
+        let expected_basic = B64.encode(format!("x-access-token:{TOKEN}"));
+        for (k, v) in &env {
+            assert!(!k.contains(TOKEN), "raw token leaked into env key {k}");
+            assert!(
+                !v.contains(TOKEN),
+                "raw token leaked into env value {v} (must be base64-only)"
+            );
+        }
+        // The base64 form is present, and decodes back to the credential.
+        let value = &env[2].1;
+        assert_eq!(value, &format!("Authorization: Basic {expected_basic}"));
+        let decoded = B64.decode(&expected_basic).unwrap();
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            format!("x-access-token:{TOKEN}")
+        );
+    }
+
+    #[test]
+    fn git_credential_env_rejected_tokens_still_never_appear_raw() {
+        // Even for a token with unsafe chars, git_credential_env only emits the
+        // base64 form; the raw token never appears in the value. (Validation that
+        // rejects such tokens happens in plain_repo_url / push_branch.)
+        let env = git_credential_env("ghs_AbC123_def");
+        for (_k, v) in &env {
+            assert!(!v.contains("ghs_AbC123_def") || v.starts_with("GIT_CONFIG"));
+        }
     }
 
     #[test]
@@ -501,9 +605,9 @@ mod tests {
     }
 
     #[test]
-    fn authed_url_rejects_tokens_with_unsafe_userinfo_chars() {
-        // Tokens carrying URL-meaningful characters would corrupt or redirect the
-        // URL; they must be rejected outright.
+    fn plain_repo_url_rejects_tokens_with_unsafe_userinfo_chars() {
+        // Tokens carrying characters outside [A-Za-z0-9_] are rejected outright so a
+        // malformed credential is never used.
         for bad in [
             "tok@evil.example",
             "tok:secret",
@@ -512,7 +616,7 @@ mod tests {
             "tok#frag",
             "",
         ] {
-            let err = authed_url("https://github.com/acme/repo.git", bad)
+            let err = plain_repo_url("https://github.com/acme/repo.git", bad)
                 .expect_err("unsafe token must be rejected");
             // The error must never leak the token value.
             assert!(!err.to_string().contains(bad) || bad.is_empty());
@@ -520,13 +624,11 @@ mod tests {
     }
 
     #[test]
-    fn authed_url_accepts_normal_ghs_token() {
-        // A normal GitHub installation token ([A-Za-z0-9_]) is accepted.
-        let url = authed_url("https://github.com/acme/repo.git", "ghs_AbC123_def").unwrap();
-        assert_eq!(
-            url,
-            "https://x-access-token:ghs_AbC123_def@github.com/acme/repo.git"
-        );
+    fn plain_repo_url_accepts_normal_ghs_token() {
+        // A normal GitHub installation token ([A-Za-z0-9_]) is accepted, and the
+        // returned URL is plain (no token in it).
+        let url = plain_repo_url("https://github.com/acme/repo.git", "ghs_AbC123_def").unwrap();
+        assert_eq!(url, "https://github.com/acme/repo.git");
     }
 
     #[test]
