@@ -1,0 +1,16 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Agent tooling (local overrides only — shared config & skills are committed)
+.claude/settings.local.json
+.ship-it/
+
+# Local env
+.env
+*.local
