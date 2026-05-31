@@ -34,11 +34,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
 uuid = { version = "1", features = ["v7"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 serde_json = "1"
 
+# Web + GitHub webhooks (wired in P2)
+axum = "0.7"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+subtle = "2"
+
 # Reserved for later phases (declared for intent; only fetched once a crate uses them):
-# axum (P2/P3 services), octocrab (P2 github),
+# octocrab + jsonwebtoken (P3 GitHub App auth / installation tokens / Checks-PR API),
 # azure_storage_blobs (P3 blob), opentelemetry + opentelemetry-otlp (P7 telemetry export).
 
 # Internal crates
@@ -47,3 +54,4 @@ factory-config = { path = "libs/config" }
 factory-record = { path = "libs/record" }
 factory-github = { path = "libs/github" }
 factory-blob = { path = "libs/blob" }
+factory-intake = { path = "services/intake" }

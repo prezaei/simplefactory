@@ -218,16 +218,102 @@ mod acceptance {
     }
 
     // P2 — intake / opt-in / config application
-    #[test]
-    #[ignore = "P2: implement opt-in label gating in intake"]
-    fn opt_in_gating_unlabelled_issue_is_ignored() {
-        todo!("P2: an issue WITHOUT the opt-in label produces no work item")
+    #[tokio::test]
+    async fn opt_in_gating_unlabelled_issue_is_ignored() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        // Register a repo whose config has a manager subscribed to issue_labeled.
+        let name = unique("e2e-optin");
+        let repo = record::upsert_repo(&pool, "acme", &name, 99).await.unwrap();
+        let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: manager\n    role: manager\n    on: [issue_labeled]\n";
+        assert_eq!(
+            factory_intake::apply_config(&pool, repo, yaml, "sha1")
+                .await
+                .unwrap(),
+            factory_intake::ApplyOutcome::Applied
+        );
+
+        let repo_ref = factory_github::RepoRef {
+            owner: "acme".into(),
+            name: name.clone(),
+            installation_id: 99,
+        };
+
+        // A labelled issue → exactly one Manager work item (the P2 exit criterion).
+        let labeled = factory_github::WebhookEvent::IssueLabeled {
+            repo: repo_ref.clone(),
+            issue: 123,
+            label: "factory".into(),
+        };
+        assert_eq!(
+            factory_intake::ingest(&pool, &labeled, &format!("d-{}", Uuid::now_v7()))
+                .await
+                .unwrap(),
+            factory_intake::IngestOutcome::Enqueued(1)
+        );
+        assert_eq!(record::count_for_repo(&pool, repo).await.unwrap(), 1);
+
+        // An issue WITHOUT the opt-in label → ignored, no new work item.
+        let unlabelled = factory_github::WebhookEvent::IssueLabeled {
+            repo: repo_ref,
+            issue: 124,
+            label: "wontfix".into(),
+        };
+        assert_eq!(
+            factory_intake::ingest(&pool, &unlabelled, &format!("d-{}", Uuid::now_v7()))
+                .await
+                .unwrap(),
+            factory_intake::IngestOutcome::Ignored
+        );
+        assert_eq!(record::count_for_repo(&pool, repo).await.unwrap(), 1);
     }
 
-    #[test]
-    #[ignore = "P2: implement config apply-on-push with fail-safe validation"]
-    fn invalid_config_is_rejected_and_last_good_kept() {
-        todo!("P2: pushing an invalid .factory/config.yml is rejected; the previous good config stays in effect")
+    #[tokio::test]
+    async fn invalid_config_is_rejected_and_last_good_kept() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let name = unique("e2e-invalidcfg");
+        let repo = record::upsert_repo(&pool, "acme", &name, 1).await.unwrap();
+
+        // A good config takes effect.
+        let good = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: manager\n    role: manager\n    on: [issue_labeled]\n";
+        assert_eq!(
+            factory_intake::apply_config(&pool, repo, good, "good-sha")
+                .await
+                .unwrap(),
+            factory_intake::ApplyOutcome::Applied
+        );
+
+        // An invalid config (coder on issue_labeled violates manager-first) is rejected.
+        let bad = "version: 1\nworkers:\n  - name: c\n    role: coder\n    on: [issue_labeled]\n";
+        assert_eq!(
+            factory_intake::apply_config(&pool, repo, bad, "bad-sha")
+                .await
+                .unwrap(),
+            factory_intake::ApplyOutcome::RejectedKeptLastGood
+        );
+
+        // The last good config is still in effect: a labelled issue still enqueues
+        // the manager.
+        let labeled = factory_github::WebhookEvent::IssueLabeled {
+            repo: factory_github::RepoRef {
+                owner: "acme".into(),
+                name,
+                installation_id: 1,
+            },
+            issue: 1,
+            label: "factory".into(),
+        };
+        assert_eq!(
+            factory_intake::ingest(&pool, &labeled, &format!("d-{}", Uuid::now_v7()))
+                .await
+                .unwrap(),
+            factory_intake::IngestOutcome::Enqueued(1)
+        );
     }
 
     // P4 — coordinator + reviewer (full loop)

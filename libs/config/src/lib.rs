@@ -10,10 +10,14 @@
 
 use std::collections::HashSet;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A validated Factory team configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The public types derive `Serialize`/`Deserialize` so a validated config can be
+/// stored as jsonb in the record book and read back (the YAML on-disk form is
+/// parsed separately via [`parse`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub version: u32,
     pub settings: Settings,
@@ -22,7 +26,7 @@ pub struct Config {
 }
 
 /// Repo-wide settings.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     /// Opt-in label; Factory acts only on work carrying it.
     pub label: String,
@@ -33,14 +37,14 @@ pub struct Settings {
 }
 
 /// Global capacity limits.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
     /// Global ceiling across all workers in this repo.
     pub max_concurrent_workers: u32,
 }
 
 /// A single configured worker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Worker {
     pub name: String,
     pub role: Role,
@@ -52,7 +56,7 @@ pub struct Worker {
 }
 
 /// The role a worker plays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Manager,
@@ -62,7 +66,7 @@ pub enum Role {
 }
 
 /// What wakes a worker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Trigger {
     IssueLabeled,
     CrOpened,

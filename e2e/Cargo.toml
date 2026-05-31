@@ -13,5 +13,7 @@ publish = false
 
 [dev-dependencies]
 factory-record.workspace = true
+factory-intake.workspace = true
+factory-github.workspace = true
 tokio.workspace = true
 uuid.workspace = true

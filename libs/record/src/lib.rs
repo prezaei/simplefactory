@@ -456,6 +456,78 @@ pub async fn count_for_repo(pool: &Pool, repo_id: Uuid) -> Result<i64> {
     )
 }
 
+/// A repo and its stored config snapshot (for intake).
+#[derive(Debug, Clone)]
+pub struct RepoConfig {
+    pub id: Uuid,
+    /// The last validated `.factory/config.yml` as jsonb, if any.
+    pub config: Option<serde_json::Value>,
+    pub config_sha: Option<String>,
+}
+
+/// Fetch a repo and its stored config by owner/name.
+pub async fn repo_by_name(pool: &Pool, owner: &str, name: &str) -> Result<Option<RepoConfig>> {
+    let row =
+        sqlx::query("SELECT id, config, config_sha FROM repos WHERE owner = $1 AND name = $2")
+            .bind(owner)
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
+    Ok(match row {
+        Some(r) => Some(RepoConfig {
+            id: r.try_get("id")?,
+            config: r.try_get("config")?,
+            config_sha: r.try_get("config_sha")?,
+        }),
+        None => None,
+    })
+}
+
+/// Store a validated config snapshot on a repo (config-apply on push).
+pub async fn set_repo_config(
+    pool: &Pool,
+    repo_id: Uuid,
+    config: &serde_json::Value,
+    config_sha: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE repos SET config = $2, config_sha = $3, updated_at = now() WHERE id = $1")
+        .bind(repo_id)
+        .bind(config)
+        .bind(config_sha)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Mark a webhook delivery id as processed; returns `false` if it was already
+/// seen (redelivery dedupe).
+pub async fn mark_delivery(pool: &Pool, delivery_id: &str) -> Result<bool> {
+    let row = sqlx::query(
+        "INSERT INTO webhook_deliveries (delivery_id) VALUES ($1)
+         ON CONFLICT (delivery_id) DO NOTHING RETURNING delivery_id",
+    )
+    .bind(delivery_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// Re-queue any `blocked` work items for a subject (the blocked → resume-on-reply
+/// transition). Returns the number re-queued.
+pub async fn requeue_blocked(pool: &Pool, repo_id: Uuid, subject_ref: &str) -> Result<u64> {
+    let result = sqlx::query(
+        "UPDATE work_items SET state = 'queued', available_at = now(), updated_at = now()
+          WHERE repo_id = $1 AND subject_ref = $2 AND state = 'blocked'",
+    )
+    .bind(repo_id)
+    .bind(subject_ref)
+    .execute(pool)
+    .await?;
+    let n = result.rows_affected();
+    tracing::info!(repo_id = %repo_id, subject = subject_ref, requeued = n, "requeue blocked on reply");
+    Ok(n)
+}
+
 fn map_work_item(row: sqlx::postgres::PgRow) -> Result<WorkItem> {
     let kind: String = row.try_get("kind")?;
     let state: String = row.try_get("state")?;
