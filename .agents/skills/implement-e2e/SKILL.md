@@ -69,13 +69,15 @@ Before running anything, classify the work so you neither skip needed rigor nor 
   Do NOT start at Phase 0 or open a duplicate PR. Enter at **Phase 2** (review gauntlet on the existing
   diff) and then **Phase 4** (Copilot-gated ship). Phases 0–1 and the PR-open in Phase 3 are already done.
 - **Substantive code/logic change** → run the full pipeline.
-- **Trivial or docs-only / config-only change with no executable logic** (markdown, comments, a constant,
-  a workflow file) → the code-specific stages are **N/A by design, not skipped lazily**: `/code-review`
+- **Trivial or docs-only change with no executable code** (markdown, comments, pure-doc files) → the
+  code-specific stages are **N/A by design, not skipped lazily**: `/code-review`
   still applies (it reviews prose/config too), but `/adversarial-investigation` (a multi-agent *production
   problem* diagnosis team — its own description says "Do NOT use for straightforward" work) and the
   cargo green gate have nothing to act on. State explicitly which stages you are declaring N/A and why.
   This is the "no theater" corollary of "no defer": don't fabricate tests for prose or spin up an
-  adversarial team where there is no runtime to investigate.
+  adversarial team where there is no runtime to investigate. A **constant, a config value, or a
+  CI-workflow file is NOT trivial** — it can change runtime behavior, tests, or CI, so it goes through the
+  full gauntlet and green gate like any code.
 
 When in doubt about whether a change is "substantive," run the full gauntlet — over-rigor is cheap, a
 missed bug is not.
@@ -140,7 +142,7 @@ On each ship-it iteration (cron-fired), the loop must:
    ```bash
    HEAD=$(gh pr view <N> --json headRefOid -q .headRefOid)
    gh api repos/{owner}/{repo}/pulls/<N>/reviews \
-     --jq "[.[] | select((.user.login|test(\"[Cc]opilot\")) and .commit_id==\"$HEAD\")] | length"
+     --jq "[.[] | select(.user.login==\"copilot-pull-request-reviewer[bot]\" and .commit_id==\"$HEAD\")] | length"
    ```
    If `0`: log "waiting for Copilot review on <HEAD>" and exit the iteration (the cron retries). If still
    absent after ~2 iterations, or Copilot dropped from the requested-reviewers list, re-request it.
