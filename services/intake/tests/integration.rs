@@ -1,8 +1,8 @@
 //! Intake integration tests against a real Postgres. Gated on `DATABASE_URL`
 //! (skip cleanly when unset). Isolated per-run via unique repo names.
 
-use factory_github::{RepoRef, Subject, WebhookEvent};
-use factory_intake::{ingest, IngestOutcome};
+use factory_github::{FakeGitHub, RepoRef, Subject, WebhookEvent};
+use factory_intake::{apply_config_from_push, ingest, ApplyOutcome, IngestOutcome};
 use factory_record as record;
 use uuid::Uuid;
 
@@ -420,4 +420,149 @@ async fn scheduler_tick_skips_repo_with_unparseable_stored_config() {
         .unwrap();
     // The malformed repo produced no work.
     assert_eq!(record::count_for_repo(&pool, id).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn config_on_push_applies_when_config_file_changed() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    // A connected repo with no config yet — the push is what installs it.
+    let owner = "acme";
+    let name = unique("intake-pushapply");
+    let id = record::upsert_repo(&pool, owner, &name, 1).await.unwrap();
+
+    let head_sha = format!("head-{}", Uuid::now_v7());
+    let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: manager\n    role: manager\n    on: [issue_labeled]\n";
+    let gh = FakeGitHub::new().with_file(&head_sha, ".factory/config.yml", yaml);
+    let repo_ref = RepoRef {
+        owner: owner.into(),
+        name: name.clone(),
+        installation_id: 1,
+    };
+
+    assert_eq!(
+        apply_config_from_push(
+            &pool,
+            &gh,
+            &repo_ref,
+            &head_sha,
+            &[".factory/config.yml".into()],
+        )
+        .await
+        .unwrap(),
+        Some(ApplyOutcome::Applied)
+    );
+
+    // The config was actually applied: stored config_sha is now the pushed head.
+    let rc = record::repo_by_name(&pool, owner, &name)
+        .await
+        .unwrap()
+        .expect("repo present");
+    assert_eq!(rc.config_sha.as_deref(), Some(head_sha.as_str()));
+
+    // And the applied config drives intake: an IssueLabeled enqueues exactly one.
+    let event = WebhookEvent::IssueLabeled {
+        repo: repo_ref,
+        issue: 1,
+        label: "factory".into(),
+    };
+    assert_eq!(
+        ingest(&pool, &event, &format!("d-{}", Uuid::now_v7()))
+            .await
+            .unwrap(),
+        IngestOutcome::Enqueued(1)
+    );
+    assert_eq!(record::count_for_repo(&pool, id).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn config_on_push_ignores_unrelated_push() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // A repo with a known-good config already applied (via apply_config, sha1).
+    let (_id, owner, name) = repo_with_manager(&pool, "intake-pushunrelated").await;
+
+    let head_sha = format!("head-{}", Uuid::now_v7());
+    // FakeGitHub has the config seeded, but the push didn't touch it, so the file
+    // must never be fetched and nothing must change.
+    let gh = FakeGitHub::new().with_file(
+        &head_sha,
+        ".factory/config.yml",
+        "version: 1\nsettings:\n  label: other\nworkers: []\n",
+    );
+    let repo_ref = RepoRef {
+        owner: owner.clone(),
+        name: name.clone(),
+        installation_id: 1,
+    };
+
+    assert_eq!(
+        apply_config_from_push(&pool, &gh, &repo_ref, &head_sha, &["src/main.rs".into()])
+            .await
+            .unwrap(),
+        None
+    );
+
+    // Config unchanged: still the original sha1 from repo_with_manager.
+    let rc = record::repo_by_name(&pool, &owner, &name)
+        .await
+        .unwrap()
+        .expect("repo present");
+    assert_eq!(rc.config_sha.as_deref(), Some("sha1"));
+}
+
+#[tokio::test]
+async fn config_on_push_rejects_invalid_yaml_keeps_last_good() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // Seed a first valid config (manager on issue_labeled) via apply_config.
+    let (id, owner, name) = repo_with_manager(&pool, "intake-pushreject").await;
+
+    // A coder may not subscribe to issue_labeled (manager-first policy) — invalid.
+    let head_sha2 = format!("head-{}", Uuid::now_v7());
+    let bad_yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: coder\n    role: coder\n    on: [issue_labeled]\n";
+    let gh = FakeGitHub::new().with_file(&head_sha2, ".factory/config.yml", bad_yaml);
+    let repo_ref = RepoRef {
+        owner: owner.clone(),
+        name: name.clone(),
+        installation_id: 1,
+    };
+
+    assert_eq!(
+        apply_config_from_push(
+            &pool,
+            &gh,
+            &repo_ref,
+            &head_sha2,
+            &[".factory/config.yml".into()],
+        )
+        .await
+        .unwrap(),
+        Some(ApplyOutcome::RejectedKeptLastGood)
+    );
+
+    // The last-good config is still in effect: sha1, and intake still enqueues the
+    // manager on issue_labeled.
+    let rc = record::repo_by_name(&pool, &owner, &name)
+        .await
+        .unwrap()
+        .expect("repo present");
+    assert_eq!(rc.config_sha.as_deref(), Some("sha1"));
+
+    let event = WebhookEvent::IssueLabeled {
+        repo: repo_ref,
+        issue: 9,
+        label: "factory".into(),
+    };
+    assert_eq!(
+        ingest(&pool, &event, &format!("d-{}", Uuid::now_v7()))
+            .await
+            .unwrap(),
+        IngestOutcome::Enqueued(1)
+    );
+    assert_eq!(record::count_for_repo(&pool, id).await.unwrap(), 1);
 }

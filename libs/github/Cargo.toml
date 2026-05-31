@@ -12,4 +12,12 @@ thiserror.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio = { workspace = true }
+octocrab.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
 subtle.workspace = true

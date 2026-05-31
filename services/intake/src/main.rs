@@ -141,11 +141,52 @@ async fn webhook(
     match factory_intake::ingest(&state.pool, &event, &delivery).await {
         Ok(outcome) => {
             tracing::info!(?outcome, event_type, delivery, "ingested webhook");
+            // A push that touched the repo config triggers an auto-reload. This is
+            // best-effort and side-channel to the queue: it must never change the
+            // 202 we return for a successfully ingested webhook.
+            if let factory_github::WebhookEvent::Push {
+                repo,
+                head_sha,
+                touched_paths,
+            } = &event
+            {
+                reload_config_on_push(&state.pool, repo, head_sha, touched_paths).await;
+            }
             StatusCode::ACCEPTED
         }
         Err(e) => {
             tracing::error!(error = %e, event_type, delivery, "intake failed");
             StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// Best-effort config auto-reload for a push. Constructs the live GitHub client
+/// from the environment; if credentials are absent (or the apply itself fails)
+/// this logs and returns — the webhook ingest already succeeded and must still
+/// 202. The file fetch is the live seam: `OctocrabGitHub::get_file` talks to
+/// GitHub, so this path is exercised in tests via `FakeGitHub` against the
+/// library function directly.
+async fn reload_config_on_push(
+    pool: &Pool,
+    repo: &factory_github::RepoRef,
+    head_sha: &str,
+    touched_paths: &[String],
+) {
+    let gh = match factory_github::OctocrabGitHub::from_env() {
+        Ok(gh) => gh,
+        Err(e) => {
+            tracing::warn!(error = %e, "config-on-push skipped: GitHub client unavailable");
+            return;
+        }
+    };
+    match factory_intake::apply_config_from_push(pool, &gh, repo, head_sha, touched_paths).await {
+        Ok(Some(outcome)) => {
+            tracing::info!(?outcome, owner = %repo.owner, repo = %repo.name, "config reloaded from push")
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!(error = %e, owner = %repo.owner, repo = %repo.name, "config-on-push apply failed")
         }
     }
 }

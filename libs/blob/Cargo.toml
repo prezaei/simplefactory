@@ -6,3 +6,10 @@ license.workspace = true
 publish = false
 
 [dependencies]
+async-trait.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+
+[dev-dependencies]
+tokio.workspace = true

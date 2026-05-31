@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lib]
+name = "factory_worker"
+path = "src/lib.rs"
+
 [[bin]]
 name = "factory-worker"
 path = "src/main.rs"
@@ -12,3 +16,13 @@ path = "src/main.rs"
 [dependencies]
 factory-telemetry.workspace = true
 tracing.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tokio = { workspace = true, features = ["process", "fs", "io-util"] }
+
+[dev-dependencies]
+tokio.workspace = true

@@ -688,6 +688,390 @@ pub async fn requeue_blocked(pool: &Pool, repo_id: Uuid, subject_ref: &str) -> R
     Ok(n)
 }
 
+// ===========================================================================
+// P3: the Tools/MCP channel — task tokens, attempts, idempotent change requests,
+// and tool-write idempotency. Tools (not the worker) own these writes.
+// ===========================================================================
+
+/// SHA-256 hex of a raw per-task token. Only the hash is ever stored or compared,
+/// so a leaked DB never exposes a usable token.
+pub fn hash_token(raw: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// A resolved task token: exactly what the bearer is authorized to act on. The
+/// Tools service authorizes every call against this — there is no cross-task access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskAuth {
+    pub work_item_id: Uuid,
+    pub repo_id: Uuid,
+    pub role: Kind,
+    pub attempt_id: Option<Uuid>,
+}
+
+/// The terminal (or running) status of a worker attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Blocked,
+    Reclaimed,
+}
+
+impl AttemptStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AttemptStatus::Running => "running",
+            AttemptStatus::Succeeded => "succeeded",
+            AttemptStatus::Failed => "failed",
+            AttemptStatus::Blocked => "blocked",
+            AttemptStatus::Reclaimed => "reclaimed",
+        }
+    }
+}
+
+/// Mint a per-task token: store only its hash, scoped to one work item / repo /
+/// role / attempt, with a TTL. The raw token is generated and held by the caller
+/// (dispatcher) and injected into the job; it is never stored.
+#[allow(clippy::too_many_arguments)]
+pub async fn mint_task_token(
+    pool: &Pool,
+    token_hash: &str,
+    work_item_id: Uuid,
+    repo_id: Uuid,
+    role: Kind,
+    attempt_id: Option<Uuid>,
+    ttl_secs: f64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO task_tokens
+           (token_hash, work_item_id, repo_id, role, attempt_id, expires_at)
+         VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))",
+    )
+    .bind(token_hash)
+    .bind(work_item_id)
+    .bind(repo_id)
+    .bind(role.as_str())
+    .bind(attempt_id)
+    .bind(ttl_secs)
+    .execute(pool)
+    .await?;
+    tracing::info!(%work_item_id, role = role.as_str(), "minted task token");
+    Ok(())
+}
+
+/// Resolve a presented token *hash* to its task, only if the token is still valid
+/// (not revoked, not expired). `None` means unauthorized.
+pub async fn resolve_task_token(pool: &Pool, token_hash: &str) -> Result<Option<TaskAuth>> {
+    let row = sqlx::query(
+        "SELECT work_item_id, repo_id, role, attempt_id FROM task_tokens
+          WHERE token_hash = $1 AND NOT revoked AND expires_at > now()",
+    )
+    .bind(token_hash)
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        Some(r) => {
+            let role: String = r.try_get("role")?;
+            Some(TaskAuth {
+                work_item_id: r.try_get("work_item_id")?,
+                repo_id: r.try_get("repo_id")?,
+                role: role.parse()?,
+                attempt_id: r.try_get("attempt_id")?,
+            })
+        }
+        None => None,
+    })
+}
+
+/// Revoke every token for a work item (task ended or lease reclaimed). Returns the
+/// number revoked.
+pub async fn revoke_task_tokens(pool: &Pool, work_item_id: Uuid) -> Result<u64> {
+    let result = sqlx::query(
+        "UPDATE task_tokens SET revoked = true WHERE work_item_id = $1 AND NOT revoked",
+    )
+    .bind(work_item_id)
+    .execute(pool)
+    .await?;
+    let n = result.rows_affected();
+    tracing::info!(%work_item_id, revoked = n, "revoked task tokens");
+    Ok(n)
+}
+
+/// Open a new attempt row for a work item (one row per worker execution). Returns
+/// its id.
+pub async fn start_attempt(
+    pool: &Pool,
+    work_item_id: Uuid,
+    job_execution_id: Option<&str>,
+) -> Result<Uuid> {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO attempts (id, work_item_id, job_execution_id, status)
+         VALUES ($1, $2, $3, 'running')",
+    )
+    .bind(id)
+    .bind(work_item_id)
+    .bind(job_execution_id)
+    .execute(pool)
+    .await?;
+    tracing::info!(%work_item_id, attempt = %id, "started attempt");
+    Ok(id)
+}
+
+/// Set the terminal status + summary on a still-running attempt. Returns whether a
+/// row was updated (a terminal attempt is never re-finished — idempotent).
+pub async fn finish_attempt(
+    pool: &Pool,
+    attempt_id: Uuid,
+    status: AttemptStatus,
+    summary: Option<&str>,
+) -> Result<bool> {
+    let row = sqlx::query(
+        "UPDATE attempts SET status = $2, summary = $3, ended_at = now()
+          WHERE id = $1 AND status = 'running'
+         RETURNING id",
+    )
+    .bind(attempt_id)
+    .bind(status.as_str())
+    .bind(summary)
+    .fetch_optional(pool)
+    .await?;
+    let updated = row.is_some();
+    tracing::info!(attempt = %attempt_id, status = status.as_str(), updated, "finish attempt");
+    Ok(updated)
+}
+
+/// A change request tracked in the record book.
+#[derive(Debug, Clone)]
+pub struct ChangeRequest {
+    pub id: Uuid,
+    pub repo_id: Uuid,
+    pub number: Option<i32>,
+    pub head_branch: String,
+    pub linked_issue: Option<i32>,
+    pub work_item_id: Option<Uuid>,
+    pub factory_state: String,
+}
+
+/// Idempotent-by-work-item CR row. The first call for a work item creates the row
+/// (number stays NULL until the worker opens it on GitHub); a re-dispatch returns
+/// the SAME row, so the CR is never duplicated.
+pub async fn upsert_change_request_for_item(
+    pool: &Pool,
+    repo_id: Uuid,
+    work_item_id: Uuid,
+    head_branch: &str,
+    linked_issue: Option<i32>,
+) -> Result<ChangeRequest> {
+    let row = sqlx::query(
+        "INSERT INTO change_requests (id, repo_id, work_item_id, head_branch, linked_issue)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (work_item_id) WHERE work_item_id IS NOT NULL
+           DO UPDATE SET head_branch = EXCLUDED.head_branch, updated_at = now()
+         RETURNING id, repo_id, number, head_branch, linked_issue, work_item_id, factory_state",
+    )
+    .bind(Uuid::now_v7())
+    .bind(repo_id)
+    .bind(work_item_id)
+    .bind(head_branch)
+    .bind(linked_issue)
+    .fetch_one(pool)
+    .await?;
+    map_change_request(row)
+}
+
+/// Record the CR number once the worker has opened it on GitHub.
+pub async fn set_change_request_number(pool: &Pool, cr_id: Uuid, number: i32) -> Result<()> {
+    sqlx::query("UPDATE change_requests SET number = $2, factory_state = 'open', updated_at = now() WHERE id = $1")
+        .bind(cr_id)
+        .bind(number)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Fetch the CR row for a work item, if one exists.
+pub async fn change_request_for_item(
+    pool: &Pool,
+    work_item_id: Uuid,
+) -> Result<Option<ChangeRequest>> {
+    let row = sqlx::query(
+        "SELECT id, repo_id, number, head_branch, linked_issue, work_item_id, factory_state
+           FROM change_requests WHERE work_item_id = $1",
+    )
+    .bind(work_item_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(map_change_request).transpose()
+}
+
+/// Get-or-set a tool idempotency record. Returns the result stored by the FIRST
+/// caller for `(work_item, scope, dedupe_key)` — so a re-run sees the original
+/// external ref and updates the same object instead of creating a duplicate.
+pub async fn idempotency_get_or_set(
+    pool: &Pool,
+    work_item_id: Uuid,
+    scope: &str,
+    dedupe_key: &str,
+    result: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    // First writer wins; losers read the stored value back.
+    sqlx::query(
+        "INSERT INTO tool_idempotency (work_item_id, scope, dedupe_key, result)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (work_item_id, scope, dedupe_key) DO NOTHING",
+    )
+    .bind(work_item_id)
+    .bind(scope)
+    .bind(dedupe_key)
+    .bind(result)
+    .execute(pool)
+    .await?;
+    let stored: serde_json::Value = sqlx::query_scalar(
+        "SELECT result FROM tool_idempotency
+          WHERE work_item_id = $1 AND scope = $2 AND dedupe_key = $3",
+    )
+    .bind(work_item_id)
+    .bind(scope)
+    .bind(dedupe_key)
+    .fetch_one(pool)
+    .await?;
+    Ok(stored)
+}
+
+/// A repo's GitHub identity (for the Tools service to scope API calls).
+#[derive(Debug, Clone)]
+pub struct RepoIdent {
+    pub id: Uuid,
+    pub owner: String,
+    pub name: String,
+    pub installation_id: i64,
+}
+
+/// Fetch a repo's identity by id.
+pub async fn repo_by_id(pool: &Pool, id: Uuid) -> Result<Option<RepoIdent>> {
+    let row = sqlx::query("SELECT id, owner, name, installation_id FROM repos WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(match row {
+        Some(r) => Some(RepoIdent {
+            id: r.try_get("id")?,
+            owner: r.try_get("owner")?,
+            name: r.try_get("name")?,
+            installation_id: r.try_get("installation_id")?,
+        }),
+        None => None,
+    })
+}
+
+/// Fetch a single work item by id (e.g. for the Tools `get_task` call).
+pub async fn work_item_by_id(pool: &Pool, id: Uuid) -> Result<Option<WorkItem>> {
+    let row = sqlx::query(
+        "SELECT id, repo_id, kind, worker_name, trigger, subject_ref, correlation_id, state,
+                attempt_count, loop_count, config_sha, lease_owner, lease_expires_at
+           FROM work_items WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(map_work_item).transpose()
+}
+
+/// Look up a previously stored tool idempotency result, if any.
+pub async fn idempotency_get(
+    pool: &Pool,
+    work_item_id: Uuid,
+    scope: &str,
+    dedupe_key: &str,
+) -> Result<Option<serde_json::Value>> {
+    Ok(sqlx::query_scalar(
+        "SELECT result FROM tool_idempotency
+          WHERE work_item_id = $1 AND scope = $2 AND dedupe_key = $3",
+    )
+    .bind(work_item_id)
+    .bind(scope)
+    .bind(dedupe_key)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Extend the lease on a work item by `ttl_secs`, authorized by the task token
+/// (not the lease owner). Returns the new expiry, or `None` if the item is no
+/// longer in-flight. This is the Tools `heartbeat` call.
+pub async fn heartbeat_task(
+    pool: &Pool,
+    work_item_id: Uuid,
+    ttl_secs: f64,
+) -> Result<Option<DateTime<Utc>>> {
+    let row = sqlx::query(
+        "UPDATE work_items
+            SET lease_expires_at = now() + make_interval(secs => $2), updated_at = now()
+          WHERE id = $1 AND state IN ('leased', 'running')
+         RETURNING lease_expires_at",
+    )
+    .bind(work_item_id)
+    .bind(ttl_secs)
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        Some(r) => Some(r.try_get("lease_expires_at")?),
+        None => None,
+    })
+}
+
+/// Record an escalation against a work item (the single human channel). Returns
+/// the new escalation id.
+pub async fn create_escalation(
+    pool: &Pool,
+    work_item_id: Uuid,
+    reason: &str,
+    context: &str,
+    delivered_to: Option<&str>,
+) -> Result<Uuid> {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO escalations (id, work_item_id, reason, context, delivered_to)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(work_item_id)
+    .bind(reason)
+    .bind(context)
+    .bind(delivered_to)
+    .execute(pool)
+    .await?;
+    tracing::info!(%work_item_id, reason, "escalation recorded");
+    Ok(id)
+}
+
+/// Count escalations recorded for a work item (test helper).
+pub async fn count_escalations_for_item(pool: &Pool, work_item_id: Uuid) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT count(*) FROM escalations WHERE work_item_id = $1")
+            .bind(work_item_id)
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+fn map_change_request(row: sqlx::postgres::PgRow) -> Result<ChangeRequest> {
+    Ok(ChangeRequest {
+        id: row.try_get("id")?,
+        repo_id: row.try_get("repo_id")?,
+        number: row.try_get("number")?,
+        head_branch: row.try_get("head_branch")?,
+        linked_issue: row.try_get("linked_issue")?,
+        work_item_id: row.try_get("work_item_id")?,
+        factory_state: row.try_get("factory_state")?,
+    })
+}
+
 fn map_work_item(row: sqlx::postgres::PgRow) -> Result<WorkItem> {
     let kind: String = row.try_get("kind")?;
     let state: String = row.try_get("state")?;

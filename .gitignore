@@ -14,3 +14,5 @@ Cargo.lock.orig
 # Local env
 .env
 *.local
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json

@@ -9,6 +9,12 @@ use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
 
+mod client;
+pub use client::*;
+
+mod octo;
+pub use octo::OctocrabGitHub;
+
 /// Errors from webhook handling.
 #[derive(Debug, thiserror::Error)]
 pub enum GithubError {
