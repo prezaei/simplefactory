@@ -23,6 +23,22 @@ struct AppState {
     secret: Vec<u8>,
 }
 
+/// Resolve the webhook secret, failing closed. An empty/absent secret disables
+/// signature checking, which is allowed ONLY when the operator explicitly opts
+/// into the insecure local-dev path (`INTAKE_ALLOW_INSECURE=1`); otherwise this
+/// errors so a production misconfiguration can't bring up an unauthenticated
+/// webhook endpoint. Returns the secret bytes (empty = checking disabled).
+fn resolve_secret(secret: Option<String>, allow_insecure: bool) -> anyhow::Result<Vec<u8>> {
+    let bytes = secret.unwrap_or_default().into_bytes();
+    if bytes.is_empty() && !allow_insecure {
+        anyhow::bail!(
+            "GITHUB_WEBHOOK_SECRET is required; set it, or set \
+             INTAKE_ALLOW_INSECURE=1 to run without signature checking (local dev only)"
+        );
+    }
+    Ok(bytes)
+}
+
 /// Build the webhook router. Extracted so tests can exercise the handler.
 fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -50,24 +66,15 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url =
         std::env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL is required"))?;
-    let secret = std::env::var("GITHUB_WEBHOOK_SECRET")
-        .unwrap_or_default()
-        .into_bytes();
+    let secret = resolve_secret(
+        std::env::var("GITHUB_WEBHOOK_SECRET").ok(),
+        std::env::var("INTAKE_ALLOW_INSECURE").as_deref() == Ok("1"),
+    )?;
     if secret.is_empty() {
-        // Fail closed: refuse to start without a webhook secret unless the
-        // operator explicitly opts into the insecure local-dev path. An
-        // unauthenticated webhook endpoint accepts forged events from anyone.
-        if std::env::var("INTAKE_ALLOW_INSECURE").as_deref() == Ok("1") {
-            tracing::warn!(
-                "GITHUB_WEBHOOK_SECRET unset and INTAKE_ALLOW_INSECURE=1 — \
-                 signature checking DISABLED (local dev only)"
-            );
-        } else {
-            anyhow::bail!(
-                "GITHUB_WEBHOOK_SECRET is required; set it, or set \
-                 INTAKE_ALLOW_INSECURE=1 to run without signature checking (local dev only)"
-            );
-        }
+        tracing::warn!(
+            "GITHUB_WEBHOOK_SECRET unset and INTAKE_ALLOW_INSECURE=1 — \
+             signature checking DISABLED (local dev only)"
+        );
     }
 
     let pool = factory_record::connect(&database_url).await?;
@@ -229,5 +236,74 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(status_for(b"", req).await, StatusCode::OK);
+    }
+
+    #[test]
+    fn resolve_secret_fails_closed_unless_opted_in() {
+        // A present secret is always accepted.
+        assert_eq!(
+            resolve_secret(Some("s".into()), false).unwrap(),
+            b"s".to_vec()
+        );
+        // Missing secret WITHOUT the opt-in → error (fail closed).
+        assert!(resolve_secret(None, false).is_err());
+        assert!(resolve_secret(Some(String::new()), false).is_err());
+        // Missing secret WITH the explicit insecure opt-in → empty (checking off).
+        assert!(resolve_secret(None, true).unwrap().is_empty());
+    }
+
+    fn sign(secret: &[u8], body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    /// A valid signature on a labelled-issue payload for a connected repo →
+    /// 202 (exercises the signature-ACCEPT branch + the success path). DB-gated.
+    #[tokio::test]
+    async fn valid_signed_webhook_is_accepted() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let pool = factory_record::connect(&url).await.unwrap();
+        factory_record::migrate(&pool).await.unwrap();
+
+        let owner = "acme";
+        let name = format!("handler-202-{}", uuid::Uuid::now_v7());
+        let repo = factory_record::upsert_repo(&pool, owner, &name, 1)
+            .await
+            .unwrap();
+        let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: manager\n    role: manager\n    on: [issue_labeled]\n";
+        factory_intake::apply_config(&pool, repo, yaml, "sha")
+            .await
+            .unwrap();
+
+        let secret = b"webhook-secret";
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "labeled",
+            "issue": { "number": 5 },
+            "label": { "name": "factory" },
+            "repository": { "name": name, "owner": { "login": owner } },
+            "installation": { "id": 1 }
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhooks/github")
+            .header("x-hub-signature-256", sign(secret, &body))
+            .header("x-github-event", "issues")
+            .header("x-github-delivery", format!("d-{}", uuid::Uuid::now_v7()))
+            .body(Body::from(body))
+            .unwrap();
+
+        let state = Arc::new(AppState {
+            pool,
+            secret: secret.to_vec(),
+        });
+        let status = build_router(state).oneshot(req).await.unwrap().status();
+        assert_eq!(status, StatusCode::ACCEPTED);
     }
 }

@@ -100,6 +100,8 @@ pub enum ConfigError {
     InvalidCron { worker: String, cron: String },
     #[error("worker '{worker}' (role {role:?}): only the manager may subscribe to issue_labeled (manager-first)")]
     NonManagerIssueLabeled { worker: String, role: Role },
+    #[error("at most one worker may subscribe to issue_labeled (a labelled issue yields a single Manager work item); found both '{first}' and '{second}'")]
+    MultipleIssueLabeledSubscribers { first: String, second: String },
     #[error("worker '{0}': instructions_file must be a non-empty path")]
     EmptyInstructionsFile(String),
 }
@@ -116,6 +118,10 @@ pub fn parse(yaml: &str) -> Result<Config, ConfigError> {
     }
 
     let mut seen = HashSet::new();
+    // Tracks the single worker allowed to subscribe to issue_labeled. A labelled
+    // issue must yield exactly one Manager work item; two subscribers would
+    // collide on the (repo, subject, kind) index and silently drop one.
+    let mut issue_labeled_subscriber: Option<&str> = None;
     let mut workers = Vec::with_capacity(raw.workers.len());
     for w in &raw.workers {
         if !seen.insert(w.name.as_str()) {
@@ -136,11 +142,20 @@ pub fn parse(yaml: &str) -> Result<Config, ConfigError> {
         for raw_trigger in &w.on {
             let trigger = convert_trigger(&w.name, raw_trigger)?;
             // Manager-first: only the manager may be woken directly by a labelled issue.
-            if trigger == Trigger::IssueLabeled && w.role != Role::Manager {
-                return Err(ConfigError::NonManagerIssueLabeled {
-                    worker: w.name.clone(),
-                    role: w.role,
-                });
+            if trigger == Trigger::IssueLabeled {
+                if w.role != Role::Manager {
+                    return Err(ConfigError::NonManagerIssueLabeled {
+                        worker: w.name.clone(),
+                        role: w.role,
+                    });
+                }
+                if let Some(first) = issue_labeled_subscriber {
+                    return Err(ConfigError::MultipleIssueLabeledSubscribers {
+                        first: first.to_owned(),
+                        second: w.name.clone(),
+                    });
+                }
+                issue_labeled_subscriber = Some(&w.name);
             }
             triggers.push(trigger);
         }
@@ -487,6 +502,20 @@ workers:
             err,
             Err(ConfigError::NonManagerIssueLabeled { worker, role })
                 if worker == "c" && role == Role::Coder
+        ));
+    }
+
+    #[test]
+    fn rejects_multiple_issue_labeled_subscribers() {
+        // Two managers both on issue_labeled would collide on the work-item index
+        // and silently drop one — reject at validation.
+        let err = parse(
+            "version: 1\nworkers:\n  - name: m1\n    role: manager\n    on: [issue_labeled]\n  - name: m2\n    role: manager\n    on: [issue_labeled]\n",
+        );
+        assert!(matches!(
+            err,
+            Err(ConfigError::MultipleIssueLabeledSubscribers { first, second })
+                if first == "m1" && second == "m2"
         ));
     }
 

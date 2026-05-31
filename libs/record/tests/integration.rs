@@ -640,3 +640,42 @@ async fn upsert_repo_is_idempotent_by_owner_name() {
     let second = record::upsert_repo(&pool, "acme", &name, 2).await.unwrap();
     assert_eq!(first, second, "same (owner,name) must map to one repo id");
 }
+
+#[tokio::test]
+async fn record_scheduled_fire_fires_each_distinct_slot() {
+    // Successive distinct cron slots must EACH fire — the exactly-once guard is
+    // per-slot, it must not coalesce different periods into one.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("sched-distinct"), 1)
+        .await
+        .unwrap();
+    let slot1 = Utc::now();
+    let slot2 = slot1 + Duration::minutes(1);
+    let item_for_slot = |slot: chrono::DateTime<Utc>| NewWorkItem {
+        repo_id: repo,
+        kind: Kind::Coder,
+        worker_name: "nightly".into(),
+        config_sha: "sha".into(),
+        trigger: "schedule".into(),
+        subject_ref: format!("schedule@nightly@{}", slot.to_rfc3339()),
+        correlation_id: Uuid::now_v7(),
+        priority: 0,
+        available_at: None,
+    };
+
+    assert!(matches!(
+        record::record_scheduled_fire(&pool, &item_for_slot(slot1), slot1)
+            .await
+            .unwrap(),
+        EnqueueOutcome::Inserted(_)
+    ));
+    assert!(matches!(
+        record::record_scheduled_fire(&pool, &item_for_slot(slot2), slot2)
+            .await
+            .unwrap(),
+        EnqueueOutcome::Inserted(_)
+    ));
+    assert_eq!(record::count_for_repo(&pool, repo).await.unwrap(), 2);
+}

@@ -232,6 +232,132 @@ async fn review_changes_requested_enqueues_subscribed_worker() {
 }
 
 #[tokio::test]
+async fn no_config_delivery_is_redriven_after_config_applied() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // Repo is connected but has no validated config yet.
+    let owner = "acme";
+    let name = unique("intake-noconfig");
+    let id = record::upsert_repo(&pool, owner, &name, 1).await.unwrap();
+    let event = WebhookEvent::IssueLabeled {
+        repo: RepoRef {
+            owner: owner.into(),
+            name: name.clone(),
+            installation_id: 1,
+        },
+        issue: 8,
+        label: "factory".into(),
+    };
+    let delivery = format!("d-{}", Uuid::now_v7());
+
+    // No config → NoConfig, and the delivery is NOT recorded (so it can redrive).
+    assert_eq!(
+        ingest(&pool, &event, &delivery).await.unwrap(),
+        IngestOutcome::NoConfig
+    );
+
+    // Config arrives; the redelivery now enqueues instead of being deduped.
+    let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: manager\n    role: manager\n    on: [issue_labeled]\n";
+    factory_intake::apply_config(&pool, id, yaml, "sha1")
+        .await
+        .unwrap();
+    assert_eq!(
+        ingest(&pool, &event, &delivery).await.unwrap(),
+        IngestOutcome::Enqueued(1)
+    );
+    assert_eq!(record::count_for_repo(&pool, id).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn cr_updated_enqueues_subscribed_worker() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: reviewer\n    role: reviewer\n    on: [cr_updated]\n";
+    let (id, owner, name) = repo_with_yaml(&pool, "intake-crupdated", yaml).await;
+    let event = WebhookEvent::CrUpdated {
+        repo: RepoRef {
+            owner,
+            name,
+            installation_id: 1,
+        },
+        number: 3,
+    };
+    assert_eq!(
+        ingest(&pool, &event, &format!("d-{}", Uuid::now_v7()))
+            .await
+            .unwrap(),
+        IngestOutcome::Enqueued(1)
+    );
+    assert_eq!(record::count_for_repo(&pool, id).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn review_requested_enqueues_subscribed_worker() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: reviewer\n    role: reviewer\n    on: [review_requested]\n";
+    let (id, owner, name) = repo_with_yaml(&pool, "intake-reviewreq", yaml).await;
+    let event = WebhookEvent::ReviewRequested {
+        repo: RepoRef {
+            owner,
+            name,
+            installation_id: 1,
+        },
+        number: 4,
+    };
+    assert_eq!(
+        ingest(&pool, &event, &format!("d-{}", Uuid::now_v7()))
+            .await
+            .unwrap(),
+        IngestOutcome::Enqueued(1)
+    );
+    assert_eq!(record::count_for_repo(&pool, id).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn push_and_unmatched_events_are_ignored() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // A configured repo whose workers subscribe to nothing relevant.
+    let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: manager\n    role: manager\n    on: [issue_labeled]\n";
+    let (id, owner, name) = repo_with_yaml(&pool, "intake-ignored", yaml).await;
+
+    // Push is parsed but config-apply-on-push is a P3 concern → Ignored here.
+    let push = WebhookEvent::Push {
+        repo: RepoRef {
+            owner,
+            name,
+            installation_id: 1,
+        },
+        head_sha: "abc".into(),
+        touched_paths: vec![".factory/config.yml".into()],
+    };
+    assert_eq!(
+        ingest(&pool, &push, &format!("d-{}", Uuid::now_v7()))
+            .await
+            .unwrap(),
+        IngestOutcome::Ignored
+    );
+
+    // An event Factory doesn't model at all → Ignored, no repo lookup.
+    assert_eq!(
+        ingest(
+            &pool,
+            &WebhookEvent::Other,
+            &format!("d-{}", Uuid::now_v7())
+        )
+        .await
+        .unwrap(),
+        IngestOutcome::Ignored
+    );
+    assert_eq!(record::count_for_repo(&pool, id).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn unknown_repo_is_ignored() {
     let Some(pool) = pool_or_skip().await else {
         return;
@@ -252,4 +378,46 @@ async fn unknown_repo_is_ignored() {
             .unwrap(),
         IngestOutcome::UnknownRepo
     );
+}
+
+#[tokio::test]
+async fn scheduler_tick_fires_due_schedule_for_configured_repo() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // A configured repo with an every-minute schedule; the all-repos pass must
+    // fire its due tick. (We assert on THIS repo's count, not the global return,
+    // since other tests' repos may also be configured in the shared DB.)
+    let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: nightly\n    role: coder\n    on:\n      - schedule: \"* * * * *\"\n";
+    let (id, _owner, _name) = repo_with_yaml(&pool, "intake-tick", yaml).await;
+
+    factory_intake::scheduler_tick(&pool, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(record::count_for_repo(&pool, id).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn scheduler_tick_skips_repo_with_unparseable_stored_config() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // A repo whose stored config jsonb is valid JSON but not a Config. The tick
+    // must skip it without erroring (a logged decision), not blow up the pass.
+    let name = unique("intake-badcfg");
+    let id = record::upsert_repo(&pool, "acme", &name, 1).await.unwrap();
+    sqlx::query(
+        "UPDATE repos SET config = '\"not a config\"'::jsonb, config_sha = 'x' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Does not error despite the malformed config row.
+    factory_intake::scheduler_tick(&pool, chrono::Utc::now())
+        .await
+        .unwrap();
+    // The malformed repo produced no work.
+    assert_eq!(record::count_for_repo(&pool, id).await.unwrap(), 0);
 }

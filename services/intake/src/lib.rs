@@ -51,9 +51,18 @@ pub async fn ingest(
 
     let (repo_id, outcome) = process(pool, event).await?;
 
-    // Audit every handled delivery (spec §340: every activity is recorded in the
-    // events book, not just in tracing). repo_id is None for events we couldn't
-    // attribute to a connected repo.
+    // Audit every handled delivery — the product spec requires a transparent
+    // play-by-play / audit trail of who did what, recorded in the events book and
+    // not just in tracing. repo_id is None for events we couldn't attribute to a
+    // connected repo.
+    //
+    // Concurrency note: dedupe here is read-act-mark across statements, not one
+    // transaction. The *work item* is still exactly-once (enqueue's partial
+    // unique index), so concurrent same-delivery handling can at worst write a
+    // duplicate audit row — never a duplicate work item. GitHub delivers a given
+    // X-GitHub-Delivery once and retries sequentially, so this race is not
+    // reachable in practice; a transaction is deliberately avoided here so we
+    // keep the mark-after-success ordering that makes lost-event redrive work.
     record::append_event(
         pool,
         repo_id,
