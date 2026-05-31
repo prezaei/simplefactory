@@ -133,8 +133,11 @@ minutes and resumes). **`/ship-it` now enforces the Copilot-on-HEAD gate nativel
 skill): when Copilot is available on the repo it automatically requests the review and will **not** merge
 until Copilot has *submitted* a review of the **current** HEAD with every comment triaged — so just
 invoke `/ship-it`; no manual gate injection is needed. (If Copilot isn't installed on the repo, `/ship-it`
-records that and proceeds without the gate rather than hanging.) The EXTRA MERGE GATE below is exactly the
-behavior `/ship-it` now enforces:
+records that and proceeds without the gate rather than hanging.) **One CI caveat:** `/ship-it` gates CI on
+the repo's branch-protection-required checks by default; since `AGENTS.md` requires **all** CI checks
+green (not only the required subset — see the exit condition), pass the full check set via `/ship-it
+--required-checks <name,…>` whenever branch protection lists fewer. The EXTRA MERGE GATE below is exactly
+the Copilot behavior `/ship-it` now enforces:
 
 > **EXTRA MERGE GATE — do not merge until BOTH:** (a) Copilot has submitted a review whose `commit_id`
 > equals the **current** PR head SHA, and (b) every new inline comment from that review is triaged —
@@ -159,7 +162,8 @@ On each ship-it iteration (cron-fired), the loop must:
    fix is new code; Copilot and `/code-review` each catch what the other misses, and rounds routinely
    catch defects *introduced by the previous fix*). NOTE: `/ship-it` does **not** run `/code-review`
    itself, so this pass is the fixer's responsibility — it's part of "fix it in code" (step 2), not a step
-   `/ship-it` performs. (For a docs/trivial fix where `/code-review` is N/A per Applicability, say so.)
+   `/ship-it` performs. (`/code-review` applies even to docs/trivial fixes — per Applicability it's
+   `/adversarial-investigation` and the cargo green gate that are N/A for those, not `/code-review`.)
 4. **Any pushed fix moves HEAD → the Copilot-on-HEAD gate RESETS:** re-request Copilot on the new HEAD
    and let the cron loop again.
 5. **Merge** (squash, via the REST API so it is worktree-safe) only when the exit condition holds.
