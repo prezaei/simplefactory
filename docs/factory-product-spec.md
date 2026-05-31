@@ -70,7 +70,6 @@ These are the requirements a good version must satisfy — the qualities to hit,
 **Staying in control (a human is always above the machine)**
 
 - **Opt-in only** (as described above): it acts only on work explicitly handed to it.
-- **Emergency stop.** One operator switch halts all new work immediately — while letting work already in progress wind down — and can be switched back on.
 - **Least privilege.** Each worker can touch only its one repository, with credentials that are short-lived and revoked when its task ends (or when a stuck worker is reclaimed). For the first version, builds need the open internet (to fetch packages), so a worker's outbound network is *not* otherwise locked down. Factory makes a best effort to keep secrets out of what it records — but this is best-effort, not a guarantee, and because the detailed play-by-play is written into your own repository, treat anyone with access to that repository as able to see it.
 - **Separate "watch" from "act."** Observing the system is open to everyone allowed in; starting, stopping, or overriding work requires an operator.
 - **Confidential by default.** The code Factory works on, and the records Factory keeps, are treated as confidential — shown only to the people allowed in, never used to train models, and purged on the retention schedule above. (The detailed play-by-play stored inside your repository is governed by your repository's own access and lifecycle.)
