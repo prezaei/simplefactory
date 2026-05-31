@@ -5,10 +5,30 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lib]
+name = "factory_coordinator"
+path = "src/lib.rs"
+
 [[bin]]
 name = "factory-coordinator"
 path = "src/main.rs"
 
 [dependencies]
+factory-record.workspace = true
+factory-config.workspace = true
+factory-github.workspace = true
 factory-telemetry.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+factory-record.workspace = true
+factory-config.workspace = true
+factory-github.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+serde_json.workspace = true

@@ -240,6 +240,22 @@ impl GitHubClient for OctocrabGitHub {
         Ok(())
     }
 
+    async fn assign_issue(
+        &self,
+        repo: &RepoRef,
+        issue_number: i64,
+        assignee: &str,
+    ) -> anyhow::Result<()> {
+        tracing::info!(owner = %repo.owner, name = %repo.name, issue_number, assignee, "assigning issue");
+        self.installation(repo.installation_id)
+            .await?
+            .issues(&repo.owner, &repo.name)
+            .add_assignees(id_u64(issue_number)?, &[assignee])
+            .await
+            .map_err(|e| anyhow::anyhow!("assigning issue #{issue_number} to {assignee}: {e}"))?;
+        Ok(())
+    }
+
     async fn submit_review(
         &self,
         repo: &RepoRef,

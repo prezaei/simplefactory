@@ -562,8 +562,16 @@ dependencies = [
 name = "factory-coordinator"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "factory-config",
+ "factory-github",
+ "factory-record",
  "factory-telemetry",
+ "serde_json",
+ "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -600,12 +608,14 @@ dependencies = [
  "chrono",
  "factory-blob",
  "factory-config",
+ "factory-coordinator",
  "factory-dispatcher",
  "factory-github",
  "factory-intake",
  "factory-record",
  "factory-tools",
  "serde_json",
+ "sqlx",
  "tokio",
  "uuid",
 ]

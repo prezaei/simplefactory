@@ -542,28 +542,557 @@ mod acceptance {
     }
 
     // P4 — coordinator + reviewer (full loop)
-    #[test]
-    #[ignore = "P4: implement manager + coder + reviewer loop"]
-    fn worked_example_happy_path_issue_to_merge_handoff() {
-        todo!("P4: labelled issue → Manager → Coder (tests+code) → CR → Reviewer approve → ready-for-human-merge → issue closed")
+    //
+    // These drive the REAL coordinator (`factory_coordinator::coordinator_tick`)
+    // against the real record book, with Claude/the workers faked at the seam: a
+    // worker "completing" is simulated by driving the Tools fns for its GitHub side
+    // effect (open CR / submit review) and then marking its work item terminal. A
+    // single shared `FakeGitHub` records every comment + assignment the coordinator
+    // makes, so the exactly-once handoff/escalation assertions are exact.
+
+    use std::sync::Arc;
+
+    use factory_coordinator::coordinator_tick;
+    use factory_github::{CheckConclusion, CheckSummary, FakeGitHub};
+    use factory_tools::ToolsState;
+
+    /// `coordinator_tick` scans the WHOLE record book (it is a global service), so in
+    /// a shared test DB the P4 tests — which assert exact per-tick react counts and
+    /// exact FakeGitHub call counts against their OWN `FakeGitHub` — must not overlap
+    /// with each other or react to each other's leftover terminal items. This mutex
+    /// serializes the four P4 coordinator tests; each one [`drain_terminal`]s any
+    /// pre-existing unreacted terminal items (through a throwaway client) before it
+    /// begins, so its own `FakeGitHub` only ever records effects for its own repo.
+    static P4_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// React to (and discard the side effects of) every currently-unreacted terminal
+    /// item, so a subsequent scoped tick sees only freshly-created ones. Uses a
+    /// throwaway `FakeGitHub` so the test's own client stays clean.
+    async fn drain_terminal(pool: &record::Pool) {
+        let sink = FakeGitHub::new();
+        // A couple of passes settle any items a drain itself enqueues-then-terminates.
+        for _ in 0..3 {
+            if coordinator_tick(pool, &sink).await.unwrap() == 0 {
+                break;
+            }
+        }
     }
 
-    #[test]
-    #[ignore = "P4: implement bounded review-rework loop + cap"]
-    fn changes_requested_rework_loop_increments_and_caps() {
-        todo!("P4: repeated changes-requested increments loop_count; at the cap the work escalates instead of looping forever")
+    /// Three-role config (manager + coder + reviewer) stored on a fresh repo.
+    /// Returns the repo id and the worker names `(manager, coder, reviewer)`.
+    async fn setup_three_role_repo(
+        pool: &record::Pool,
+        repo: Uuid,
+    ) -> (&'static str, &'static str, &'static str) {
+        let (manager, coder, reviewer) = ("manager", "bug-fixer", "reviewer");
+        let yaml = format!(
+            "version: 1\n\
+             settings:\n  label: factory\n\
+             limits:\n  max_concurrent_workers: 5\n\
+             workers:\n\
+             \x20 - name: {manager}\n    role: manager\n    on: [issue_labeled]\n\
+             \x20 - name: {coder}\n    role: coder\n    on: [manager, cr_changes_requested]\n\
+             \x20 - name: {reviewer}\n    role: reviewer\n    on: [cr_opened]\n"
+        );
+        let cfg = factory_config::parse(&yaml).expect("valid three-role config");
+        let cfg_json = serde_json::to_value(&cfg).unwrap();
+        record::set_repo_config(pool, repo, &cfg_json, "p4-sha")
+            .await
+            .unwrap();
+        (manager, coder, reviewer)
     }
 
-    #[test]
-    #[ignore = "P4: implement exactly-once escalation"]
-    fn exactly_once_escalation_under_redispatch() {
-        todo!("P4: a lease-expiry re-dispatch during/after escalation yields exactly ONE escalation (one comment + one assignment)")
+    /// Enqueue a work item of `kind` for `subject`, returning its id.
+    async fn enqueue_item(
+        pool: &record::Pool,
+        repo: Uuid,
+        kind: record::Kind,
+        worker: &str,
+        subject: &str,
+    ) -> Uuid {
+        let outcome = record::enqueue(
+            pool,
+            &record::NewWorkItem {
+                repo_id: repo,
+                kind,
+                worker_name: worker.into(),
+                config_sha: "p4-sha".into(),
+                trigger: "manager".into(),
+                subject_ref: subject.into(),
+                correlation_id: Uuid::now_v7(),
+                priority: 0,
+                available_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        match outcome {
+            record::EnqueueOutcome::Inserted(id) => id,
+            other => panic!("expected fresh insert for {subject}, got {other:?}"),
+        }
     }
 
-    #[test]
-    #[ignore = "P4: implement the can't-weaken-own-checks guard"]
-    fn cannot_weaken_own_gating_checks_is_escalated() {
-        todo!("P4: a change that weakens/disables the checks gating its own work is rejected → escalated, never marked ready")
+    /// Mark a work item `succeeded` (simulates the worker finishing its task).
+    async fn mark_succeeded(pool: &record::Pool, id: Uuid) {
+        assert!(
+            record::set_state(pool, id, record::State::Succeeded)
+                .await
+                .unwrap(),
+            "work item should transition to succeeded"
+        );
+    }
+
+    /// A `TaskAuth` for driving Tools fns as the worker for `work_item`. No attempt
+    /// is needed: the P4 tests use the GitHub-facing tool fns (open CR / submit
+    /// review), not `record_outcome`.
+    fn task_auth(work_item: Uuid, repo: Uuid, role: record::Kind) -> record::TaskAuth {
+        record::TaskAuth {
+            work_item_id: work_item,
+            repo_id: repo,
+            role,
+            attempt_id: None,
+        }
+    }
+
+    /// Build a `ToolsState` over the shared `FakeGitHub` and an in-memory blob store.
+    fn tools_state(pool: &record::Pool, gh: Arc<FakeGitHub>) -> ToolsState {
+        ToolsState {
+            pool: pool.clone(),
+            gh,
+            blob: Arc::new(factory_blob::InMemoryTranscripts::new()),
+        }
+    }
+
+    /// The coordinator's mutating GitHub calls of a given prefix (e.g.
+    /// `"assign_issue"`), used for exact-count assertions.
+    fn calls_with_prefix(gh: &FakeGitHub, prefix: &str) -> Vec<String> {
+        gh.calls()
+            .into_iter()
+            .filter(|c| c.starts_with(prefix))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn worked_example_happy_path_issue_to_merge_handoff() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let _serial = P4_SERIAL.lock().await;
+        drain_terminal(&pool).await;
+        let name = unique("e2e-p4-happy");
+        let repo = record::upsert_repo(&pool, "acme", &name, 1).await.unwrap();
+        let (manager, _coder, _reviewer) = setup_three_role_repo(&pool, repo).await;
+
+        let gh = Arc::new(FakeGitHub::new());
+        let state = tools_state(&pool, gh.clone());
+
+        // The manager triaged issue#1 and succeeded → coordinator assigns a coder.
+        let manager_item =
+            enqueue_item(&pool, repo, record::Kind::Manager, manager, "issue#1").await;
+        mark_succeeded(&pool, manager_item).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        // A coder item now exists for issue#1, and the issue is in_progress.
+        assert_eq!(
+            issue_state(&pool, repo, 1).await.as_deref(),
+            Some("in_progress"),
+            "issue moves to in_progress when delegated to a coder"
+        );
+        let coder_id = find_item(&pool, repo, record::Kind::Coder, "issue#1")
+            .await
+            .expect("a coder item was enqueued for issue#1");
+
+        // Simulate the coder: open the CR, then mark the coder item succeeded.
+        let coder_auth = task_auth(coder_id, repo, record::Kind::Coder);
+        let cr = factory_tools::open_or_update_change_request(
+            &state,
+            &coder_auth,
+            "[coder] issue#1",
+            "Implemented the fix with tests",
+            "factory/issue-1",
+            "main",
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let cr_number = cr["cr_number"].as_i64().expect("a cr_number");
+        mark_succeeded(&pool, coder_id).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        // A reviewer item now exists for cr#<n>.
+        let cr_subject = format!("cr#{cr_number}");
+        let reviewer_id = find_item(&pool, repo, record::Kind::Reviewer, &cr_subject)
+            .await
+            .expect("a reviewer item was enqueued for the CR");
+
+        // Simulate the reviewer: approve (sets CR factory_state=approved). Seed the
+        // CR head's checks green; default file list is non-gating.
+        let reviewer_auth = task_auth(reviewer_id, repo, record::Kind::Reviewer);
+        factory_tools::submit_review(
+            &state,
+            &reviewer_auth,
+            cr_number,
+            "approve",
+            "LGTM",
+            Some("rev-1"),
+        )
+        .await
+        .unwrap();
+        let gh = Arc::new(FakeGitHub::new().with_checks(
+            &format!("sha-{cr_number}"),
+            CheckSummary {
+                overall: CheckConclusion::Success,
+                checks: vec![("ci".into(), CheckConclusion::Success)],
+            },
+        ));
+        mark_succeeded(&pool, reviewer_id).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        // The CR is marked ready, exactly one handoff comment + one assignment ran,
+        // and the issue reached its closed end state.
+        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .expect("CR row");
+        assert_eq!(cr_row.factory_state, "ready", "CR is ready-for-human-merge");
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one handoff comment"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one assignment"
+        );
+        assert_eq!(
+            issue_state(&pool, repo, 1).await.as_deref(),
+            Some("done"),
+            "the issue reaches its closed end state"
+        );
+    }
+
+    #[tokio::test]
+    async fn changes_requested_rework_loop_increments_and_caps() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let _serial = P4_SERIAL.lock().await;
+        drain_terminal(&pool).await;
+        let name = unique("e2e-p4-rework");
+        let repo = record::upsert_repo(&pool, "acme", &name, 1).await.unwrap();
+        let (_manager, coder, reviewer) = setup_three_role_repo(&pool, repo).await;
+
+        let gh = Arc::new(FakeGitHub::new());
+        let state = tools_state(&pool, gh.clone());
+
+        // Bootstrap a CR on issue#1: one coder opens it.
+        let first_coder = enqueue_item(&pool, repo, record::Kind::Coder, coder, "issue#1").await;
+        let coder_auth = task_auth(first_coder, repo, record::Kind::Coder);
+        let cr = factory_tools::open_or_update_change_request(
+            &state,
+            &coder_auth,
+            "[coder] issue#1",
+            "first attempt",
+            "factory/issue-1",
+            "main",
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let cr_number = cr["cr_number"].as_i64().unwrap();
+        let cr_subject = format!("cr#{cr_number}");
+        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .unwrap();
+        // The bootstrap coder finished opening the CR: mark it terminal AND reacted
+        // so it neither occupies the active (repo, issue#1, coder) slot (which would
+        // make the coordinator's rework dispatch dedupe against it) nor shows up as
+        // an extra item for the coordinator to react to in the cycles below.
+        mark_succeeded(&pool, first_coder).await;
+        assert!(record::mark_reacted(&pool, first_coder).await.unwrap());
+
+        // The reviewer requests changes repeatedly. Each cycle: a reviewer item for
+        // the CR requests changes and succeeds; the coordinator increments the loop
+        // count and (below the cap) re-dispatches a coder for the issue. The first
+        // cycle's reviewer is enqueued here; each subsequent cycle's reviewer is the
+        // one the coordinator wakes when the cycle's rework coder succeeds.
+        // LOOP_CAP = 5: cycles 1..=4 re-dispatch; the 5th escalates.
+        let mut reviewer_id =
+            enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, &cr_subject).await;
+        for cycle in 1..=5 {
+            let reviewer_auth = task_auth(reviewer_id, repo, record::Kind::Reviewer);
+            factory_tools::submit_review(
+                &state,
+                &reviewer_auth,
+                cr_number,
+                "request_changes",
+                "needs work",
+                Some(&format!("rev-{cycle}")),
+            )
+            .await
+            .unwrap();
+            mark_succeeded(&pool, reviewer_id).await;
+            coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+            assert_eq!(
+                record::cr_loop_count(&pool, cr_row.id).await.unwrap(),
+                cycle,
+                "loop count increments each changes-requested cycle"
+            );
+
+            if cycle < 5 {
+                // A fresh rework coder item exists for the issue (the coordinator's
+                // rework dispatch). The rework pushes to the EXISTING CR/branch, so it
+                // opens no new CR row; mark it succeeded and react (a coder-succeeded
+                // with no CR row is a no-op). Then wake the next reviewer for the CR
+                // directly (idempotent by active (repo, subject, kind)).
+                let rework = find_item(&pool, repo, record::Kind::Coder, "issue#1")
+                    .await
+                    .expect("a rework coder item exists below the cap");
+                assert_ne!(rework, first_coder, "rework is a new coder item");
+                mark_succeeded(&pool, rework).await;
+                coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+                reviewer_id =
+                    enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, &cr_subject).await;
+            }
+        }
+
+        // At the cap: no NEW coder was enqueued for the rework, and exactly one
+        // loop_cap escalation exists with exactly one comment + one assignment.
+        assert!(
+            find_item(&pool, repo, record::Kind::Coder, "issue#1")
+                .await
+                .is_none(),
+            "no further coder is enqueued once the loop cap is hit"
+        );
+        // The escalation is recorded against the reviewer item that hit the cap.
+        let escalations: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'loop_cap' \
+             AND work_item_id IN (SELECT id FROM work_items WHERE repo_id = $1)",
+        )
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(escalations, 1, "exactly one loop_cap escalation");
+    }
+
+    #[tokio::test]
+    async fn exactly_once_escalation_under_redispatch() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let _serial = P4_SERIAL.lock().await;
+        drain_terminal(&pool).await;
+        let name = unique("e2e-p4-once");
+        let repo = record::upsert_repo(&pool, "acme", &name, 1).await.unwrap();
+        let (_manager, coder, reviewer) = setup_three_role_repo(&pool, repo).await;
+
+        let gh = Arc::new(FakeGitHub::new());
+        let state = tools_state(&pool, gh.clone());
+
+        // A CR already at the loop cap (loop_count = LOOP_CAP - 1, so the next
+        // changes-requested reaches it). Open the CR via the coder seam.
+        let coder_item = enqueue_item(&pool, repo, record::Kind::Coder, coder, "issue#1").await;
+        let coder_auth = task_auth(coder_item, repo, record::Kind::Coder);
+        let cr = factory_tools::open_or_update_change_request(
+            &state,
+            &coder_auth,
+            "[coder] issue#1",
+            "attempt",
+            "factory/issue-1",
+            "main",
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let cr_number = cr["cr_number"].as_i64().unwrap();
+        let cr_subject = format!("cr#{cr_number}");
+        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..4 {
+            record::increment_cr_loop_count(&pool, cr_row.id)
+                .await
+                .unwrap();
+        }
+
+        // The reviewer requests changes → the next increment hits the cap → escalate.
+        let reviewer_id =
+            enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, &cr_subject).await;
+        let reviewer_auth = task_auth(reviewer_id, repo, record::Kind::Reviewer);
+        factory_tools::submit_review(
+            &state,
+            &reviewer_auth,
+            cr_number,
+            "request_changes",
+            "still wrong",
+            Some("rev-final"),
+        )
+        .await
+        .unwrap();
+        mark_succeeded(&pool, reviewer_id).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        // Simulate a re-dispatch: clear the react flag and run the tick AGAIN. The
+        // exactly-once escalation index + run-side-effects-only-when-created rule
+        // mean no second escalation, comment, or assignment.
+        sqlx::query("UPDATE work_items SET reacted = false WHERE id = $1")
+            .bind(reviewer_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let _ = coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        assert_eq!(
+            record::count_escalations_for_item(&pool, reviewer_id)
+                .await
+                .unwrap(),
+            1,
+            "exactly one escalation survives the re-dispatch"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one escalation assignment"
+        );
+    }
+
+    #[tokio::test]
+    async fn cannot_weaken_own_gating_checks_is_escalated() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let _serial = P4_SERIAL.lock().await;
+        drain_terminal(&pool).await;
+        let name = unique("e2e-p4-gating");
+        let repo = record::upsert_repo(&pool, "acme", &name, 1).await.unwrap();
+        let (_manager, coder, reviewer) = setup_three_role_repo(&pool, repo).await;
+
+        // First open the CR on a default FakeGitHub so we learn its number, then
+        // build the assertion FakeGitHub seeded with a gating file list + green
+        // checks for that CR (green checks prove the guard, not the checks, blocks it).
+        let setup_gh = Arc::new(FakeGitHub::new());
+        let setup_state = tools_state(&pool, setup_gh.clone());
+        let coder_item = enqueue_item(&pool, repo, record::Kind::Coder, coder, "issue#1").await;
+        let coder_auth = task_auth(coder_item, repo, record::Kind::Coder);
+        let cr = factory_tools::open_or_update_change_request(
+            &setup_state,
+            &coder_auth,
+            "[coder] issue#1",
+            "disables CI",
+            "factory/issue-1",
+            "main",
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let cr_number = cr["cr_number"].as_i64().unwrap();
+        let cr_subject = format!("cr#{cr_number}");
+
+        let gh = Arc::new(
+            FakeGitHub::new()
+                .with_cr_files(cr_number, vec![".github/workflows/ci.yml".into()])
+                .with_checks(
+                    &format!("sha-{cr_number}"),
+                    CheckSummary {
+                        overall: CheckConclusion::Success,
+                        checks: vec![("ci".into(), CheckConclusion::Success)],
+                    },
+                ),
+        );
+        let state = tools_state(&pool, gh.clone());
+
+        // The reviewer approves the gating-weakening CR.
+        let reviewer_id =
+            enqueue_item(&pool, repo, record::Kind::Reviewer, reviewer, &cr_subject).await;
+        let reviewer_auth = task_auth(reviewer_id, repo, record::Kind::Reviewer);
+        factory_tools::submit_review(
+            &state,
+            &reviewer_auth,
+            cr_number,
+            "approve",
+            "ship it",
+            Some("rev-1"),
+        )
+        .await
+        .unwrap();
+        mark_succeeded(&pool, reviewer_id).await;
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+
+        // The CR is NEVER marked ready; exactly one conflict escalation exists with
+        // one comment + one assignment.
+        let cr_row = record::change_request_by_number(&pool, repo, cr_number as i32)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            cr_row.factory_state, "ready",
+            "CR must never be marked ready"
+        );
+        assert_eq!(cr_row.factory_state, "approved", "CR stays approved");
+        let conflicts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM escalations WHERE reason = 'conflict' AND work_item_id = $1",
+        )
+        .bind(reviewer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(conflicts, 1, "exactly one conflict escalation");
+        assert_eq!(
+            calls_with_prefix(&gh, "post_comment").len(),
+            1,
+            "exactly one escalation comment"
+        );
+        assert_eq!(
+            calls_with_prefix(&gh, "assign_issue").len(),
+            1,
+            "exactly one escalation assignment"
+        );
+    }
+
+    /// Find a single non-terminal-or-any work item for `(repo, kind, subject)`.
+    /// Used to assert the coordinator enqueued the expected next step.
+    async fn find_item(
+        pool: &record::Pool,
+        repo: Uuid,
+        kind: record::Kind,
+        subject: &str,
+    ) -> Option<Uuid> {
+        sqlx::query_scalar(
+            "SELECT id FROM work_items
+              WHERE repo_id = $1 AND kind = $2 AND subject_ref = $3
+                AND state IN ('queued', 'leased', 'running', 'blocked')
+              ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo)
+        .bind(kind.as_str())
+        .bind(subject)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The factory_state of an issue row, if it exists.
+    async fn issue_state(pool: &record::Pool, repo: Uuid, number: i32) -> Option<String> {
+        sqlx::query_scalar("SELECT factory_state FROM issues WHERE repo_id = $1 AND number = $2")
+            .bind(repo)
+            .bind(number)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
     }
 
     // P5 — resilience

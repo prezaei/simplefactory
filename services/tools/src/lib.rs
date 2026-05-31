@@ -456,6 +456,7 @@ pub async fn submit_review(
             .gh
             .submit_review(&repo, cr_number, verdict, body)
             .await?;
+        record_verdict_cr_state(state, auth, cr_number, verdict).await?;
         tracing::info!(work_item = %auth.work_item_id, cr_number, verdict = verdict.as_str(), "submit_review (no dedupe)");
         return Ok(json!({ "review_id": review_id }));
     };
@@ -472,6 +473,7 @@ pub async fn submit_review(
                 .submit_review(&repo, cr_number, verdict, body)
                 .await
                 .map_err(ToolError::Internal)?;
+            record_verdict_cr_state(state, auth, cr_number, verdict).await?;
             tracing::info!(work_item = %auth.work_item_id, cr_number, verdict = verdict.as_str(), "submit_review");
             Ok(json!({ "review_id": review_id }))
         },
@@ -481,6 +483,30 @@ pub async fn submit_review(
         },
     )
     .await
+}
+
+/// Reflect a review verdict onto the change request's factory state so the
+/// coordinator can react: approve → `approved`, request_changes →
+/// `changes_requested`, comment → no state change. No-op if the CR row isn't
+/// tracked yet (number not recorded).
+async fn record_verdict_cr_state(
+    state: &ToolsState,
+    auth: &TaskAuth,
+    cr_number: i64,
+    verdict: ReviewVerdict,
+) -> Result<(), ToolError> {
+    let new_state = match verdict {
+        ReviewVerdict::Approve => "approved",
+        ReviewVerdict::RequestChanges => "changes_requested",
+        ReviewVerdict::Comment => return Ok(()),
+    };
+    let cr_number = i32::try_from(cr_number)
+        .map_err(|_| ToolError::BadRequest(format!("invalid cr_number {cr_number}")))?;
+    if let Some(cr) = record::change_request_by_number(&state.pool, auth.repo_id, cr_number).await?
+    {
+        record::set_change_request_state(&state.pool, cr.id, new_state).await?;
+    }
+    Ok(())
 }
 
 /// Read required-check status for either a CR number or an explicit sha. Exactly

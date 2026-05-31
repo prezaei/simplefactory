@@ -139,6 +139,17 @@ pub trait GitHubClient: Send + Sync {
         body: &str,
     ) -> anyhow::Result<i64>;
 
+    /// Assign an issue (or change request — PR numbers are issue numbers on GitHub)
+    /// to a user. Used by the coordinator to hand work to a human on escalation or
+    /// ready-for-merge handoff. Idempotent on GitHub (assigning an existing assignee
+    /// is a no-op).
+    async fn assign_issue(
+        &self,
+        repo: &RepoRef,
+        issue_number: i64,
+        assignee: &str,
+    ) -> anyhow::Result<()>;
+
     /// Update an existing comment's body (used by `post_comment`'s idempotent re-run:
     /// the same dedupe_key updates the same comment rather than creating a new one).
     async fn update_comment(
@@ -182,6 +193,9 @@ struct FakeState {
     files: HashMap<(String, String), String>,
     /// Seeded check summaries, keyed by ref string.
     checks: HashMap<String, CheckSummary>,
+    /// Seeded change-request file lists, keyed by CR number. Defaults to a single
+    /// non-gating file when unset (see `read_change_request`).
+    cr_files: HashMap<i64, Vec<String>>,
     /// PR number assigned per head branch (idempotency).
     pr_by_branch: HashMap<String, i64>,
     next_pr: i64,
@@ -244,6 +258,14 @@ impl FakeGitHub {
         self
     }
 
+    /// Seed the file list `read_change_request` reports for a CR number. Used to
+    /// exercise the coordinator's can't-weaken-own-gating-checks guard (a CR whose
+    /// files touch `.github/workflows/`).
+    pub fn with_cr_files(self, cr_number: i64, files: Vec<String>) -> Self {
+        self.state.lock().unwrap().cr_files.insert(cr_number, files);
+        self
+    }
+
     /// The mutating calls recorded so far (for assertions).
     pub fn calls(&self) -> Vec<String> {
         self.state.lock().unwrap().pub_calls.clone()
@@ -290,11 +312,19 @@ impl GitHubClient for FakeGitHub {
         _repo: &RepoRef,
         number: i64,
     ) -> anyhow::Result<ChangeRequestView> {
+        let files = self
+            .state
+            .lock()
+            .unwrap()
+            .cr_files
+            .get(&number)
+            .cloned()
+            .unwrap_or_else(|| vec!["src/lib.rs".to_owned()]);
         Ok(ChangeRequestView {
             number,
             head_sha: format!("sha-{number}"),
             diff: "--- fake diff ---".to_owned(),
-            files: vec!["src/lib.rs".to_owned()],
+            files,
             reviews: vec![],
             checks: CheckSummary {
                 overall: CheckConclusion::Success,
@@ -355,6 +385,21 @@ impl GitHubClient for FakeGitHub {
             return Err(e);
         }
         s.pub_calls.push(format!("update_comment {comment_id}"));
+        Ok(())
+    }
+
+    async fn assign_issue(
+        &self,
+        _repo: &RepoRef,
+        issue_number: i64,
+        assignee: &str,
+    ) -> anyhow::Result<()> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(e) = Self::take_injected_failure(&mut s, "assign_issue") {
+            return Err(e);
+        }
+        s.pub_calls
+            .push(format!("assign_issue #{issue_number} -> {assignee}"));
         Ok(())
     }
 

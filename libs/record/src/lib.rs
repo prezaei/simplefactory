@@ -1194,6 +1194,162 @@ pub async fn count_escalations_for_item(pool: &Pool, work_item_id: Uuid) -> Resu
     )
 }
 
+// ===========================================================================
+// P4: the Coordinator (Manager) loop — react-once, issue/CR state, rework loop,
+// exactly-once escalation.
+// ===========================================================================
+
+/// Terminal work items the coordinator has not yet reacted to (oldest first).
+pub async fn list_unreacted_terminal(pool: &Pool) -> Result<Vec<WorkItem>> {
+    let rows = sqlx::query(
+        "SELECT id, repo_id, kind, worker_name, trigger, subject_ref, correlation_id, state,
+                attempt_count, loop_count, config_sha, lease_owner, lease_expires_at
+           FROM work_items
+          WHERE state IN ('succeeded', 'failed', 'escalated') AND NOT reacted
+          ORDER BY updated_at",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(map_work_item).collect()
+}
+
+/// Claim a terminal work item for coordination: set `reacted = true` if it wasn't
+/// already. Returns `true` for the single caller that wins (exactly-once react).
+pub async fn mark_reacted(pool: &Pool, work_item_id: Uuid) -> Result<bool> {
+    let row = sqlx::query(
+        "UPDATE work_items SET reacted = true, updated_at = now()
+          WHERE id = $1 AND NOT reacted
+         RETURNING id",
+    )
+    .bind(work_item_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// Create (or fetch) an issue row for `(repo, number)`; returns its id.
+pub async fn upsert_issue(pool: &Pool, repo_id: Uuid, number: i32) -> Result<Uuid> {
+    let row = sqlx::query(
+        "INSERT INTO issues (id, repo_id, number) VALUES ($1, $2, $3)
+         ON CONFLICT (repo_id, number) DO UPDATE SET updated_at = now()
+         RETURNING id",
+    )
+    .bind(Uuid::now_v7())
+    .bind(repo_id)
+    .bind(number)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get("id")?)
+}
+
+/// Set an issue's factory state (`open` | `in_progress` | `blocked` | `done`).
+pub async fn set_issue_state(pool: &Pool, repo_id: Uuid, number: i32, state: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO issues (id, repo_id, number, factory_state) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (repo_id, number) DO UPDATE SET factory_state = EXCLUDED.factory_state, updated_at = now()",
+    )
+    .bind(Uuid::now_v7())
+    .bind(repo_id)
+    .bind(number)
+    .bind(state)
+    .execute(pool)
+    .await?;
+    tracing::info!(%repo_id, issue = number, state, "set issue state");
+    Ok(())
+}
+
+/// Set a change request's factory state.
+pub async fn set_change_request_state(pool: &Pool, cr_id: Uuid, factory_state: &str) -> Result<()> {
+    sqlx::query("UPDATE change_requests SET factory_state = $2, updated_at = now() WHERE id = $1")
+        .bind(cr_id)
+        .bind(factory_state)
+        .execute(pool)
+        .await?;
+    tracing::info!(cr = %cr_id, factory_state, "set CR state");
+    Ok(())
+}
+
+/// Fetch a change request by its GitHub number.
+pub async fn change_request_by_number(
+    pool: &Pool,
+    repo_id: Uuid,
+    number: i32,
+) -> Result<Option<ChangeRequest>> {
+    let row = sqlx::query(
+        "SELECT id, repo_id, number, head_branch, linked_issue, work_item_id, factory_state
+           FROM change_requests WHERE repo_id = $1 AND number = $2",
+    )
+    .bind(repo_id)
+    .bind(number)
+    .fetch_optional(pool)
+    .await?;
+    row.map(map_change_request).transpose()
+}
+
+/// Increment a CR's review-rework loop count; returns the new value.
+pub async fn increment_cr_loop_count(pool: &Pool, cr_id: Uuid) -> Result<i32> {
+    let n: i32 = sqlx::query_scalar(
+        "UPDATE change_requests SET loop_count = loop_count + 1, updated_at = now()
+          WHERE id = $1 RETURNING loop_count",
+    )
+    .bind(cr_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+/// A CR's current loop count (test/diagnostic helper).
+pub async fn cr_loop_count(pool: &Pool, cr_id: Uuid) -> Result<i32> {
+    Ok(
+        sqlx::query_scalar("SELECT loop_count FROM change_requests WHERE id = $1")
+            .bind(cr_id)
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+/// Record an escalation **exactly once** per `(work_item, reason)`. Returns the
+/// escalation id and whether this call created it (`true`) or it already existed
+/// (`false`) — so a re-dispatch / racing replica never double-escalates.
+pub async fn create_escalation_idempotent(
+    pool: &Pool,
+    work_item_id: Uuid,
+    reason: &str,
+    context: &str,
+    delivered_to: Option<&str>,
+) -> Result<(Uuid, bool)> {
+    let inserted = sqlx::query(
+        "INSERT INTO escalations (id, work_item_id, reason, context, delivered_to)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (work_item_id, reason) DO NOTHING
+         RETURNING id",
+    )
+    .bind(Uuid::now_v7())
+    .bind(work_item_id)
+    .bind(reason)
+    .bind(context)
+    .bind(delivered_to)
+    .fetch_optional(pool)
+    .await?;
+    match inserted {
+        Some(r) => {
+            let id: Uuid = r.try_get("id")?;
+            tracing::info!(%work_item_id, reason, "escalation created");
+            Ok((id, true))
+        }
+        None => {
+            let id: Uuid = sqlx::query_scalar(
+                "SELECT id FROM escalations WHERE work_item_id = $1 AND reason = $2",
+            )
+            .bind(work_item_id)
+            .bind(reason)
+            .fetch_one(pool)
+            .await?;
+            Ok((id, false))
+        }
+    }
+}
+
 fn map_change_request(row: sqlx::postgres::PgRow) -> Result<ChangeRequest> {
     Ok(ChangeRequest {
         id: row.try_get("id")?,

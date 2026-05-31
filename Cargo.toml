@@ -65,3 +65,4 @@ factory-blob = { path = "libs/blob" }
 factory-intake = { path = "services/intake" }
 factory-tools = { path = "services/tools" }
 factory-dispatcher = { path = "services/dispatcher" }
+factory-coordinator = { path = "services/coordinator" }
