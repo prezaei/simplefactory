@@ -11,7 +11,7 @@ Hosting target: **everything runs on Azure, using Azure-native services.** Facto
 | Implementation language | **Rust** (Cargo workspace: `services/`, `libs/`) | Single static binary, runs identically on laptop and cluster; matches repo conventions (clippy/fmt gates, no `unwrap` in prod). |
 | Async runtime / errors | **tokio**, **anyhow** (apps) + **thiserror** (libs) | Repo standard. |
 | Coding assistant (per worker) | **Claude Code CLI**, headless, driven as a subprocess | "Reuse, don't reinvent." Native session persistence + `--resume` maps onto the crash-resume requirement; tools via MCP. |
-| Model access | **Anthropic API directly** over the internet; key in Key Vault | Anthropic is not first-party on Azure; the workroom already has open egress. Model provider sits behind Claude Code config, so it stays swappable. |
+| Model access | **Anthropic API directly** over the internet; key in Key Vault | Anthropic is not first-party on Azure; the workroom already has open egress. Uses the **commercial API** (no training on inputs/outputs) with **zero-data-retention** enabled where available. Model provider sits behind Claude Code config, so it stays swappable. |
 | Code host | **GitHub App** (per-repo install) · **octocrab** client | Webhooks for events; short-lived **installation tokens** for least-privilege repo access; Checks/PR APIs for gating and handoff. |
 | State / queue / arbitration | **Azure Database for PostgreSQL — Flexible Server** · **sqlx** | One transactional store for the record book, the durable to-do queue (`FOR UPDATE SKIP LOCKED`), and pickup arbitration. Single dependency; same engine locally. |
 | Worker runtime (sealed workroom) | **Azure Container Apps Jobs** (one-shot, per task) | Throwaway by construction; scale-to-zero; managed scaling for many concurrent workers without running a cluster. |
@@ -101,7 +101,7 @@ Reacts to completions in the record book and decides the next step (assign a Cod
 The throwaway workroom. The Rust harness:
 1. Mints/receives a short-lived **GitHub installation token**, does a **fresh shallow clone** of the repo.
 2. Launches **Claude Code headless** with the task prompt and the Factory **MCP** endpoint configured as its tool server.
-3. **Continuously checkpoints** Claude Code's session state (session id / transcript) + the working-tree state to **Blob** (see [Crash-resume](#crash-resume)).
+3. **Continuously checkpoints** Claude Code's session state (session id / transcript) + the working-tree state to **Blob** (see [Crash-resume](#key-workflows)).
 4. On success, Claude Code has opened/updated a change request via Factory Tools; the harness records the outcome and exits; the job is destroyed.
 
 The worker has **no** direct Postgres or Blob credentials — everything goes through Factory Tools (the one exception being model calls straight to Anthropic). Outbound internet is open (builds fetch packages); the trusted-tenant model is assumed per the product spec's non-goals.
@@ -139,9 +139,10 @@ CREATE TABLE work_items (                          -- the durable to-do list / q
     repo_id          uuid NOT NULL REFERENCES repos(id),
     kind             text NOT NULL CHECK (kind IN ('manager','coder','reviewer','tester')),
     worker_name      text NOT NULL,               -- which configured worker
+    config_sha       text NOT NULL,               -- repo config version this item was enqueued under (pinned)
     trigger          text NOT NULL CHECK (trigger IN
                        ('issue_labeled','cr_opened','cr_updated','cr_changes_requested',
-                        'review_requested','schedule','manager')),
+                        'review_requested','issue_comment','schedule','manager')),
     subject_ref      text NOT NULL,               -- "issue#123" | "cr#456"
     correlation_id   uuid NOT NULL,               -- threads telemetry across the lifecycle
     state            text NOT NULL DEFAULT 'queued'
@@ -164,7 +165,7 @@ CREATE UNIQUE INDEX work_items_active_uniq ON work_items (repo_id, subject_ref, 
     WHERE state IN ('queued','leased','running','blocked');
 
 -- SKIP LOCKED pickup: ready, unleased items, oldest-first.
-CREATE INDEX work_items_pickup ON work_items (repo_id, kind, priority DESC, available_at)
+CREATE INDEX work_items_pickup ON work_items (repo_id, worker_name, priority DESC, available_at)
     WHERE state = 'queued';
 
 CREATE TABLE attempts (                            -- one row per worker execution
@@ -242,7 +243,7 @@ CREATE TABLE webhook_deliveries (                  -- dedupe redelivered webhook
 ```sql
 WITH next AS (
   SELECT id FROM work_items
-  WHERE state = 'queued' AND available_at <= now() AND repo_id = $1 AND kind = $2
+  WHERE state = 'queued' AND available_at <= now() AND repo_id = $1 AND worker_name = $2
   ORDER BY priority DESC, available_at
   FOR UPDATE SKIP LOCKED
   LIMIT 1
@@ -253,9 +254,9 @@ UPDATE work_items w
 RETURNING w.*;
 ```
 
-**Capacity caps** are enforced in the same transaction: the dispatcher only leases when `count(state IN ('leased','running')) per (repo_id, kind) < per-worker cap` and the global running count `< limits.max_concurrent_workers`.
+**Capacity caps** are enforced inside the lease transaction, serialized per pool with a `pg_advisory_xact_lock` on `(repo_id, worker_name)` — the advisory-lock pattern the scheduler already uses — so two dispatcher replicas can't both pass the check and overshoot. A lease is granted only when **both** the per-worker count `count(state IN ('leased','running')) WHERE repo_id=$1 AND worker_name=$2 < that worker's max_concurrent` **and** the global count `count(...) WHERE repo_id=$1 < limits.max_concurrent_workers` hold. The global ceiling needs a coarser advisory key (or a `SERIALIZABLE` transaction), since a per-pool lock alone does not serialize the global count.
 
-**Idempotency.** `change_requests.work_item_id` ties a CR to its task, so a re-run's `open_or_update_change_request` finds and updates the *same* CR; `post_comment` dedupes via `dedupe_key`. The partial unique index prevents duplicate live work items.
+**Idempotency.** `change_requests.work_item_id` ties a CR to its task, so a re-run's `open_or_update_change_request` finds and updates the *same* CR; `post_comment`, `submit_review`, and `escalate` dedupe via a `dedupe_key` (one comment / review / escalation per task) so a lease-expiry re-dispatch never duplicates them; the branch push is idempotent too (`git push --force-with-lease` to the task's own branch). The partial unique index prevents duplicate live work items.
 
 **Retention.** A scheduled purge job deletes terminal `work_items` (+ their `attempts`, `escalations`, `events`) older than the bounded period; Blob lifecycle rules expire the linked transcripts/checkpoints. No archive tables — purge in place.
 
@@ -274,7 +275,7 @@ settings:
     This is a Rust workspace — follow AGENTS.md. Prefer small, focused change requests.
 
 limits:
-  max_concurrent_workers: 10     # global ceiling across all workers in this repo
+  max_concurrent_workers: 5      # global ceiling across all workers in this repo (platform default: 5)
 
 workers:
   - name: bug-fixer
@@ -306,7 +307,7 @@ workers:
     max_concurrent: 1
 ```
 
-**Worker model.** `workers:` is a named list; each entry binds a `name` to a `role` (`manager` | `coder` | `reviewer` | `tester`), its triggers, and its caps. The named-list form (vs fixed role blocks) allows multiple workers of the same role (e.g. a `bug-fixer` and a `refactorer`, both coders) and future roles without a schema change.
+**Worker model.** `workers:` is a named list; each entry binds a `name` to a `role` (`manager` | `coder` | `reviewer` | `tester`), its triggers, and its caps. The named-list form (vs fixed role blocks) allows multiple workers of the same role (e.g. a `bug-fixer` and a `refactorer`, both coders) and future roles without a schema change. (The `tester` role and the `review_requested` trigger are reserved for future workflows — no shipped workflow drives them yet.)
 
 **Trigger vocabulary** (`on:`):
 
@@ -317,6 +318,7 @@ workers:
 | `cr_updated` | new commits pushed to a tracked CR |
 | `cr_changes_requested` | a reviewer requested changes (drives the rework loop) |
 | `review_requested` | review explicitly requested on a CR |
+| `issue_comment` | a human comments on / edits a tracked issue or CR — resumes a `blocked` item and carries human steering |
 | `schedule: "<cron>"` | a timer fires (UTC); enqueued by the in-app scheduler |
 | `manager` | the Manager dispatches this worker as a next step |
 
@@ -331,6 +333,8 @@ Later layers append to earlier ones, so a repo can shape behavior without forkin
 
 **Validation & safety.** On each change Factory parses and validates the file before applying it: `version` recognized, every `role` valid, every `cron` parseable, caps positive integers, any `instructions_file` resolvable. **Invalid config is rejected atomically** — Factory keeps the last good config, leaves a comment describing the error, and changes nothing else (fail-safe). The opt-in `label` still gates all action regardless of worker config.
 
+**Mid-flight changes.** Each work item pins the `config_sha` it was enqueued under. An in-flight attempt runs to completion under its **pinned** config (prompt, model, caps); only newly enqueued work uses the updated config. A worker whose definition is removed mid-flight finishes its current attempt and is not re-dispatched.
+
 ## Factory Tools (MCP) surface
 
 The worker's only channel to Factory, exposed by the Tools service as a **remote MCP server over HTTP/SSE**. At job start the dispatcher injects the Tools endpoint URL and a **per-task token**; Claude Code is configured with that MCP server. The token identifies the task, repo, and role; the server resolves all three and authorizes every call against the task's own repo. **All tools are available to every role** — the role is recorded on each call (and the role's prompt steers correct use), but tools are not per-role-gated. Every call is written to the record book + `events` audit log.
@@ -342,14 +346,14 @@ The worker's only channel to Factory, exposed by the Tools service as a **remote
 | `read_change_request` | Read a CR: metadata, diff, review threads | `cr_number` | diff, files, reviews, check summary |
 | `open_or_update_change_request` | Create the CR for this task, or update it if it already exists (**idempotent by work item**) | `title`, `body`, `head_branch`, `base`, `linked_issue` | `cr_number`, url |
 | `post_comment` | Comment on an issue/CR; with `dedupe_key`, updates the same comment on re-run | `target`, `body`, `dedupe_key?` | comment id |
-| `submit_review` | Leave a review verdict on a CR (reviewer role) | `cr_number`, `verdict` (approve\|request_changes\|comment), `body` | review id |
+| `submit_review` | Leave a review verdict on a CR (reviewer role); idempotent by `dedupe_key` | `cr_number`, `verdict` (approve\|request_changes\|comment), `body`, `dedupe_key?` | review id |
 | `get_check_status` | Read required-check states for a ref (to know if CI is green) | `cr_number` or `sha` | per-check conclusion + overall |
 | `append_transcript` | Append a chunk to this run's transcript in Blob | `chunk` | ok |
 | `record_outcome` | Set the attempt's terminal state | `status` (succeeded\|failed\|blocked), `summary` | ok |
 | `heartbeat` | Extend the task lease (liveness) | — | new lease expiry |
-| `escalate` | Raise an escalation: posts a question as an issue/CR comment + assigns a human, marks the item blocked/escalated | `reason`, `context` | escalation id |
+| `escalate` | Raise an escalation: posts a question as an issue/CR comment + assigns a human, marks the item blocked/escalated; idempotent by `dedupe_key` (one escalation per task) | `reason`, `context`, `dedupe_key?` | escalation id |
 
-**Branch push vs CR creation.** The worker pushes its branch directly with the short-lived **git installation token** (a plain git operation). The CR itself and all comments/reviews go through Factory Tools so they are recorded and **idempotent** — a re-run calls `open_or_update_change_request` and `post_comment` (with `dedupe_key`) and updates the *same* objects rather than duplicating them.
+**Branch push vs CR creation.** The worker pushes its branch directly with the short-lived **git installation token**, via `git push --force-with-lease` to the task's own branch — idempotent, so a lease-expiry re-dispatch re-pushes without duplicating or diverging commits. The CR itself and all comments/reviews go through Factory Tools so they are recorded and **idempotent** — a re-run calls `open_or_update_change_request`, `post_comment`, `submit_review`, and `escalate` (each with `dedupe_key`) and updates the *same* objects rather than duplicating them.
 
 **No cross-task lookup.** There is deliberately no "search prior runs / how was this done before?" tool — consistent with the product spec's removal of the "It learns" subsystem. A worker sees only its own task's context.
 
@@ -363,6 +367,8 @@ The worker's only channel to Factory, exposed by the Tools service as a **remote
 
 **Escalation.** When work exhausts retries / hits the loop cap / needs a human decision, the Manager (or worker, for blocked-on-input) writes the question as an **issue/CR comment and assigns the issue** — the single human channel — and records an `escalations` row. Blocked-on-human time does not count against retry/loop caps.
 
+**Blocked → resume on reply (also the human-steer path).** A `blocked: waiting on a human` item has freed its slot and sits in `state='blocked'`. When the human comments on or edits the issue/CR, the `issue_comment` webhook reaches Intake, which flips the matching item to `state='queued'` and sets `available_at = now()`; the next dispatch re-leases it and `claude --resume` continues the *same* session. The same path lets a human **steer** an item proactively (PROD "comment or edit … to steer it"). The dashboard stays read-only by design — steering happens in GitHub, not the dashboard.
+
 ## Requirements traceability
 
 | Product-spec requirement | Mechanism |
@@ -371,7 +377,7 @@ The worker's only channel to Factory, exposed by the Tools service as a **remote
 | Crash resumes the same session | Blob checkpoints + `claude --resume`; lease expiry → re-dispatch. |
 | Safe to redo (idempotent) | `issues`/`change_requests` tracking; Tools update the same CR/comment. |
 | Bounded effort / bounded loops | `attempt_count` + `loop_count` caps in `work_items`; escalate at cap. |
-| Needs human input → ask, don't block | `blocked` state + Tools "ask" writes to issue/CR; freed lease; resume on reply event. |
+| Needs human input → ask, don't block | `blocked` state + `escalate` tool writes the question to issue/CR; freed lease; an `issue_comment` event flips `blocked→queued` and `claude --resume` continues the session. |
 | Stuck workers caught | Lease expiry + sweeper; heartbeats extend leases. |
 | Capped & scalable | Capacity counts in SQL (global + per repo/type); add Container Apps replicas/jobs. |
 | No double-starts | `FOR UPDATE SKIP LOCKED` leasing; works across replicas. |
@@ -379,16 +385,20 @@ The worker's only channel to Factory, exposed by the Tools service as a **remote
 | Records don't pile up | Blob lifecycle expiry + Postgres retention jobs. |
 | Opt-in only | Intake filters on the `factory` label. |
 | Least privilege | GitHub installation tokens (short-lived); Key Vault + Managed Identity; worker → Tools-only, per-task token; can't weaken its own checks. |
-| Confidential by default | Records in Factory's own Postgres/Blob, access-controlled, retention-bounded, not used for training. |
+| Confidential by default | Factory's own records: Postgres/Blob access-controlled, retention-bounded. Code/prompts egressed to Anthropic use the **commercial API under no-train terms + zero-data-retention** — not used for training. |
 | Transparent play-by-play | Transcript in Blob + `events` audit trail; live SSE dashboard. |
-| Always on | Multi-replica Container Apps + Postgres arbitration; survives single-replica loss. |
+| Always on | Multi-replica Container Apps + Postgres arbitration; survives loss of any single **service** replica. **Postgres HA is deferred** (single instance, no zone-redundant HA) — the record book is a known SPOF; see [Infrastructure & sizing](#infrastructure--sizing-azure). |
 | Reuse a capable coding assistant | Claude Code headless per worker. |
+| Prompt pickup (start within minutes) | Synchronous webhook→enqueue + dispatcher polls the ready queue on a short interval (oldest-first); handoff-to-lease is seconds, not hours. |
+| Config version-controlled, auto re-read, no redeploy | `.factory/config.yml` in the repo; Intake/Scheduler re-parse + validate on every push that touches it (atomic apply, last-good retained). |
+| Human can step in / steer | Human comment or edit on the issue/CR arrives as an `issue_comment` webhook → Intake → resumes/steers the item (same path as a blocked-on-human reply). |
 
 ## Security & least privilege
 
 - **Factory services** authenticate to Postgres/Blob/Key Vault via **Managed Identity** — no secrets in images or config.
 - **Workers** receive only a **per-task token** (scoped to one task/repo) for the Tools/MCP endpoint and a **short-lived GitHub installation token** for the clone/PR. No DB/Blob creds. Tokens revoked when the task ends or its lease is reclaimed.
 - **Anthropic key** lives in Key Vault; the worker reads the model endpoint config, the key is injected at job start and never written to the transcript (best-effort secret scrubbing, per the product spec's stated limits).
+- **Model-provider data handling.** Code and prompts sent to Anthropic use the **commercial API**, whose terms do not train on inputs/outputs; **zero-data-retention** is enabled where available so the provider persists nothing. This is what backs the product spec's "never used to train models" for the egressed *code* (not just Factory's own records).
 - A worker **may not modify the automated checks that gate its own work**; such edits are escalated to a human.
 - Trust model is the product spec's: trusted tenant code, no prompt-injection hardening in v1.
 
@@ -442,6 +452,7 @@ Starting values. Per-repo `.factory/config.yml` may override the **capacity caps
 | Failed-attempt retries | **3** | Then escalate. |
 | Per-issue review-rework loop cap | **5** | Coder↔Reviewer cycles; then escalate. |
 | Deterministic-crash resumes | **3** | Before falling through to a fresh attempt / escalation. |
+| Dispatcher poll interval | **5 s** | Ready-queue scan cadence (backs prompt-pickup-in-minutes). |
 | Worker lease | **15 min** | Extended by heartbeat; sweeper reclaims past expiry. |
 | Heartbeat interval | **60 s** | Via the Tools `heartbeat` call. |
 | Per-attempt wall-clock cap | **30 min** | Attempt killed + reclaimed past this. |
