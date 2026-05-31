@@ -950,19 +950,24 @@ mod acceptance {
         let manager_item =
             enqueue_item(&pool, repo, record::Kind::Manager, manager, "issue#1").await;
         mark_succeeded(&pool, manager_item).await;
+        let manager_updated_at = record::work_item_by_id(&pool, manager_item)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at;
         assert!(
-            record::mark_reacted(&pool, manager_item).await.unwrap(),
+            record::mark_reacted(&pool, manager_item, manager_updated_at)
+                .await
+                .unwrap(),
             "simulate the migration backfill: mark the pre-existing terminal row reacted"
         );
 
-        let acted = coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
 
-        // The tick acted on ZERO items for this already-reacted row, enqueued no coder,
-        // left the issue untouched, and made no GitHub calls.
-        assert_eq!(
-            acted, 0,
-            "an already-reacted terminal item is acted on zero times"
-        );
+        // The tick did nothing for this already-reacted row: enqueued no coder, left the
+        // issue untouched, and made no GitHub calls. (We assert the no-op on OUR repo's
+        // state and FakeGitHub, not on `coordinator_tick`'s GLOBAL acted-count, which can
+        // include a concurrent crate's transient terminal items in the shared record book.)
         assert!(
             find_item(&pool, repo, record::Kind::Coder, "issue#1")
                 .await
@@ -1001,7 +1006,16 @@ mod acceptance {
             .await
             .expect("the bootstrap coder item");
         mark_succeeded(&pool, first_coder).await;
-        assert!(record::mark_reacted(&pool, first_coder).await.unwrap());
+        let first_coder_updated_at = record::work_item_by_id(&pool, first_coder)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at;
+        assert!(
+            record::mark_reacted(&pool, first_coder, first_coder_updated_at)
+                .await
+                .unwrap()
+        );
 
         // The reviewer requests changes repeatedly. Each cycle: a reviewer item for
         // the CR requests changes and succeeds; the coordinator increments the loop
@@ -1120,7 +1134,14 @@ mod acceptance {
         // Retire coder A so it does not occupy the active (repo, issue#1, coder) slot
         // (the rework dispatch must be able to enqueue a fresh coder for the issue).
         mark_succeeded(&pool, coder_a).await;
-        assert!(record::mark_reacted(&pool, coder_a).await.unwrap());
+        let coder_a_updated_at = record::work_item_by_id(&pool, coder_a)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at;
+        assert!(record::mark_reacted(&pool, coder_a, coder_a_updated_at)
+            .await
+            .unwrap());
 
         // Coder B is the rework coder for the SAME issue (a NEW work item). Enqueue it
         // and drive its open_or_update_change_request with the SAME deterministic head
@@ -1859,12 +1880,19 @@ mod acceptance {
             .await
             .unwrap();
 
-        assert_eq!(
-            coordinator_tick(&pool, gh.as_ref()).await.unwrap(),
-            1,
-            "the escalated item is reacted exactly once"
-        );
+        // The tick reacts to our escalated item; it must end up reacted exactly once.
+        // (`coordinator_tick` returns a GLOBAL acted-count over the whole shared record
+        // book, so it can include another concurrent crate's transient terminal items —
+        // we therefore assert the exactly-once react on OUR item directly, not on that
+        // global count.)
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
         assert!(is_reacted(&pool, item).await, "the item is marked reacted");
+        // A second tick is a no-op for our item (it is already reacted): exactly once.
+        coordinator_tick(&pool, gh.as_ref()).await.unwrap();
+        assert!(
+            is_reacted(&pool, item).await,
+            "the item stays reacted across a second tick — reacted exactly once"
+        );
 
         // No new escalation row for the item, and no new work item was enqueued.
         assert_eq!(

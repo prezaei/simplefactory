@@ -19,5 +19,18 @@ DROP INDEX change_requests_by_item;
 
 -- The CR identity is now the head branch (one CR per branch per repo). `head_branch`
 -- is NOT NULL, so every CR participates.
+--
+-- The old per-work-item keying allowed duplicate (repo_id, head_branch) rows (esp.
+-- while `number` was still NULL), which would make the unique index below fail on an
+-- upgraded DB. Dedup first, keeping ONE row per (repo_id, head_branch): prefer the most
+-- "advanced" row — a non-null `number` first, then the most recent `updated_at`, with
+-- ctid as a deterministic tiebreaker. On a fresh DB this affects 0 rows.
+DELETE FROM change_requests a
+ USING change_requests b
+ WHERE a.repo_id = b.repo_id
+   AND a.head_branch = b.head_branch
+   AND ((a.number IS NOT NULL), a.updated_at, a.ctid)
+     < ((b.number IS NOT NULL), b.updated_at, b.ctid);
+
 CREATE UNIQUE INDEX change_requests_by_branch
     ON change_requests (repo_id, head_branch);

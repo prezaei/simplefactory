@@ -238,7 +238,7 @@ async fn react_to_item(
 
     // Claim the item INSIDE the tx: exactly one replica wins. If we don't win, the
     // item was already reacted — roll back and skip.
-    if !record::mark_reacted(&mut *tx, item.id).await? {
+    if !record::mark_reacted(&mut *tx, item.id, item.updated_at).await? {
         tx.rollback().await?;
         return Ok(false);
     }

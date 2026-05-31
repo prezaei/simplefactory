@@ -896,9 +896,17 @@ pub async fn upsert_change_request_for_item(
         "INSERT INTO change_requests (id, repo_id, work_item_id, head_branch, linked_issue)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (repo_id, head_branch)
-           DO UPDATE SET work_item_id = EXCLUDED.work_item_id,
-                         linked_issue = COALESCE(EXCLUDED.linked_issue, change_requests.linked_issue),
-                         updated_at = now()
+           DO UPDATE SET
+             -- A late/retried coder tool call on the same deterministic branch must NOT
+             -- drag a CR that already advanced to a terminal-ish state ('ready', 'merged',
+             -- 'closed') back by stealing its `work_item_id` or bumping `updated_at`. For
+             -- those states the SET is a no-op (row still RETURNED so the contract holds);
+             -- non-terminal rows are re-pointed/refreshed as before (the rework loop).
+             work_item_id = CASE WHEN change_requests.factory_state IN ('ready', 'merged', 'closed')
+                                 THEN change_requests.work_item_id ELSE EXCLUDED.work_item_id END,
+             linked_issue = COALESCE(EXCLUDED.linked_issue, change_requests.linked_issue),
+             updated_at   = CASE WHEN change_requests.factory_state IN ('ready', 'merged', 'closed')
+                                 THEN change_requests.updated_at ELSE now() END
          RETURNING id, repo_id, number, head_branch, linked_issue, work_item_id, factory_state",
     )
     .bind(Uuid::now_v7())
@@ -912,12 +920,24 @@ pub async fn upsert_change_request_for_item(
 }
 
 /// Record the CR number once the worker has opened it on GitHub.
+///
+/// Setting the number never DOWNGRADES a terminal-ish CR ('ready', 'merged', 'closed')
+/// back to 'open': a late/retried coder tool call on the same deterministic branch could
+/// otherwise drag a CR that already advanced (e.g. to 'ready' after review approval) back
+/// to 'open'. Terminal-ish states are preserved; only non-terminal CRs move to 'open'.
 pub async fn set_change_request_number(pool: &Pool, cr_id: Uuid, number: i32) -> Result<()> {
-    sqlx::query("UPDATE change_requests SET number = $2, factory_state = 'open', updated_at = now() WHERE id = $1")
-        .bind(cr_id)
-        .bind(number)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE change_requests
+            SET number = $2,
+                factory_state = CASE WHEN factory_state IN ('ready', 'merged', 'closed')
+                                     THEN factory_state ELSE 'open' END,
+                updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(cr_id)
+    .bind(number)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1253,17 +1273,29 @@ pub async fn list_unreacted_terminal(pool: &Pool) -> Result<Vec<WorkItem>> {
 /// Executor-generic so the coordinator can run this as the claim INSIDE its
 /// per-react transaction (binding the claim and the decision writes atomically),
 /// while existing callers passing `&pool` still work (`&Pool: PgExecutor`).
-pub async fn mark_reacted(executor: impl sqlx::PgExecutor<'_>, work_item_id: Uuid) -> Result<bool> {
+pub async fn mark_reacted(
+    executor: impl sqlx::PgExecutor<'_>,
+    work_item_id: Uuid,
+    expected_updated_at: DateTime<Utc>,
+) -> Result<bool> {
     // Do NOT touch `updated_at`: it records when the item became TERMINAL, and both
     // `purge_terminal` retention and the coordinator's `WorkItem.updated_at` defer-grace
     // anchor rely on that meaning. Bumping it on the react claim would make an old
     // terminal row look newly terminal (retained longer; stale grace window).
+    //
+    // The claim is tied to the EXACT terminal occurrence via `updated_at`: a requeue
+    // (`requeue_for_retry`) revives the row and bumps `updated_at`, so a stale snapshot
+    // listed at the old terminal time can no longer re-claim it even though `reacted`
+    // was reset to false. This closes the double-react race where two replicas list the
+    // same Failed row at T0, one requeues it (reacted=false again), and the other would
+    // otherwise re-run the failed decision on its stale snapshot.
     let row = sqlx::query(
         "UPDATE work_items SET reacted = true
-          WHERE id = $1 AND NOT reacted
+          WHERE id = $1 AND NOT reacted AND updated_at = $2
          RETURNING id",
     )
     .bind(work_item_id)
+    .bind(expected_updated_at)
     .fetch_optional(executor)
     .await?;
     Ok(row.is_some())

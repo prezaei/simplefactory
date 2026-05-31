@@ -845,3 +845,238 @@ async fn requeue_for_retry_resets_state_attempts_and_reacted() {
         "reacted reset so a later terminal occurrence is reacted again"
     );
 }
+
+#[tokio::test]
+async fn mark_reacted_with_stale_updated_at_does_not_double_react_after_requeue() {
+    // The double-react race: two replicas list the SAME failed item at terminal time T0.
+    // Replica A claims it and requeues it (state=queued, reacted=false, updated_at bumped
+    // to T1). Replica B, holding a stale snapshot showing updated_at=T0, must NOT be able
+    // to re-claim it even though `reacted` is false again — its claim is anchored to the
+    // exact terminal occurrence via updated_at, so the stale claim fails.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("double-react"), 1)
+        .await
+        .unwrap();
+    let EnqueueOutcome::Inserted(id) = record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap()
+    else {
+        panic!("fresh insert");
+    };
+    // Drive it to a terminal failed occurrence; updated_at becomes the terminal anchor T0.
+    record::set_state(&pool, id, State::Failed).await.unwrap();
+    let listed = record::list_unreacted_terminal(&pool).await.unwrap();
+    let listed = listed
+        .into_iter()
+        .find(|w| w.id == id)
+        .expect("failed item listed as unreacted terminal");
+    let t0 = listed.updated_at;
+
+    // Replica A wins the claim at T0, then requeues (bumping updated_at to T1 != T0).
+    assert!(
+        record::mark_reacted(&pool, id, t0).await.unwrap(),
+        "replica A wins the single legitimate claim at the terminal occurrence"
+    );
+    record::requeue_for_retry(&pool, id).await.unwrap();
+    let after = record::work_item_by_id(&pool, id).await.unwrap().unwrap();
+    assert_ne!(
+        after.updated_at, t0,
+        "requeue advances updated_at off the terminal anchor"
+    );
+    assert_eq!(after.state, State::Queued, "requeued back to queued");
+
+    // Replica B's stale claim at the ORIGINAL terminal updated_at must fail, even though
+    // `reacted` is false again after the requeue — no stale re-claim, no second decide.
+    assert!(
+        !record::mark_reacted(&pool, id, t0).await.unwrap(),
+        "stale claim at the old terminal updated_at does not re-claim the requeued row"
+    );
+    let reacted: bool = sqlx::query_scalar("SELECT reacted FROM work_items WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !reacted,
+        "the requeued (active) row is left unreacted by the rejected stale claim"
+    );
+}
+
+#[tokio::test]
+async fn mark_reacted_single_claim_with_matching_updated_at_succeeds_once() {
+    // The normal single-claim path: a claim with the matching terminal updated_at wins
+    // exactly once; a second claim with the same updated_at loses (reacted is now true).
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("single-claim"), 1)
+        .await
+        .unwrap();
+    let EnqueueOutcome::Inserted(id) = record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap()
+    else {
+        panic!("fresh insert");
+    };
+    record::set_state(&pool, id, State::Failed).await.unwrap();
+    let item = record::work_item_by_id(&pool, id).await.unwrap().unwrap();
+    let t0 = item.updated_at;
+
+    assert!(
+        record::mark_reacted(&pool, id, t0).await.unwrap(),
+        "first claim with the matching terminal updated_at wins"
+    );
+    assert!(
+        !record::mark_reacted(&pool, id, t0).await.unwrap(),
+        "second claim with the same updated_at loses (already reacted)"
+    );
+}
+
+#[tokio::test]
+async fn upsert_cr_preserves_terminal_state_and_owner_against_stale_coder() {
+    // A CR that already advanced to a terminal-ish state ('ready') must NOT be dragged
+    // back to 'open' nor have its work_item_id stolen by a late/retried coder tool call
+    // on the same deterministic branch. This mirrors the two record-layer writes that
+    // `open_or_update_change_request` performs in sequence: upsert_change_request_for_item
+    // then set_change_request_number.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("cr-terminal-guard"), 1)
+        .await
+        .unwrap();
+    let branch = "factory/issue-9";
+
+    // Work item A opens the CR on the branch and it advances through 'open' to 'ready'.
+    let EnqueueOutcome::Inserted(item_a) = record::enqueue(&pool, &coder_item(repo, "issue#9"))
+        .await
+        .unwrap()
+    else {
+        panic!("fresh insert A");
+    };
+    let cr = record::upsert_change_request_for_item(&pool, repo, item_a, branch, Some(9))
+        .await
+        .unwrap();
+    record::set_change_request_number(&pool, cr.id, 42)
+        .await
+        .unwrap();
+    record::set_change_request_state(&pool, cr.id, "ready")
+        .await
+        .unwrap();
+    // Coder A finishes (terminal) so it no longer occupies the active
+    // (repo, issue#9, coder) dedup slot — letting the rework coder B enqueue.
+    record::set_state(&pool, item_a, State::Succeeded)
+        .await
+        .unwrap();
+
+    // Work item B is a stale/retried coder pushing the SAME branch.
+    let EnqueueOutcome::Inserted(item_b) = record::enqueue(&pool, &coder_item(repo, "issue#9"))
+        .await
+        .unwrap()
+    else {
+        panic!("fresh insert B");
+    };
+    let returned = record::upsert_change_request_for_item(&pool, repo, item_b, branch, Some(9))
+        .await
+        .unwrap();
+    // Contract still holds: the same CR row is returned...
+    assert_eq!(returned.id, cr.id, "same CR row returned");
+    // ...but the terminal-ish state and original owner are preserved.
+    assert_eq!(
+        returned.factory_state, "ready",
+        "terminal-ish state not dragged back by the stale upsert"
+    );
+    assert_eq!(
+        returned.work_item_id,
+        Some(item_a),
+        "original owner not stolen by the stale upsert"
+    );
+
+    // The follow-up set_change_request_number must NOT downgrade 'ready' to 'open'.
+    record::set_change_request_number(&pool, cr.id, 42)
+        .await
+        .unwrap();
+    let after = record::change_request_by_number(&pool, repo, 42)
+        .await
+        .unwrap()
+        .expect("CR by number");
+    assert_eq!(
+        after.factory_state, "ready",
+        "set_change_request_number does not downgrade a terminal-ish CR"
+    );
+    assert_eq!(
+        after.work_item_id,
+        Some(item_a),
+        "owner still preserved after set_change_request_number"
+    );
+}
+
+#[tokio::test]
+async fn upsert_cr_rework_path_repoints_and_reopens_non_terminal_cr() {
+    // The normal rework path is unchanged: a non-terminal CR (here 'changes_requested')
+    // is re-pointed to the new rework coder and set_change_request_number reopens it.
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("cr-rework-path"), 1)
+        .await
+        .unwrap();
+    let branch = "factory/issue-12";
+
+    let EnqueueOutcome::Inserted(item_a) = record::enqueue(&pool, &coder_item(repo, "issue#12"))
+        .await
+        .unwrap()
+    else {
+        panic!("fresh insert A");
+    };
+    let cr = record::upsert_change_request_for_item(&pool, repo, item_a, branch, Some(12))
+        .await
+        .unwrap();
+    record::set_change_request_number(&pool, cr.id, 77)
+        .await
+        .unwrap();
+    // Reviewer requested changes: a non-terminal state.
+    record::set_change_request_state(&pool, cr.id, "changes_requested")
+        .await
+        .unwrap();
+    // Coder A finishes (terminal) so the rework coder B can claim the active slot.
+    record::set_state(&pool, item_a, State::Succeeded)
+        .await
+        .unwrap();
+
+    // The rework coder pushes the same branch: the row is re-pointed to it.
+    let EnqueueOutcome::Inserted(item_b) = record::enqueue(&pool, &coder_item(repo, "issue#12"))
+        .await
+        .unwrap()
+    else {
+        panic!("fresh insert B");
+    };
+    let returned = record::upsert_change_request_for_item(&pool, repo, item_b, branch, Some(12))
+        .await
+        .unwrap();
+    assert_eq!(returned.id, cr.id, "same CR row reused");
+    assert_eq!(
+        returned.work_item_id,
+        Some(item_b),
+        "non-terminal CR re-pointed to the rework coder"
+    );
+
+    record::set_change_request_number(&pool, cr.id, 77)
+        .await
+        .unwrap();
+    let after = record::change_request_by_number(&pool, repo, 77)
+        .await
+        .unwrap()
+        .expect("CR by number");
+    assert_eq!(
+        after.factory_state, "open",
+        "non-terminal CR reopened on set_change_request_number"
+    );
+    assert_eq!(
+        after.work_item_id,
+        Some(item_b),
+        "rework coder remains the owner"
+    );
+}
