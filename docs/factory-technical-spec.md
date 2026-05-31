@@ -40,7 +40,7 @@ flowchart LR
       IN["Intake API<br/>(Axum, verifies sig)"]
       SCH["Scheduler<br/>(timers from config)"]
       DISP["Dispatcher<br/>(capacity caps · SKIP LOCKED)"]
-      MGR["Coordinator / Manager<br/>(decides next step)"]
+      MGR["Coordinator<br/>(decides next step)"]
       TOOLS["Factory Tools<br/>(MCP server)"]
       API["Dashboard API<br/>(Axum + SSE)"]
       SWEEP["Lease sweeper<br/>(stuck-worker reclaim)"]
@@ -94,17 +94,30 @@ Single source of truth. The to-do list is a table; the dispatcher leases rows wi
 ### Dispatcher
 Polls the queue under capacity caps (global + per repo-and-worker-type, enforced as counts in SQL). For each leased task it starts a Container Apps Job execution, injecting a **per-task scoped token** and the task id. The lease has an expiry; the worker heartbeats via the Tools API to extend it.
 
-### Coordinator / Manager
-Reacts to completions in the record book and decides the next step (assign a Coder, wake a Reviewer on a new CR, hand an approved+green CR to a human, close the loop, or escalate). It only decides and delegates — it enqueues new work items; it never writes code. Runs as replicas; per-issue decisions are serialized with a row lock on the issue.
+### Coordinator
+The **deterministic** orchestrator — **never** calls a model. Reacts to completions in the record book and decides the next step (assign a Coder, wake a Reviewer on a new CR, hand an approved+green CR to a human, close the loop, or escalate). It only decides and delegates — it enqueues new work items; it never writes code. Runs as replicas; per-issue decisions are serialized with a row lock on the issue.
+
+> **"Manager" disambiguation.** The Coordinator is *not* the **Manager role**. The Manager is an **AI worker role** (see [Worker lifecycle by role](#worker-lifecycle-by-role)) that triages an issue via Claude; the Coordinator is the AI-free Rust service that reacts to that triage (and to coder/reviewer outcomes) and routes the next step. Earlier drafts called the Coordinator "Coordinator / Manager"; that alias is dropped to keep the two distinct.
 
 ### Worker harness + Claude Code (Container Apps Job)
 The throwaway workroom. The Rust harness:
 1. Mints/receives a short-lived **GitHub installation token**, does a **fresh shallow clone** of the repo.
 2. Launches **Claude Code headless** with the task prompt and the Factory **MCP** endpoint configured as its tool server.
 3. **Continuously checkpoints** Claude Code's session state (session id / transcript) + the working-tree state to **Blob** (see [Crash-resume](#key-workflows)).
-4. On success, Claude Code has opened/updated a change request via Factory Tools; the harness records the outcome and exits; the job is destroyed.
+4. On success, the harness performs the **role's terminal action** via Factory Tools (see below), records the outcome, and exits; the job is destroyed.
 
 The worker has **no** direct Postgres or Blob credentials — everything goes through Factory Tools (the one exception being model calls straight to Anthropic). Outbound internet is open (builds fetch packages); the trusted-tenant model is assumed per the product spec's non-goals.
+
+#### Worker lifecycle by role
+Every role runs Claude Code over the same MCP/Tools channel, but the harness's terminal action differs by `role` (only the **Coder** produces a change request):
+
+| Role | Reads | Claude does | Terminal action (via Tools) | Produces a CR? |
+| --- | --- | --- | --- | --- |
+| **Manager** | the issue (`read_issue`) | triages: decide scope / actionability | `post_comment` / label / `escalate`; `record_outcome` → the Coordinator then assigns a Coder | **No** |
+| **Coder** | the issue / CR | writes code on a fresh clone | push branch → `open_or_update_change_request` → `record_outcome` | **Yes** (the only role that does) |
+| **Reviewer** | the CR (`read_change_request`) | reviews the diff + checks | `submit_review` verdict (approve / request changes) → `record_outcome` | **No** |
+
+A Manager or Reviewer therefore never pushes a branch or opens a CR. (The Coder→CR lifecycle ships in P3; the Manager-triage and Reviewer-verdict lifecycles are **P4.5** in the implementation plan.)
 
 ### Factory Tools (MCP server)
 Axum-hosted MCP server exposing the worker's only channel to Factory: read the ticket/diff, open/update the change request, leave a comment, submit a review, read check status, append to the transcript, record outcome, heartbeat the lease, raise an escalation. A worker sees only its own task's context (no cross-task lookup). Authenticates the per-task token, enforces that a token may only act on its own task/repo, and writes every call to the record book + audit log. Tools (not the worker) own writes to Postgres/Blob. Full surface in [Factory Tools (MCP) surface](#factory-tools-mcp-surface).
