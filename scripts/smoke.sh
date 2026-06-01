@@ -7,8 +7,8 @@
 #
 # Scenarios (deterministically observable):
 #   happy   issue labeled → manager triage → coder change-request → reviewer verdict
-#   rework  human "changes requested" review on the CR → coder reworks → CR head advances
-#   crash   kill the worker mid-run → sweeper reclaims → re-dispatch resumes → CR produced
+#   rework  "changes requested" review → a coder runs on the SAME CR (no duplicate CR)
+#   crash   kill the worker mid-run → sweeper reclaims → the issue still produces a CR
 #   config  push a .factory/config.yml change → it reloads and still drives the loop
 #
 # Usage:
@@ -86,7 +86,7 @@ scenario_happy() {
     "Factory smoke. Add a small documented \`hello()\` function and a test for it.")"
   ok "opened + labelled issue #$issue"
   if ! wait_for "a work item for the issue" \
-      "work_items_json | jq -e --arg n '$issue' '[.[]|select((.subject_ref//\"\")|test(\$n))]|length>0' >/dev/null && echo seen" >/dev/null; then
+      "work_items_json | jq -e --arg n '$issue' '[.[]|select(.subject_ref==("issue#"+$n))]|length>0' >/dev/null && echo seen" >/dev/null; then
     set_result happy FAIL; die "no work item enqueued for #$issue (webhook delivered? config loaded?)"
   fi
   ok "manager picked up the issue"
@@ -169,7 +169,7 @@ scenario_config() {
   local issue
   issue="$(open_labelled_issue "[smoke] config reload probe" "Probe that config reloaded; no action needed.")"
   if wait_for "a work item after the config reload" \
-      "work_items_json | jq -e --arg n '$issue' '[.[]|select((.subject_ref//\"\")|test(\$n))]|length>0' >/dev/null && echo seen" >/dev/null; then
+      "work_items_json | jq -e --arg n '$issue' '[.[]|select(.subject_ref==("issue#"+$n))]|length>0' >/dev/null && echo seen" >/dev/null; then
     ok "config reloaded and still drives intake"
     set_result config PASS
   else

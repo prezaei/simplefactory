@@ -130,11 +130,13 @@ FACTORY_SMOKE_REPO="$REPO" ./scripts/smoke.sh happy           # a subset (positi
 
 With no arguments it runs all scenarios: **config** (push reloads `.factory/config.yml`),
 **happy** (issue → manager triage → coder change-request → reviewer verdict), **rework**
-(a human "changes requested" review → the coder reworks → the CR head advances), and
-**crash** (kill the worker container mid-run → the sweeper reclaims the lapsed lease →
-the dispatcher re-dispatches → the resumed worker, restored from its Blob checkpoint via
-`claude --resume`, still produces the CR). Select a subset with positional args, e.g.
-`./scripts/smoke.sh happy crash`. It prints a PASS/FAIL matrix at the end.
+(a "changes requested" review → a coder runs on the **same** CR, with **no duplicate CR**
+opened — it does not require a new commit, since whether claude makes one is its own
+judgment), and **crash** (kill the worker container mid-run → the sweeper reclaims the
+lapsed lease → the dispatcher re-dispatches → the issue **still produces a CR**). Reclaim
+latency is the lease TTL — set `FACTORY_LEASE_TTL_SECS` low (e.g. 120) for a fast crash
+run. Select a subset with positional args, e.g. `./scripts/smoke.sh happy crash`. It
+prints a PASS/FAIL matrix at the end.
 
 Observe live at the dashboard: `http://localhost:8082/` (work items, events, SSE).
 Transcripts land in the Azurite `transcripts` container; checkpoints in `checkpoints`
