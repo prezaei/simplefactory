@@ -4,7 +4,7 @@
 //! [`TranscriptStore`] is a trait so callers depend on behavior, not on a live
 //! object store: [`InMemoryTranscripts`] is the test double, [`FsTranscripts`]
 //! gives local-parity persistence, and an Azure Blob / Azurite implementation is
-//! the P7 swap (see `docs/factory-implementation-plan.md`). Session/worktree
+//! the P8 swap (see `docs/factory-implementation-plan.md`). Session/worktree
 //! checkpoints (also Blob) land in P5.
 #![forbid(unsafe_code)]
 
@@ -125,7 +125,7 @@ impl TranscriptStore for FsTranscripts {
 /// re-dispatch after a crash can restore it and `claude --resume`. Unlike the
 /// append-only transcript, a checkpoint is the latest-wins whole-snapshot blob.
 /// [`InMemoryCheckpoints`] is the test double, [`FsCheckpoints`] gives local-parity
-/// persistence, and an Azure Blob implementation is the P7 swap.
+/// persistence, and an Azure Blob implementation is the P8 swap.
 #[async_trait::async_trait]
 pub trait CheckpointStore: Send + Sync {
     /// Write (overwrite) the checkpoint at `uri`.
