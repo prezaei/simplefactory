@@ -37,7 +37,10 @@ async fn main() -> anyhow::Result<()> {
     // the SOLE production store, same Blob backend as worker checkpoints. Required:
     // there is no filesystem fallback (a dev/prod fork we deliberately removed).
     let blob_conn = std::env::var("FACTORY_BLOB_CONNECTION_STRING")
-        .map_err(|_| anyhow::anyhow!("FACTORY_BLOB_CONNECTION_STRING is required"))?;
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("FACTORY_BLOB_CONNECTION_STRING is required"))?;
     let blob: Arc<dyn factory_blob::TranscriptStore> = Arc::new(
         factory_blob::AzureBlobTranscripts::connect(
             &blob_conn,

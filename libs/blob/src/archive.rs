@@ -111,13 +111,14 @@ mod tests {
         d
     }
 
-    // A cheap unique suffix without pulling in the uuid crate for a test.
+    // A cheap unique suffix without pulling in the uuid crate for a test. A
+    // process-local counter + PID is collision-free under parallel test execution
+    // (unlike SystemTime, whose resolution is platform-dependent and can repeat).
     fn uuid_like() -> u128 {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        (u128::from(std::process::id()) << 64) | u128::from(n)
     }
 
     #[test]

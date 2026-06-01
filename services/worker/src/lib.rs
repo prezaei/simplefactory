@@ -374,7 +374,14 @@ pub async fn checkpoint_loop(
 /// (the live worker container sets it); unset (tests/dev) → `None`, so a checkpoint never
 /// tars a developer's real `~/.claude`.
 fn claude_session_dir() -> Option<PathBuf> {
-    std::env::var("CLAUDE_CONFIG_DIR").ok().map(PathBuf::from)
+    // Trim + treat empty/whitespace as unset: an empty CLAUDE_CONFIG_DIR would become
+    // PathBuf("") → the current working directory, so a checkpoint could tar an
+    // unintended tree. Only an explicit, non-empty path opts the session dir in.
+    std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 /// The named roots a checkpoint captures: always the worktree, plus the `claude` session

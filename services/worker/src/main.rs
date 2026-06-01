@@ -525,7 +525,13 @@ async fn load_config() -> anyhow::Result<HarnessConfig> {
     // Checkpoints persist to Azure Blob (Azurite locally in P7, real Azure in P8) so
     // they survive the worker container for crash-resume. This is the SOLE production
     // store — there is no filesystem fallback (a dev/prod fork we deliberately removed).
-    let blob_conn = env_var("FACTORY_BLOB_CONNECTION_STRING")?;
+    // Trim + reject empty so a blank/whitespace env value fails clearly here, not as an
+    // opaque connection-string parse error later (matches WorkerRuntime::from_env).
+    let blob_conn = std::env::var("FACTORY_BLOB_CONNECTION_STRING")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("FACTORY_BLOB_CONNECTION_STRING is required"))?;
     let checkpoint_store = factory_blob::AzureBlobCheckpoints::connect(
         &blob_conn,
         factory_blob::DEFAULT_CHECKPOINT_CONTAINER,
