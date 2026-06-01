@@ -431,12 +431,26 @@ const MANAGER_TRIAGE_DEDUPE_KEY: &str = "manager-triage";
 /// Stable dedupe key for the Reviewer's verdict, so a re-dispatch submits one review.
 const REVIEWER_VERDICT_DEDUPE_KEY: &str = "reviewer-verdict";
 
+/// Max attempts for a Tools call that returns 409 Conflict (a concurrent attempt
+/// holds the idempotency claim). The first try plus retries; after this many 409s we
+/// give up and surface the error.
+const TOOLS_CONFLICT_MAX_ATTEMPTS: u32 = 6;
+
+/// Bounded exponential backoff before retrying a 409 Conflict: 50ms, 100ms, 200ms, …
+/// capped at 1s. `attempt` is 1-based (the attempt that just got a 409).
+fn tools_conflict_backoff(attempt: u32) -> std::time::Duration {
+    let ms = 50u64.saturating_mul(1u64 << attempt.saturating_sub(1).min(5));
+    std::time::Duration::from_millis(ms.min(1000))
+}
+
 /// Real Tools client over HTTP — the worker's live seam to the Tools service.
 ///
 /// Every call targets `POST {base}/tools/{tool}` (the only surface the Tools
 /// router serves) and carries `Authorization: Bearer <task_token>`. Lives in the
 /// library (not just the binary) so an integration test can drive the REAL client
-/// against a real `build_router`, proving the two seams actually connect.
+/// against a real `build_router`, proving the two seams actually connect. A 409
+/// Conflict (idempotency claim held by a concurrent attempt) is retried with bounded
+/// backoff — see [`call_tool`](HttpTools::call_tool).
 pub struct HttpTools {
     base_url: String,
     task_token: String,
@@ -465,15 +479,37 @@ impl HttpTools {
         tool: &str,
         body: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
-        let resp = self
-            .http
-            .post(self.tool_url(tool))
-            .bearer_auth(&self.task_token)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(resp.json().await?)
+        let url = self.tool_url(tool);
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let resp = self
+                .http
+                .post(&url)
+                .bearer_auth(&self.task_token)
+                .json(&body)
+                .send()
+                .await?;
+            // Tools returns 409 Conflict when a CONCURRENT attempt holds the same
+            // idempotency claim (a lease-expiry re-dispatch overlapping the original
+            // run). That is a transient race the claim is meant to absorb — NOT a task
+            // failure. Retry a bounded number of times so the re-dispatched worker waits
+            // for the in-flight action to complete/dedupe instead of recording a spurious
+            // `failed`. Applies to every Tools call (open CR, comment, review, escalate).
+            if resp.status() == reqwest::StatusCode::CONFLICT
+                && attempt < TOOLS_CONFLICT_MAX_ATTEMPTS
+            {
+                tracing::info!(
+                    tool,
+                    attempt,
+                    "HttpTools: 409 conflict (idempotency claim in flight); retrying"
+                );
+                tokio::time::sleep(tools_conflict_backoff(attempt)).await;
+                continue;
+            }
+            let resp = resp.error_for_status()?;
+            return Ok(resp.json().await?);
+        }
     }
 }
 
@@ -613,6 +649,18 @@ mod tests {
             t2.tool_url("record_outcome"),
             "https://tools.test/tools/record_outcome"
         );
+    }
+
+    #[test]
+    fn tools_conflict_backoff_grows_then_caps() {
+        // 1-based attempts: 50, 100, 200, 400, 800, then capped at 1000ms.
+        assert_eq!(tools_conflict_backoff(1).as_millis(), 50);
+        assert_eq!(tools_conflict_backoff(2).as_millis(), 100);
+        assert_eq!(tools_conflict_backoff(3).as_millis(), 200);
+        assert_eq!(tools_conflict_backoff(5).as_millis(), 800);
+        // Capped (and no overflow at large attempt counts).
+        assert_eq!(tools_conflict_backoff(6).as_millis(), 1000);
+        assert_eq!(tools_conflict_backoff(100).as_millis(), 1000);
     }
 
     #[test]

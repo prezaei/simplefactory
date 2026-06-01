@@ -407,3 +407,56 @@ async fn reviewer_lifecycle_over_the_wire_submits_verdict_and_opens_no_cr() {
 
     server.abort();
 }
+
+// ---------------------------------------------------------------------------
+// HttpTools retries a transient 409 Conflict (Tools idempotency claim held by a
+// concurrent attempt) instead of surfacing it as a failure.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[tokio::test]
+async fn http_tools_retries_409_conflict_then_succeeds() {
+    use axum::http::StatusCode as Sc;
+    use axum::routing::post;
+    use axum::Json;
+
+    // A mock Tools endpoint that returns 409 on the first call, then 200.
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let hits_route = hits.clone();
+    let app = axum::Router::new().route(
+        "/tools/heartbeat",
+        post(move || {
+            let n = hits_route.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    (
+                        Sc::CONFLICT,
+                        Json(serde_json::json!({"error":"claim in flight"})),
+                    )
+                } else {
+                    (Sc::OK, Json(serde_json::json!({"ok":true})))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let tools = HttpTools::new(format!("http://{addr}"), "tok".into());
+    // heartbeat() goes through call_tool; it must succeed despite the first 409.
+    tools
+        .heartbeat()
+        .await
+        .expect("heartbeat retries past the 409 and succeeds");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "first call 409'd, the retry succeeded (exactly two attempts)"
+    );
+
+    server.abort();
+}
