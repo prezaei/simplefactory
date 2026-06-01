@@ -147,10 +147,14 @@ async fn get_optional(container: &ContainerClient, uri: &str) -> anyhow::Result<
 }
 
 /// True when an Azure error is a 404 for a missing *blob* — mapped to the
-/// `None`/empty read semantics the store traits promise. A 404 with a *different*
-/// error code (e.g. `ContainerNotFound` — a misconfiguration, not "no checkpoint
-/// yet") is NOT swallowed: it propagates so a real fault can't masquerade as an
-/// empty/absent value (which would silently abandon a recoverable checkpoint).
+/// `None`/empty read semantics the store traits promise. A 404 explicitly labelled
+/// `BlobNotFound`, OR an unlabelled 404 (no `x-ms-error-code` header — some servers
+/// omit it), is treated as "no blob yet". A 404 with a *different* explicit code
+/// (e.g. `ContainerNotFound` — a misconfiguration, not a missing blob) is NOT
+/// swallowed: it propagates so a real fault can't masquerade as an empty/absent value
+/// (which would silently abandon a recoverable checkpoint). The unlabelled-404 case is
+/// a deliberate trade-off: lenient enough to tolerate a header-omitting emulator,
+/// while still surfacing any 404 the server *does* label with a non-blob code.
 fn is_blob_not_found(err: &AzureError) -> bool {
     match err.as_http_error() {
         Some(h) if h.status() == StatusCode::NotFound => {

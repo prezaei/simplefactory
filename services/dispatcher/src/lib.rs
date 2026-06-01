@@ -199,7 +199,13 @@ impl WorkerRuntime {
 }
 
 fn non_empty_env(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|v| !v.is_empty())
+    // Trim first so a whitespace-only value (common when copying env files) is treated
+    // as unset rather than forwarded into a worker container, where it would surface as
+    // a confusing parse/startup failure instead of "absent".
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Live launcher: runs a worker container via `docker run`, injecting the task
