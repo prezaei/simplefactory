@@ -34,23 +34,11 @@ const DEFAULT_LEASE_TTL_SECS: f64 = 900.0;
 /// (and final checkpoint) before the token expires.
 const TOKEN_TTL_GRACE_SECS: f64 = 5.0 * 60.0;
 
-/// Resolve a positive-seconds env var, warning (telemetry invariant) if a PRESENT value
-/// was malformed and the default was used, so an operator can diagnose the misconfig from
-/// logs alone. An unset value falls back silently.
-fn resolve_secs(var: &str, default: f64) -> f64 {
-    let (value, invalid) =
-        record::parse_positive_secs_reported(std::env::var(var).ok().as_deref(), default);
-    if invalid {
-        tracing::warn!(var, default, "invalid {var}; using default");
-    }
-    value
-}
-
 /// The effective per-task **lease** TTL: `FACTORY_LEASE_TTL_SECS` if set to a positive
 /// number, else [`DEFAULT_LEASE_TTL_SECS`]. Governs how fast a *dead* worker's lease is
 /// reclaimed — deliberately short for crash-resume smokes.
 fn task_ttl_secs() -> f64 {
-    resolve_secs("FACTORY_LEASE_TTL_SECS", DEFAULT_LEASE_TTL_SECS)
+    record::resolve_positive_secs_env("FACTORY_LEASE_TTL_SECS", DEFAULT_LEASE_TTL_SECS)
 }
 
 /// Size a task-token TTL from a wall-clock `cap`. Pure half of [`token_ttl_secs`].
@@ -72,7 +60,7 @@ fn token_ttl_from_cap(cap: f64) -> f64 {
 /// Reclaim security does NOT rely on token expiry — the sweeper REVOKES a reclaimed
 /// attempt's token, killing it immediately regardless of this (generous) TTL.
 fn token_ttl_secs() -> f64 {
-    token_ttl_from_cap(resolve_secs(
+    token_ttl_from_cap(record::resolve_positive_secs_env(
         "FACTORY_WALL_CLOCK_CAP_SECS",
         record::DEFAULT_WALL_CLOCK_CAP_SECS,
     ))

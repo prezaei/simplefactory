@@ -51,6 +51,27 @@ pub fn parse_positive_secs_reported(raw: Option<&str>, default: f64) -> (f64, bo
     }
 }
 
+/// Resolve a positive-seconds value from env var `var`, via [`parse_positive_secs_reported`].
+/// When a PRESENT value is malformed (and the `default` is used), `warn!` with the var name
+/// AND the rejected raw value — per the telemetry invariant, an operator must be able to
+/// diagnose the ignored misconfig from logs alone. An unset/empty var falls back silently.
+/// The single place env-backed TTL/cap config is resolved across services (dispatcher
+/// lease + token, coordinator wall-clock cap, tools heartbeat), so the read/validate/log
+/// behavior can't diverge per crate.
+pub fn resolve_positive_secs_env(var: &str, default: f64) -> f64 {
+    let raw = std::env::var(var).ok();
+    let (value, invalid) = parse_positive_secs_reported(raw.as_deref(), default);
+    if invalid {
+        tracing::warn!(
+            env = var,
+            rejected = raw.as_deref().unwrap_or(""),
+            default,
+            "ignored invalid env value; using default"
+        );
+    }
+    value
+}
+
 /// Result type for record-book operations.
 pub type Result<T> = std::result::Result<T, RecordError>;
 

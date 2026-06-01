@@ -896,22 +896,11 @@ async fn escalate_won(
 const DEFAULT_HEARTBEAT_TTL_SECS: f64 = 900.0;
 
 /// The effective heartbeat lease extension: `FACTORY_HEARTBEAT_TTL_SECS` if a positive
-/// number, else [`DEFAULT_HEARTBEAT_TTL_SECS`]. Uses the SHARED positive-secs parser so
-/// the trim/validate rules match the dispatcher's TTLs and the coordinator's cap; a
-/// PRESENT-but-invalid value is logged (telemetry invariant) so the operator can diagnose
-/// the ignored misconfig from logs.
+/// number, else [`DEFAULT_HEARTBEAT_TTL_SECS`]. Uses the SHARED resolver so the
+/// trim/validate rules match the dispatcher's TTLs and the coordinator's cap, and a
+/// PRESENT-but-invalid value is logged (var + rejected value) per the telemetry invariant.
 fn heartbeat_ttl_secs() -> f64 {
-    let (value, invalid) = record::parse_positive_secs_reported(
-        std::env::var("FACTORY_HEARTBEAT_TTL_SECS").ok().as_deref(),
-        DEFAULT_HEARTBEAT_TTL_SECS,
-    );
-    if invalid {
-        tracing::warn!(
-            default = DEFAULT_HEARTBEAT_TTL_SECS,
-            "invalid FACTORY_HEARTBEAT_TTL_SECS; using default"
-        );
-    }
-    value
+    record::resolve_positive_secs_env("FACTORY_HEARTBEAT_TTL_SECS", DEFAULT_HEARTBEAT_TTL_SECS)
 }
 
 /// Prefix for the per-reason default idempotency key used by [`escalate`] when the
