@@ -241,7 +241,9 @@ async fn stream_handler(
     // we need (pool, repo identity, interval) and yields one snapshot frame per
     // tick. The first frame is emitted immediately on connect (no initial sleep),
     // then every `interval` thereafter. A failed snapshot read is logged and that
-    // tick is skipped (an empty data frame) rather than tearing down the stream.
+    // tick emits an SSE *comment* (ignored by EventSource) rather than a data frame,
+    // so the client keeps its last good frame instead of blanking — and the stream is
+    // never torn down.
     let seed = PollState {
         pool: state.pool.clone(),
         repo_id,
