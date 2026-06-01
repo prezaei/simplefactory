@@ -689,6 +689,20 @@ pub async fn save_checkpoint(
     let attempt_id = auth
         .attempt_id
         .ok_or_else(|| ToolError::BadRequest("token has no attempt to checkpoint".to_string()))?;
+    // Reject empty/whitespace-only values before persisting: an empty session_id would
+    // make a later resume run `claude --resume ""`, and an empty checkpoint_uri makes a
+    // filesystem checkpoint store join its root with "" (a degenerate path). The pointer
+    // must be usable for a resume to mean anything.
+    if session_id.trim().is_empty() {
+        return Err(ToolError::BadRequest(
+            "session_id must be non-empty".to_string(),
+        ));
+    }
+    if checkpoint_uri.trim().is_empty() {
+        return Err(ToolError::BadRequest(
+            "checkpoint_uri must be non-empty".to_string(),
+        ));
+    }
     let saved =
         record::save_attempt_checkpoint(&state.pool, attempt_id, session_id, checkpoint_uri)
             .await?;

@@ -445,6 +445,35 @@ async fn save_checkpoint_without_attempt_errors() {
     assert!(err.to_string().contains("no attempt"));
 }
 
+#[tokio::test]
+async fn save_checkpoint_rejects_empty_values() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#73", FakeGitHub::new()).await;
+    // Empty/whitespace session_id or checkpoint_uri is a 400 — an empty pointer is
+    // unusable for a resume and would make an FS store join its root with "".
+    for (sid, uri) in [
+        ("", "cp://1"),
+        ("   ", "cp://1"),
+        ("ses", ""),
+        ("ses", "  "),
+    ] {
+        let err = factory_tools::save_checkpoint(&fx.state, &fx.auth, sid, uri)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("non-empty"),
+            "({sid:?},{uri:?}) should be rejected, got: {err}"
+        );
+    }
+    // Nothing was persisted (the attempt has no checkpoint).
+    assert!(record::last_checkpoint_for_item(&pool, fx.work_item_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
 // ===========================================================================
 // 7. escalate — exactly one escalation, idempotent, work item escalated
 // ===========================================================================
