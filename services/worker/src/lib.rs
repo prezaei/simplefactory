@@ -303,11 +303,13 @@ async fn run_manager(
     // reacted item). Config/intake could enqueue a manager on a non-issue trigger, so
     // fail loudly at the seam — before spending a Claude run or any side effect —
     // rather than succeed into a dead end. Parse the full `issue#<number>` form (not a
-    // bare prefix), so a malformed `issue#not-a-number` also fails here.
+    // bare prefix), so a malformed `issue#not-a-number` — or a non-positive
+    // `issue#-1`/`issue#0` — also fails here (GitHub issue numbers are positive).
     if task
         .subject_ref
         .strip_prefix("issue#")
         .and_then(|n| n.parse::<i64>().ok())
+        .filter(|n| *n > 0)
         .is_none()
     {
         anyhow::bail!(
@@ -383,9 +385,10 @@ async fn run_reviewer(
         .subject_ref
         .strip_prefix("cr#")
         .and_then(|n| n.parse::<i64>().ok())
+        .filter(|n| *n > 0)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "worker(reviewer): task subject {:?} is not a cr#<number>",
+                "worker(reviewer): task subject {:?} is not a cr#<number> (positive)",
                 task.subject_ref
             )
         })?;
@@ -1175,42 +1178,44 @@ mod tests {
 
     #[tokio::test]
     async fn reviewer_with_non_cr_subject_fails_loudly() {
-        // A reviewer task whose subject is not `cr#N` cannot be acted on — bail loudly
-        // BEFORE running Claude (the validation is up front), so it costs no Claude run,
-        // writes no transcript, and submits no verdict.
-        let tools = FakeTools::seeded_role("reviewer", "issue#5", "factory/issue-5");
-        let git = FakeGit::default();
-        let claude = FakeClaude::with(RunOutcome::Review {
-            verdict: ReviewVerdict::Approve,
-            summary: "lgtm".into(),
-        });
-        let cfg = config();
+        // A reviewer subject must be a POSITIVE `cr#<number>`. A non-cr subject — or a
+        // non-positive `cr#-1`/`cr#0` — bails loudly BEFORE running Claude (validation is
+        // up front), so it costs no Claude run, writes no transcript, submits no verdict.
+        for bad_subject in ["issue#5", "cr#-1", "cr#0", "cr#not-a-number"] {
+            let tools = FakeTools::seeded_role("reviewer", bad_subject, "factory/x");
+            let git = FakeGit::default();
+            let claude = FakeClaude::with(RunOutcome::Review {
+                verdict: ReviewVerdict::Approve,
+                summary: "lgtm".into(),
+            });
+            let cfg = config();
 
-        let err = run_task(&tools, &git, &claude, &cfg)
-            .await
-            .expect_err("a reviewer with a non-cr subject must fail loudly");
-        assert!(
-            err.to_string().contains("cr#"),
-            "error explains the bad subject: {err}"
-        );
-        assert_eq!(
-            claude.ran.load(Ordering::SeqCst),
-            0,
-            "Claude is not run on a bad subject (validation is up front)"
-        );
-        assert_eq!(
-            tools.transcripts.lock().expect("lock").len(),
-            0,
-            "no transcript written on a bad subject"
-        );
-        assert_eq!(
-            tools.reviews.lock().expect("lock").len(),
-            0,
-            "no verdict submitted on a bad subject"
-        );
-        let outcomes = tools.outcomes.lock().expect("lock");
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].0, "failed");
+            let err = run_task(&tools, &git, &claude, &cfg)
+                .await
+                .expect_err("a reviewer with a bad subject must fail loudly");
+            assert!(
+                err.to_string().contains("cr#"),
+                "{bad_subject}: error explains the bad subject: {err}"
+            );
+            assert_eq!(
+                claude.ran.load(Ordering::SeqCst),
+                0,
+                "{bad_subject}: Claude not run (validation up front)"
+            );
+            assert_eq!(
+                tools.transcripts.lock().expect("lock").len(),
+                0,
+                "{bad_subject}: no transcript"
+            );
+            assert_eq!(
+                tools.reviews.lock().expect("lock").len(),
+                0,
+                "{bad_subject}: no verdict"
+            );
+            let outcomes = tools.outcomes.lock().expect("lock");
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].0, "failed");
+        }
     }
 
     #[tokio::test]
@@ -1219,7 +1224,13 @@ mod tests {
         // coordinator no-ops otherwise, stranding a reacted item). A non-issue subject —
         // including a malformed `issue#not-a-number` — must fail at the seam BEFORE Claude
         // runs: no comment, no escalate, no success.
-        for bad_subject in ["cr#9", "issue#not-a-number", "schedule@nightly"] {
+        for bad_subject in [
+            "cr#9",
+            "issue#not-a-number",
+            "schedule@nightly",
+            "issue#-1",
+            "issue#0",
+        ] {
             let tools = FakeTools::seeded_role("manager", bad_subject, "factory/x");
             let git = FakeGit::default();
             let claude = FakeClaude::with(RunOutcome::Triage {

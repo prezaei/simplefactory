@@ -350,18 +350,18 @@ fn marker_first_token(value: &str) -> Option<String> {
         .map(|t| t.to_ascii_lowercase())
 }
 
-/// Find the last line that starts with `prefix` (case-insensitive on the prefix) and
-/// return its trimmed, lowercased value. `None` if no such line exists.
+/// If the FINAL non-empty line starts with `prefix` (case-insensitive), return its
+/// trimmed, lowercased value; otherwise `None`. The prompt requires the control marker
+/// to be the last line, so only that line is consulted — a marker-looking line quoted
+/// earlier in Claude's output (e.g. echoing issue text) cannot drive the decision.
 fn last_marker(text: &str, prefix: &str) -> Option<String> {
-    text.lines().rev().find_map(|line| {
-        let line = line.trim();
-        let head = line.get(..prefix.len())?;
-        if head.eq_ignore_ascii_case(prefix) {
-            Some(line[prefix.len()..].trim().to_ascii_lowercase())
-        } else {
-            None
-        }
-    })
+    let last = text.lines().rev().map(str::trim).find(|l| !l.is_empty())?;
+    let head = last.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        Some(last[prefix.len()..].trim().to_ascii_lowercase())
+    } else {
+        None
+    }
 }
 
 /// Best-effort delete the entire MCP scratch directory (and its token-bearing config)
@@ -874,6 +874,11 @@ mod tests {
         assert!(parse_manager_actionable(
             "ACTIONABLE: yes, assigning a coder"
         ));
+        // A marker quoted EARLIER (not the final line) is ignored → conservative
+        // default (actionable). This stops echoed issue text from driving the decision.
+        assert!(parse_manager_actionable(
+            "The issue says 'ACTIONABLE: no'\nProceeding with the fix."
+        ));
     }
 
     #[test]
@@ -940,14 +945,24 @@ mod tests {
     }
 
     #[test]
-    fn last_marker_finds_last_and_is_prefix_case_insensitive() {
+    fn last_marker_only_reads_the_final_nonempty_line() {
+        // The marker must be the FINAL non-empty line.
+        assert_eq!(last_marker("kEy: Val", "KEY:"), Some("val".to_string()));
         assert_eq!(
             last_marker("a\nKEY: first\nKEY: second", "KEY:"),
-            Some("second".to_string())
+            Some("second".to_string()),
+            "the last line wins"
         );
-        assert_eq!(last_marker("kEy: Val", "KEY:"), Some("val".to_string()));
+        // Trailing blank lines are ignored; the last NON-EMPTY line is the marker.
+        assert_eq!(
+            last_marker("KEY: val\n\n  ", "KEY:"),
+            Some("val".to_string())
+        );
+        // A marker quoted EARLIER does NOT count when the final line isn't a marker —
+        // this is the contract that stops echoed issue/CR text from driving the decision.
+        assert_eq!(last_marker("KEY: no\nsome closing prose", "KEY:"), None);
         assert_eq!(last_marker("nothing here", "KEY:"), None);
-        // A short line (shorter than the prefix) is skipped, not a panic.
+        // A short final line (shorter than the prefix) is None, not a panic.
         assert_eq!(last_marker("hi", "KEY:"), None);
         // Multibyte content doesn't panic the prefix slice.
         assert_eq!(last_marker("héllo", "KEY:"), None);
