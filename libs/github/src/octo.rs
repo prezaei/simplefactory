@@ -18,11 +18,11 @@
 //! top-level `state` (authoritative over every context, pagination-immune) and merges it
 //! with the check runs before the rollup, so an empty Checks API result is never treated
 //! as green when a failing status exists.
-//! `read_change_request` populates
-//! the changed-file list for real (the coordinator's can't-weaken-own-gating guard
-//! depends on it) but still reports checks as `Pending` (the coordinator reads checks
-//! via `check_status` directly, so the CR-view check rollup is not on the hot approval
-//! path).
+//! `read_change_request` populates the changed-file list (the coordinator's
+//! can't-weaken-own-gating guard depends on it) AND the unified diff (the Reviewer's
+//! primary signal) — the diff is BEST-EFFORT (a fetch failure/406 doesn't fail the call,
+//! so gating is never blocked by a diff problem) and size-capped. CR-view `checks` stay
+//! `Pending` (the coordinator reads checks via `check_status` directly, off this path).
 use secrecy::ExposeSecret;
 
 use crate::client::{
@@ -77,6 +77,28 @@ impl OctocrabGitHub {
             .map_err(|e| anyhow::anyhow!("minting installation client: {e}"))?;
         Ok(client)
     }
+}
+
+/// Cap on the CR diff body carried to the reviewer (keeps a huge generated/lockfile
+/// diff from blowing up the model context / MCP payload). 256 KiB is ample for a
+/// review signal; larger is truncated with a marker.
+const MAX_DIFF_BYTES: usize = 256 * 1024;
+
+/// Truncate `diff` to at most `max` bytes on a UTF-8 char boundary, appending a marker
+/// when truncated. Returns the diff unchanged when within budget.
+fn cap_diff(diff: String, max: usize) -> String {
+    if diff.len() <= max {
+        return diff;
+    }
+    let mut end = max;
+    while end > 0 && !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n... [diff truncated at {max} bytes of {} total]",
+        &diff[..end],
+        diff.len()
+    )
 }
 
 /// Normalize a PEM read from the environment. A multi-line PEM can't live on one
@@ -219,14 +241,23 @@ impl GitHubClient for OctocrabGitHub {
         tracing::info!(owner = %repo.owner, name = %repo.name, number, files = files.len(), "read change request files");
 
         // The unified diff is the Reviewer's PRIMARY signal (it reviews from the CR view,
-        // not a local clone), so it MUST be populated — an empty diff left the reviewer
-        // with "no usable data" against real GitHub. octocrab returns the raw unified
-        // diff as text.
-        let diff = client
+        // not a local clone), so populate it. BEST-EFFORT, for two reasons: (1) the
+        // coordinator's gating guard reads only `files`/`head_sha`, so a diff problem
+        // must never fail the whole read and block approval; (2) GitHub returns 406 for
+        // very large diffs. On any error, review/gate proceed without the diff body.
+        // CAP the size so a huge (e.g. generated/lockfile) diff can't blow up the
+        // reviewer's context / MCP payload.
+        let diff = match client
             .pulls(&repo.owner, &repo.name)
             .get_diff(number_u64)
             .await
-            .map_err(|e| anyhow::anyhow!("fetching diff for change request #{number}: {e}"))?;
+        {
+            Ok(d) => cap_diff(d, MAX_DIFF_BYTES),
+            Err(e) => {
+                tracing::warn!(number, error = %e, "fetching CR diff failed; proceeding without it");
+                String::new()
+            }
+        };
         tracing::info!(owner = %repo.owner, name = %repo.name, number, diff_bytes = diff.len(), "read change request diff");
 
         // `reviews` stays best-effort empty; `checks` stays the `Pending` stub here
@@ -367,23 +398,45 @@ impl GitHubClient for OctocrabGitHub {
             .await
             .map_err(|e| anyhow::anyhow!("reading change request #{number} for review: {e}"))?;
         let head_sha = pr.head.sha.clone();
+        use octocrab::models::pulls::ReviewAction;
         let event = match verdict {
-            ReviewVerdict::Approve => octocrab::models::pulls::ReviewAction::Approve,
-            ReviewVerdict::RequestChanges => octocrab::models::pulls::ReviewAction::RequestChanges,
-            ReviewVerdict::Comment => octocrab::models::pulls::ReviewAction::Comment,
+            ReviewVerdict::Approve => ReviewAction::Approve,
+            ReviewVerdict::RequestChanges => ReviewAction::RequestChanges,
+            ReviewVerdict::Comment => ReviewAction::Comment,
         };
-        // `pull_number().reviews().create_review(..)` is the only route octocrab
-        // 0.51 exposes for *creating* a review; `pull_number` carries a
-        // deprecation note but its replacements only act on an existing review,
-        // so the allow is scoped tightly to this call.
-        #[allow(deprecated)]
-        let review = client
-            .pulls(&repo.owner, &repo.name)
-            .pull_number(number_u64)
-            .reviews()
-            .create_review(head_sha, body, event, vec![])
-            .await
-            .map_err(|e| anyhow::anyhow!("submitting review on #{number}: {e}"))?;
+        // `pull_number().reviews().create_review(..)` is the only route octocrab 0.51
+        // exposes for *creating* a review; `pull_number` carries a deprecation note but
+        // its replacements only act on an existing review, so the allow is scoped tightly.
+        let create = |evt: ReviewAction, text: String| {
+            let client = client.clone();
+            let (owner, name, sha) = (repo.owner.clone(), repo.name.clone(), head_sha.clone());
+            async move {
+                #[allow(deprecated)]
+                client
+                    .pulls(&owner, &name)
+                    .pull_number(number_u64)
+                    .reviews()
+                    .create_review(sha, text, evt, vec![])
+                    .await
+            }
+        };
+        let review = match create(event, body.to_string()).await {
+            Ok(r) => r,
+            // GitHub forbids APPROVE/REQUEST_CHANGES on your OWN pull request, and the
+            // Factory App authors the CR (as the coder) — so the reviewer (same App) can
+            // only COMMENT. Fall back to a COMMENT review carrying the verdict in the body;
+            // the structured verdict still reaches the coordinator via the CR factory_state.
+            Err(e) if !matches!(verdict, ReviewVerdict::Comment) => {
+                tracing::warn!(number, verdict = verdict.as_str(), error = %e, "review event rejected (likely self-review on the App's own PR); retrying as a COMMENT review with the verdict in the body");
+                let annotated = format!("**Reviewer verdict: {}**\n\n{}", verdict.as_str(), body);
+                create(ReviewAction::Comment, annotated)
+                    .await
+                    .map_err(|e2| {
+                        anyhow::anyhow!("submitting review on #{number} (comment fallback): {e2}")
+                    })?
+            }
+            Err(e) => return Err(anyhow::anyhow!("submitting review on #{number}: {e}")),
+        };
         Ok(review.id.0 as i64)
     }
 
@@ -634,6 +687,17 @@ mod tests {
     }
 
     // ---- normalize_pem: \n-escaped env value → real PEM ----
+
+    #[test]
+    fn cap_diff_passes_small_and_truncates_large_on_char_boundary() {
+        assert_eq!(cap_diff("small".to_string(), 1024), "small");
+        // A multibyte char straddling the cap must not panic and must stay valid UTF-8.
+        let big = "é".repeat(1000); // 2 bytes each = 2000 bytes
+        let out = cap_diff(big, 101);
+        assert!(out.starts_with('é') || out.starts_with("é"));
+        assert!(out.contains("[diff truncated at 101 bytes of 2000 total]"));
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
 
     #[test]
     fn normalize_pem_unescapes_backslash_n() {

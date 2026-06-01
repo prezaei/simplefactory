@@ -49,9 +49,10 @@ pub fn archive_dirs(roots: &[(&str, &Path)]) -> anyhow::Result<Vec<u8>> {
 /// requested `name` are ignored. An entry whose path contains `..` or a root component
 /// is rejected, so a name-based traversal can't escape `dest`. The writer is trusted
 /// (the worker tars its own worktree, and `append_dir_all` does not follow symlinks, so
-/// a real worktree can't produce an out-of-tree entry); this guards the entry *paths*,
-/// not a full sandbox against an adversarially crafted archive (e.g. symlink-then-write-
-/// through is out of scope — the input is our own checkpoint).
+/// a real worktree can't produce an out-of-tree entry). Defence in depth on top of the
+/// trusted writer: entry paths with `..`/root are rejected, AND symlink/hardlink entries
+/// whose target escapes `dest` (absolute or `..`) are SKIPPED — the worktree is produced
+/// by `claude` under skip-permissions, so a link-then-write-through escape is guarded.
 pub fn extract_dirs(archive: &[u8], dests: &[(&str, &Path)]) -> anyhow::Result<()> {
     // Create every destination up front so an archive that simply lacks a root still
     // yields an (empty) dest rather than a later missing-dir surprise.
@@ -86,6 +87,28 @@ pub fn extract_dirs(archive: &[u8], dests: &[(&str, &Path)]) -> anyhow::Result<(
         };
         if rel.as_os_str().is_empty() {
             continue; // the root dir entry itself; dest already created
+        }
+        // Reject a symlink/hardlink whose target escapes `dest`. The worktree is produced
+        // by `claude` under --dangerously-skip-permissions, so it is NOT a fully trusted
+        // input: an escaping link, once extracted, could let a later entry write through
+        // it outside `dest`. Skip such links (don't fail the whole restore).
+        if matches!(
+            entry.header().entry_type(),
+            tar::EntryType::Symlink | tar::EntryType::Link
+        ) {
+            let target = entry.link_name().ok().flatten();
+            let escapes = match target.as_deref() {
+                Some(t) => {
+                    t.is_absolute()
+                        || t.components()
+                            .any(|c| matches!(c, Component::ParentDir | Component::RootDir))
+                }
+                None => true, // missing/unreadable target → refuse
+            };
+            if escapes {
+                tracing::warn!(path = %path.display(), "extract_dirs: skipping link entry with escaping/absent target");
+                continue;
+            }
         }
         entry.unpack(dest.join(&rel))?;
         extracted += 1;
@@ -209,5 +232,37 @@ mod tests {
         for d in [worktree, session, dest] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    #[test]
+    fn extract_skips_a_symlink_entry_whose_target_escapes_dest() {
+        // Hand-craft an archive with a safe file + an absolute-target symlink under
+        // worktree/. The symlink must be SKIPPED (not extracted), the file restored.
+        let mut builder =
+            tar::Builder::new(GzEncoder::new(Vec::new(), flate2::Compression::default()));
+        let data = b"ok";
+        let mut h = tar::Header::new_gnu();
+        h.set_path("worktree/safe.txt").unwrap();
+        h.set_size(data.len() as u64);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_cksum();
+        builder.append(&h, &data[..]).unwrap();
+        let mut sh = tar::Header::new_gnu();
+        sh.set_entry_type(tar::EntryType::Symlink);
+        sh.set_size(0);
+        sh.set_cksum();
+        builder
+            .append_link(&mut sh, "worktree/evil", "/etc/passwd")
+            .unwrap();
+        let bytes = builder.into_inner().unwrap().finish().unwrap();
+
+        let dest = tmp("wt-link-dest");
+        extract_dirs(&bytes, &[("worktree", dest.as_path())]).unwrap();
+        assert!(dest.join("safe.txt").exists(), "the safe file is restored");
+        assert!(
+            dest.join("evil").symlink_metadata().is_err(),
+            "the escaping symlink must be skipped"
+        );
+        let _ = std::fs::remove_dir_all(dest);
     }
 }

@@ -231,11 +231,29 @@ async fn run_claude_with_config(
     write_mcp_config_file(&config_path, tools_url, token).await?;
 
     let args = claude_args(&config_path, prompt, session_id, resume);
-    let output = tokio::process::Command::new("claude")
+    // Bound the run: a wedged claude (e.g. a stalled MCP/network call) would otherwise
+    // run forever while the heartbeat keeps renewing the lease, so the sweeper never
+    // reclaims it. On timeout the child is killed (kill_on_drop) and the attempt fails →
+    // it gets reclaimed/retried. The bound is generous (real coding runs are minutes).
+    let run_timeout = std::time::Duration::from_secs(env_secs(
+        "FACTORY_CLAUDE_TIMEOUT_SECS",
+        DEFAULT_CLAUDE_TIMEOUT_SECS,
+    ));
+    let child = tokio::process::Command::new("claude")
         .current_dir(workdir)
         .args(&args)
-        .output()
-        .await?;
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let output = match tokio::time::timeout(run_timeout, child.wait_with_output()).await {
+        Ok(res) => res?,
+        Err(_) => {
+            // The timeout future dropped the child → kill_on_drop terminates claude.
+            tracing::error!(role, secs = run_timeout.as_secs(), "claude run timed out");
+            anyhow::bail!("claude run timed out after {}s", run_timeout.as_secs());
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -316,7 +334,9 @@ fn strip_marker_lines(summary: &str, prefix: &str) -> String {
     summary
         .lines()
         .filter(|line| {
-            line.trim()
+            // Strip decoration first so a decorated marker (`**VERDICT: ...**`) is also
+            // removed from the user-facing body, matching what last_marker parses.
+            strip_decoration(line)
                 .get(..prefix.len())
                 .map(|head| !head.eq_ignore_ascii_case(prefix))
                 .unwrap_or(true)
@@ -364,18 +384,30 @@ fn marker_first_token(value: &str) -> Option<String> {
         .map(|t| t.to_ascii_lowercase())
 }
 
-/// If the FINAL non-empty line starts with `prefix` (case-insensitive), return its
-/// trimmed, lowercased value; otherwise `None`. The prompt requires the control marker
-/// to be the last line, so only that line is consulted — a marker-looking line quoted
-/// earlier in Claude's output (e.g. echoing issue text) cannot drive the decision.
+/// Strip the markdown decoration a model commonly wraps a marker line in, so
+/// `**VERDICT: approve**`, `> VERDICT: approve`, or `` `VERDICT: approve` `` still match.
+fn strip_decoration(line: &str) -> &str {
+    line.trim()
+        .trim_start_matches(['>', '#', '*', '-', '`', ' '])
+        .trim_end_matches(['*', '`', ' '])
+        .trim()
+}
+
+/// Find the control marker (`ACTIONABLE:` / `VERDICT:`) near the END of Claude's output
+/// and return its trimmed, lowercased value. Scans the last few non-empty lines (a model
+/// often adds a closing ``` fence or a trailing sentence after the marker) and strips
+/// markdown decoration before matching, taking the LAST match. Bounded to the tail so a
+/// marker-looking line quoted earlier (e.g. echoing issue text) can't drive the decision.
 fn last_marker(text: &str, prefix: &str) -> Option<String> {
-    let last = text.lines().rev().map(str::trim).find(|l| !l.is_empty())?;
-    let head = last.get(..prefix.len())?;
-    if head.eq_ignore_ascii_case(prefix) {
-        Some(last[prefix.len()..].trim().to_ascii_lowercase())
-    } else {
-        None
+    for raw in text.lines().rev().filter(|l| !l.trim().is_empty()).take(10) {
+        let line = strip_decoration(raw);
+        if let Some(head) = line.get(..prefix.len()) {
+            if head.eq_ignore_ascii_case(prefix) {
+                return Some(line[prefix.len()..].trim().to_ascii_lowercase());
+            }
+        }
     }
+    None
 }
 
 /// Best-effort delete the entire MCP scratch directory (and its token-bearing config)
@@ -490,6 +522,9 @@ fn env_var(key: &str) -> anyhow::Result<String> {
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 /// Default seconds between worktree/session checkpoints during a run.
 const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 300;
+/// Default hard ceiling on a single `claude` run before it is killed (a wedged run must
+/// not hold the lease open forever). 30 min is well beyond a normal coding/triage run.
+const DEFAULT_CLAUDE_TIMEOUT_SECS: u64 = 1800;
 
 /// Parse an optional positive-int env var, falling back to `default` when unset or
 /// unparseable (a malformed override must not silently disable the loop).
@@ -1066,6 +1101,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_reviewer_verdict_tolerates_decoration_and_trailing_lines() {
+        // A model commonly bolds the marker and/or adds a closing fence or sentence after
+        // it. request_changes must NOT silently degrade to comment (that weakens the gate).
+        assert_eq!(
+            parse_reviewer_verdict("Issues found.\n**VERDICT: request_changes**"),
+            ReviewVerdict::RequestChanges
+        );
+        assert_eq!(
+            parse_reviewer_verdict("review\n```\nVERDICT: request_changes\n```"),
+            ReviewVerdict::RequestChanges
+        );
+        assert_eq!(
+            parse_reviewer_verdict("> VERDICT: approve\n\nThanks for the contribution!"),
+            ReviewVerdict::Approve
+        );
+        // Still bounded to the tail: a marker far above a long trailer is not picked up.
+        let long_trailer = format!("VERDICT: request_changes\n{}", "filler\n".repeat(20));
+        assert_eq!(
+            parse_reviewer_verdict(&long_trailer),
+            ReviewVerdict::Comment
+        );
+    }
+
+    #[test]
     fn strip_marker_lines_removes_the_control_marker_only() {
         assert_eq!(
             strip_marker_lines("Triaged it.\nACTIONABLE: no", "ACTIONABLE:"),
@@ -1098,26 +1157,31 @@ mod tests {
     }
 
     #[test]
-    fn last_marker_only_reads_the_final_nonempty_line() {
-        // The marker must be the FINAL non-empty line.
+    fn last_marker_scans_the_tail_tolerating_decoration_and_trailing_lines() {
         assert_eq!(last_marker("kEy: Val", "KEY:"), Some("val".to_string()));
+        // The LAST matching marker (scanning from the end) wins.
         assert_eq!(
             last_marker("a\nKEY: first\nKEY: second", "KEY:"),
             Some("second".to_string()),
-            "the last line wins"
         );
-        // Trailing blank lines are ignored; the last NON-EMPTY line is the marker.
+        // Trailing blank lines are ignored.
         assert_eq!(
             last_marker("KEY: val\n\n  ", "KEY:"),
             Some("val".to_string())
         );
-        // A marker quoted EARLIER does NOT count when the final line isn't a marker —
-        // this is the contract that stops echoed issue/CR text from driving the decision.
-        assert_eq!(last_marker("KEY: no\nsome closing prose", "KEY:"), None);
+        // A marker followed by a few trailing lines (closing fence / prose) is still
+        // found — this is the robustness fix so a decorated/trailing verdict isn't lost.
+        assert_eq!(
+            last_marker("KEY: no\nsome closing prose", "KEY:"),
+            Some("no".to_string())
+        );
+        assert_eq!(last_marker("**KEY: yes**", "KEY:"), Some("yes".to_string()));
+        // ...but it stays bounded to the tail: a marker far above a long trailer is NOT
+        // picked up, so echoed text high in the output can't drive the decision.
+        let buried = format!("KEY: no\n{}", "filler\n".repeat(20));
+        assert_eq!(last_marker(&buried, "KEY:"), None);
         assert_eq!(last_marker("nothing here", "KEY:"), None);
-        // A short final line (shorter than the prefix) is None, not a panic.
-        assert_eq!(last_marker("hi", "KEY:"), None);
-        // Multibyte content doesn't panic the prefix slice.
-        assert_eq!(last_marker("héllo", "KEY:"), None);
+        assert_eq!(last_marker("hi", "KEY:"), None); // shorter than prefix → no panic
+        assert_eq!(last_marker("héllo", "KEY:"), None); // multibyte → no panic
     }
 }
