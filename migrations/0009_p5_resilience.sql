@@ -9,9 +9,10 @@ CREATE INDEX IF NOT EXISTS attempts_running_started_at
     ON attempts (started_at)
     WHERE status = 'running';
 
--- Crash-resume looks up the most recent checkpointed attempt for a work item
--- (session_id + checkpoint_uri set). This partial index serves both that lookup and
--- the resume-count tally (attempts carrying a session_id).
+-- Crash-resume looks up the most recent RESUMABLE attempt for a work item — one with
+-- BOTH session_id AND checkpoint_uri set (see `last_checkpoint_for_item`). The partial
+-- predicate matches that query exactly (both columns non-NULL), keeping the index smaller
+-- and more selective than filtering on session_id alone.
 CREATE INDEX IF NOT EXISTS attempts_checkpointed
     ON attempts (work_item_id, started_at DESC)
-    WHERE session_id IS NOT NULL;
+    WHERE session_id IS NOT NULL AND checkpoint_uri IS NOT NULL;

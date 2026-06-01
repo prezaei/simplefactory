@@ -435,6 +435,7 @@ mod tests {
             "append_transcript",
             "record_outcome",
             "heartbeat",
+            "save_checkpoint",
             "escalate",
         ] {
             assert_eq!(
