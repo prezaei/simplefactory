@@ -116,6 +116,10 @@ pub struct EventView {
 pub struct Snapshot {
     pub summary: SummaryView,
     pub work_items: Vec<WorkItemView>,
+    /// True when `work_items` was capped at [`WORK_ITEMS_LIMIT`] and `summary.total`
+    /// may exceed the rows shown — so the live view can say "showing first N" instead
+    /// of silently mismatching the total against a truncated table.
+    pub work_items_truncated: bool,
 }
 
 /// A read query failed. The HTTP layer maps `NotFound` to 404 (unknown repo) and
@@ -199,7 +203,10 @@ async fn summary_handler(
 /// Query string for the events feed.
 #[derive(Debug, serde::Deserialize)]
 pub struct EventsParams {
-    pub limit: Option<i64>,
+    /// Raw string so a malformed `?limit=` (non-numeric, empty, overflow) is handled
+    /// gracefully by `clamp_limit` (→ default) rather than failing Query
+    /// deserialization with a 400. The feed stays bounded regardless of input.
+    pub limit: Option<String>,
 }
 
 /// `GET /api/repos/{owner}/{name}/events?limit=N` — recent audit events,
@@ -209,7 +216,7 @@ async fn events_handler(
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<EventsParams>,
 ) -> Result<Json<Vec<EventView>>, ReadError> {
-    let limit = clamp_limit(params.limit);
+    let limit = clamp_limit(params.limit.as_deref());
     tracing::info!(%owner, %name, limit, "GET events");
     let repo_id = resolve_repo(&state.pool, &owner, &name).await?;
     let events = query_events(&state.pool, repo_id, limit).await?;
@@ -249,17 +256,26 @@ async fn stream_handler(
         } else {
             tokio::time::sleep(s.interval).await;
         }
-        let payload = match build_snapshot(&s.pool, s.repo_id, &s.owner, &s.name).await {
-            Ok(snap) => serde_json::to_string(&snap).unwrap_or_else(|e| {
-                tracing::error!(error = %e, "serializing SSE snapshot");
-                "{}".to_owned()
-            }),
+        // On a read/serialize failure, emit an SSE *comment* (which EventSource
+        // ignores) rather than a `data: {}` frame — an empty data frame would make the
+        // client render an empty snapshot and blank the live view. A comment keeps the
+        // last good frame on screen until the next successful tick.
+        let event = match build_snapshot(&s.pool, s.repo_id, &s.owner, &s.name).await {
+            Ok(snap) => match serde_json::to_string(&snap) {
+                Ok(json) => {
+                    tracing::debug!(owner = %s.owner, name = %s.name, "SSE snapshot pushed");
+                    Event::default().data(json)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "serializing SSE snapshot");
+                    Event::default().comment("snapshot unavailable")
+                }
+            },
             Err(e) => {
-                tracing::error!(owner = %s.owner, name = %s.name, error = ?e, "SSE snapshot read failed; skipping tick");
-                "{}".to_owned()
+                tracing::error!(owner = %s.owner, name = %s.name, error = ?e, "SSE snapshot read failed; keeping last frame");
+                Event::default().comment("snapshot unavailable")
             }
         };
-        let event = Event::default().data(payload);
         Some((Ok::<_, Infallible>(event), s))
     });
 
@@ -411,16 +427,20 @@ async fn build_snapshot(
 ) -> Result<Snapshot, ReadError> {
     let summary = query_summary(pool, repo_id, owner, name).await?;
     let work_items = query_work_items(pool, repo_id, WORK_ITEMS_LIMIT).await?;
+    let work_items_truncated = work_items.len() as i64 >= WORK_ITEMS_LIMIT;
     Ok(Snapshot {
         summary,
         work_items,
+        work_items_truncated,
     })
 }
 
-/// Clamp the caller-supplied events limit into `[1, EVENTS_MAX_LIMIT]`, defaulting
-/// when absent or non-positive. Keeps the feed bounded regardless of input.
-fn clamp_limit(requested: Option<i64>) -> i64 {
-    match requested {
+/// Parse and clamp the caller-supplied events `?limit=` into `[1, EVENTS_MAX_LIMIT]`,
+/// defaulting when absent, empty, non-numeric, overflowing, or non-positive. Lenient
+/// by design: a malformed limit yields the default rather than a 400, and the feed
+/// stays bounded regardless of input.
+fn clamp_limit(requested: Option<&str>) -> i64 {
+    match requested.and_then(|s| s.trim().parse::<i64>().ok()) {
         Some(n) if n > 0 => n.min(EVENTS_MAX_LIMIT),
         _ => EVENTS_DEFAULT_LIMIT,
     }
@@ -449,9 +469,22 @@ mod tests {
     #[test]
     fn clamp_limit_defaults_and_bounds() {
         assert_eq!(clamp_limit(None), EVENTS_DEFAULT_LIMIT);
-        assert_eq!(clamp_limit(Some(0)), EVENTS_DEFAULT_LIMIT);
-        assert_eq!(clamp_limit(Some(-5)), EVENTS_DEFAULT_LIMIT);
-        assert_eq!(clamp_limit(Some(10)), 10);
-        assert_eq!(clamp_limit(Some(EVENTS_MAX_LIMIT + 1)), EVENTS_MAX_LIMIT);
+        assert_eq!(clamp_limit(Some("0")), EVENTS_DEFAULT_LIMIT);
+        assert_eq!(clamp_limit(Some("-5")), EVENTS_DEFAULT_LIMIT);
+        assert_eq!(clamp_limit(Some("10")), 10);
+        assert_eq!(
+            clamp_limit(Some(&(EVENTS_MAX_LIMIT + 1).to_string())),
+            EVENTS_MAX_LIMIT
+        );
+        // Lenient parsing: malformed/empty/overflow all fall back to the default
+        // (graceful, never a 400).
+        assert_eq!(clamp_limit(Some("abc")), EVENTS_DEFAULT_LIMIT);
+        assert_eq!(clamp_limit(Some("")), EVENTS_DEFAULT_LIMIT);
+        assert_eq!(clamp_limit(Some("  25 ")), 25, "whitespace tolerated");
+        assert_eq!(
+            clamp_limit(Some("99999999999999999999999")),
+            EVENTS_DEFAULT_LIMIT,
+            "i64 overflow falls back to default"
+        );
     }
 }

@@ -146,20 +146,27 @@ async fn summary_counts_by_state_and_open_escalations() {
     let (owner, name) = unique_repo();
     let repo_id = record::upsert_repo(&pool, &owner, &name, 1).await.unwrap();
 
-    // Two queued, one running, one escalated (with an open escalation row).
-    enqueue_item(&pool, repo_id, Kind::Coder, "s1").await;
-    enqueue_item(&pool, repo_id, Kind::Coder, "s2").await;
-    let running = enqueue_item(&pool, repo_id, Kind::Manager, "s3").await;
-    record::set_state(&pool, running, State::Running)
-        .await
-        .unwrap();
-    let esc = enqueue_item(&pool, repo_id, Kind::Reviewer, "s4").await;
-    record::set_state(&pool, esc, State::Escalated)
-        .await
-        .unwrap();
-    record::create_escalation_idempotent(&pool, esc, "needs_decision", "stuck", None)
-        .await
-        .unwrap();
+    // Seed EVERY work_item state variant through the summary entry point so the
+    // GROUP BY/state projection is verified for each (not just a happy few): two
+    // queued, and one each of leased/running/blocked/succeeded/failed/escalated.
+    enqueue_item(&pool, repo_id, Kind::Coder, "s1").await; // queued
+    enqueue_item(&pool, repo_id, Kind::Coder, "s2").await; // queued
+    for (subj, st) in [
+        ("s-leased", State::Leased),
+        ("s-running", State::Running),
+        ("s-blocked", State::Blocked),
+        ("s-succeeded", State::Succeeded),
+        ("s-failed", State::Failed),
+        ("s-escalated", State::Escalated),
+    ] {
+        let id = enqueue_item(&pool, repo_id, Kind::Coder, subj).await;
+        record::set_state(&pool, id, st).await.unwrap();
+        if st == State::Escalated {
+            record::create_escalation_idempotent(&pool, id, "needs_decision", "stuck", None)
+                .await
+                .unwrap();
+        }
+    }
 
     let (status, body) = call(
         DashboardState::new(pool.clone()),
@@ -171,10 +178,10 @@ async fn summary_counts_by_state_and_open_escalations() {
 
     assert_eq!(summary["owner"], owner);
     assert_eq!(summary["name"], name);
-    assert_eq!(summary["total"], 4);
+    assert_eq!(summary["total"], 8);
     assert_eq!(summary["open_escalations"], 1);
 
-    // by_state must report queued=2, running=1, escalated=1.
+    // by_state must report every variant's count exactly.
     let by_state = summary["by_state"].as_array().unwrap();
     let count_for = |st: &str| -> i64 {
         by_state
@@ -184,9 +191,12 @@ async fn summary_counts_by_state_and_open_escalations() {
             .unwrap_or(0)
     };
     assert_eq!(count_for("queued"), 2);
+    assert_eq!(count_for("leased"), 1);
     assert_eq!(count_for("running"), 1);
+    assert_eq!(count_for("blocked"), 1);
+    assert_eq!(count_for("succeeded"), 1);
+    assert_eq!(count_for("failed"), 1);
     assert_eq!(count_for("escalated"), 1);
-    assert_eq!(count_for("succeeded"), 0);
 }
 
 // ---- (c) events feed ------------------------------------------------------
@@ -241,6 +251,23 @@ async fn events_feed_newest_first_and_bounded_by_limit() {
     let events: Vec<Value> = serde_json::from_slice(&body).unwrap();
     assert_eq!(events.len(), 1, "bounded by limit=1");
     assert_eq!(events[0]["action"], "action-2");
+
+    // Malformed limit is handled GRACEFULLY over the HTTP path (200 with the default
+    // bound), NOT a 400 — exercise the lenient parse end-to-end.
+    for bad in ["abc", "", "-5", "99999999999999999999999"] {
+        let (status, body) = call(
+            DashboardState::new(pool.clone()),
+            get(&format!("/api/repos/{owner}/{name}/events?limit={bad}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "limit={bad:?} is graceful, not 400");
+        let events: Vec<Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            events.len(),
+            3,
+            "limit={bad:?} falls back to the default bound"
+        );
+    }
 }
 
 // ---- (d) SSE freshness ----------------------------------------------------

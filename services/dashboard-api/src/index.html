@@ -64,12 +64,15 @@
       `<div class="pills">${pills || '<span class="empty">no work items</span>'}${esc}</div>`;
   }
 
-  function renderItems(items) {
+  function renderItems(items, truncated) {
     const root = document.getElementById('items');
     if (!items || items.length === 0) {
       root.innerHTML = '<p class="empty">No work items yet.</p>';
       return;
     }
+    const note = truncated
+      ? `<p class="empty">Showing the most recent ${items.length} (more exist — see the totals above).</p>`
+      : '';
     const rows = items.map(w => `
       <tr>
         <td>${w.kind}</td>
@@ -87,7 +90,7 @@
           <th>attempts</th><th>loops</th><th>updated</th>
         </tr></thead>
         <tbody>${rows}</tbody>
-      </table>`;
+      </table>${note}`;
   }
 
   function connect(owner, name) {
@@ -101,7 +104,7 @@
       try {
         const snap = JSON.parse(ev.data);
         renderSummary(snap.summary);
-        renderItems(snap.work_items);
+        renderItems(snap.work_items, snap.work_items_truncated);
         setConn(true);
       } catch (e) { /* skip malformed frame */ }
     };
