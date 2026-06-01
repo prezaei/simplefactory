@@ -837,10 +837,16 @@ mod tests {
         assert_eq!(args[2], "--mcp-config");
         // The config is referenced BY PATH, not as inline JSON.
         assert_eq!(args[3], "/work/.factory-mcp.json");
-        // A fresh run pins the session id with --session-id.
-        assert!(args.iter().any(|a| a == "--session-id" || a == "ses-123"));
-        assert_eq!(args.iter().position(|a| a == "--session-id"), Some(5));
-        assert_eq!(args[6], "ses-123");
+        // A fresh run pins the session id with --session-id <id> (both, adjacent).
+        let sid = args
+            .iter()
+            .position(|a| a == "--session-id")
+            .expect("--session-id present");
+        assert_eq!(
+            args[sid + 1],
+            "ses-123",
+            "the session id value follows the flag"
+        );
         // The prompt is the final positional argument.
         assert_eq!(args.last().unwrap(), "Fix the bug");
     }

@@ -124,15 +124,17 @@ Use the public URL it prints as the App's Webhook URL (step 1) if you didn't alr
 ## 7. Run the smoke
 
 ```bash
-FACTORY_SMOKE_REPO="$REPO" ./scripts/smoke.sh
+FACTORY_SMOKE_REPO="$REPO" ./scripts/smoke.sh                 # all scenarios
+FACTORY_SMOKE_REPO="$REPO" ./scripts/smoke.sh happy           # a subset (positional)
 ```
 
-It (1) opens a labelled issue and watches **manager triage → coder change-request →
-reviewer verdict**, then (2) runs the **crash-resume drill**: opens a second issue,
-waits for the worker container, `docker kill`s it mid-run, and verifies the
-coordinator's sweeper reclaims the lease, the dispatcher re-dispatches, and the
-resumed worker (restored from its Blob checkpoint, `claude --resume`) still produces
-the change request. Pass `--skip-crash` for the happy path only.
+With no arguments it runs all scenarios: **config** (push reloads `.factory/config.yml`),
+**happy** (issue → manager triage → coder change-request → reviewer verdict), **rework**
+(a human "changes requested" review → the coder reworks → the CR head advances), and
+**crash** (kill the worker container mid-run → the sweeper reclaims the lapsed lease →
+the dispatcher re-dispatches → the resumed worker, restored from its Blob checkpoint via
+`claude --resume`, still produces the CR). Select a subset with positional args, e.g.
+`./scripts/smoke.sh happy crash`. It prints a PASS/FAIL matrix at the end.
 
 Observe live at the dashboard: `http://localhost:8082/` (work items, events, SSE).
 Transcripts land in the Azurite `transcripts` container; checkpoints in `checkpoints`
