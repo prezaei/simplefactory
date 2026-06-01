@@ -1419,6 +1419,81 @@ async fn escalate_blocked_input_is_resumable_and_terminal_reasons_escalate() {
     assert_eq!(requeued2, 0, "escalated items are not re-queued");
 }
 
+/// A STALE duplicate escalate (distinct dedupe_key, same reason) arriving AFTER a human
+/// reply re-queued the blocked item must NOT clobber the re-queued/healthy item back to
+/// blocked. The state transition is gated on `created || attempt_was_running`: the stale
+/// call hits the existing escalation row (created=false) and the original attempt is
+/// already finished (attempt_was_running=false), so set_state is skipped.
+#[tokio::test]
+async fn stale_duplicate_escalate_after_requeue_does_not_clobber_state() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#306", FakeGitHub::new()).await;
+
+    // First escalate(blocked_input): item → blocked, original attempt finished as blocked.
+    let (s1, _) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "escalate",
+        json!({ "reason": "blocked_input", "context": "need a key", "dedupe_key": "k1" }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(
+        record::work_item_by_id(&pool, fx.work_item_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        State::Blocked
+    );
+
+    // A human reply re-queues the item (now Queued, healthy, awaiting re-dispatch).
+    record::requeue_blocked(&pool, fx.auth.repo_id, "issue#306")
+        .await
+        .unwrap();
+
+    // A STALE duplicate escalate for the SAME (work_item, reason) but a DISTINCT key —
+    // the worker's token is intentionally never revoked, so this is reachable. It hits
+    // the existing escalation row (created=false); the original attempt is already
+    // finished, so set_state must be SKIPPED and the re-queued item left Queued.
+    let (s2, b2) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "escalate",
+        json!({ "reason": "blocked_input", "context": "need a key", "dedupe_key": "k2" }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(
+        b2["state_changed"],
+        json!(false),
+        "no transition by the stale call"
+    );
+    assert_eq!(
+        record::work_item_by_id(&pool, fx.work_item_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        State::Queued,
+        "the re-queued healthy item is NOT clobbered back to blocked"
+    );
+    // Still exactly one escalation row, no second comment.
+    assert_eq!(
+        record::count_escalations_for_item(&pool, fx.work_item_id)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        count_calls(&fx.gh, "post_comment"),
+        1,
+        "no duplicate comment"
+    );
+}
+
 // ===========================================================================
 // FIX 5 — variants through entry points: submit_review request_changes & comment;
 // post_comment to a cr#N target; concurrent submit_review dedupe (exactly one).

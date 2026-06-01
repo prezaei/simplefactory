@@ -136,9 +136,13 @@ async fn sweeper_reclaims_an_expired_leased_item() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let gh = Arc::new(FakeGitHub::new());
-    sweeper_tick(&pool, gh.as_ref(), NEVER_WALL_CLOCK)
-        .await
-        .expect("sweep");
+    sweeper_tick(
+        &pool,
+        Some(gh.as_ref() as &dyn factory_github::GitHubClient),
+        NEVER_WALL_CLOCK,
+    )
+    .await
+    .expect("sweep");
 
     let after = record::work_item_by_id(&pool, item).await.unwrap().unwrap();
     assert_eq!(
@@ -172,9 +176,13 @@ async fn sweeper_reclaims_an_expired_running_item_and_finishes_its_attempt() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let gh = Arc::new(FakeGitHub::new());
-    sweeper_tick(&pool, gh.as_ref(), NEVER_WALL_CLOCK)
-        .await
-        .expect("sweep");
+    sweeper_tick(
+        &pool,
+        Some(gh.as_ref() as &dyn factory_github::GitHubClient),
+        NEVER_WALL_CLOCK,
+    )
+    .await
+    .expect("sweep");
 
     let after = record::work_item_by_id(&pool, item).await.unwrap().unwrap();
     assert_eq!(after.state, State::Queued);
@@ -194,9 +202,13 @@ async fn sweeper_escalates_at_the_retry_cap() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let gh = Arc::new(FakeGitHub::new());
-    sweeper_tick(&pool, gh.as_ref(), NEVER_WALL_CLOCK)
-        .await
-        .expect("sweep");
+    sweeper_tick(
+        &pool,
+        Some(gh.as_ref() as &dyn factory_github::GitHubClient),
+        NEVER_WALL_CLOCK,
+    )
+    .await
+    .expect("sweep");
 
     let after = record::work_item_by_id(&pool, item).await.unwrap().unwrap();
     assert_eq!(
@@ -232,6 +244,52 @@ async fn sweeper_escalates_at_the_retry_cap() {
 }
 
 #[tokio::test]
+async fn sweeper_reclaims_without_github_creds() {
+    let _serial = SWEEPER_SERIAL.lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    // One requeue-path item and one at-cap (escalate-path) item, both expired.
+    let requeue = enqueue_and_lease(&pool, repo, "issue#7", 0.0).await;
+    let escalate = enqueue_and_lease(&pool, repo, "issue#8", 0.0).await;
+    set_attempt_count(&pool, escalate, 3).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // GitHub creds absent: the DB reclaim still runs (free the slot, requeue/escalate),
+    // only the escalation comment is suppressed.
+    sweeper_tick(&pool, None, NEVER_WALL_CLOCK)
+        .await
+        .expect("sweep without github");
+
+    let r = record::work_item_by_id(&pool, requeue)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        r.state,
+        State::Queued,
+        "requeue reclaim works without github"
+    );
+    let e = record::work_item_by_id(&pool, escalate)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        e.state,
+        State::Escalated,
+        "at-cap item still escalates (row recorded) without github"
+    );
+    assert_eq!(
+        record::count_escalations_for_item(&pool, escalate)
+            .await
+            .unwrap(),
+        1,
+        "escalation row recorded even with no comment delivery"
+    );
+}
+
+#[tokio::test]
 async fn sweeper_does_not_touch_a_valid_lease() {
     let _serial = SWEEPER_SERIAL.lock().await;
     let Some(pool) = pool_or_skip().await else {
@@ -242,9 +300,13 @@ async fn sweeper_does_not_touch_a_valid_lease() {
     let item = enqueue_and_lease(&pool, repo, "issue#4", 600.0).await;
 
     let gh = Arc::new(FakeGitHub::new());
-    sweeper_tick(&pool, gh.as_ref(), NEVER_WALL_CLOCK)
-        .await
-        .expect("sweep");
+    sweeper_tick(
+        &pool,
+        Some(gh.as_ref() as &dyn factory_github::GitHubClient),
+        NEVER_WALL_CLOCK,
+    )
+    .await
+    .expect("sweep");
 
     let after = record::work_item_by_id(&pool, item).await.unwrap().unwrap();
     assert_eq!(after.state, State::Leased, "a valid lease is untouched");
@@ -272,7 +334,13 @@ async fn sweeper_wall_clock_cap_reclaims_a_long_running_attempt() {
 
     let gh = Arc::new(FakeGitHub::new());
     // A 60s wall-clock cap catches the hour-old run despite the live lease.
-    sweeper_tick(&pool, gh.as_ref(), 60.0).await.expect("sweep");
+    sweeper_tick(
+        &pool,
+        Some(gh.as_ref() as &dyn factory_github::GitHubClient),
+        60.0,
+    )
+    .await
+    .expect("sweep");
 
     let after = record::work_item_by_id(&pool, item).await.unwrap().unwrap();
     assert_eq!(after.state, State::Queued, "stuck-but-alive run reclaimed");
@@ -294,8 +362,16 @@ async fn concurrent_sweeps_escalate_exactly_once() {
     // escalation must yield exactly one escalation row, not two.
     let gh = Arc::new(FakeGitHub::new());
     let (a, b) = tokio::join!(
-        sweeper_tick(&pool, gh.as_ref(), NEVER_WALL_CLOCK),
-        sweeper_tick(&pool, gh.as_ref(), NEVER_WALL_CLOCK),
+        sweeper_tick(
+            &pool,
+            Some(gh.as_ref() as &dyn factory_github::GitHubClient),
+            NEVER_WALL_CLOCK
+        ),
+        sweeper_tick(
+            &pool,
+            Some(gh.as_ref() as &dyn factory_github::GitHubClient),
+            NEVER_WALL_CLOCK
+        ),
     );
     a.expect("sweep a");
     b.expect("sweep b");

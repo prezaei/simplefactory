@@ -68,13 +68,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // One task drives both loops: the reactive coordinator tick and the lease sweeper.
-    // Both are gated on GitHub credentials. The coordinator genuinely needs GitHub for
-    // every decision (handoff comments, approval reads). The sweeper's DB-reclaim itself
-    // needs no GitHub (only its escalation *comment* does, which `reclaim_item` already
-    // degrades gracefully) — but gating it alongside the coordinator is deliberate and
-    // harmless: all Factory services share the one GitHub App, so credential-absent means
-    // the dispatcher can't mint installation tokens either, no workers ever launch, and
-    // there are therefore no live leases to reclaim. The gate never strands real work.
+    // The coordinator tick genuinely needs GitHub for every decision (handoff comments,
+    // approval reads), so it is SKIPPED when credentials are absent. The sweeper's
+    // DB-reclaim (free crashed-worker slots, revoke tokens, requeue/escalate) needs NO
+    // GitHub — only its escalation *comment* does — so it RUNS regardless, passing GitHub
+    // as optional; `reclaim_item` records the escalation without a comment when creds are
+    // absent. This way a credential outage can't leave pre-existing leases stuck forever.
     let mut coordinate = tokio::time::interval(COORDINATE_TICK);
     let mut sweep = tokio::time::interval(SWEEPER_TICK);
     loop {
@@ -93,11 +92,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             _ = sweep.tick() => {
-                let Some(gh) = gh.as_ref() else {
-                    tracing::warn!("skipping sweeper tick: GitHub App credentials are not configured");
-                    continue;
-                };
-                match sweeper_tick(&pool, gh, wall_clock_cap_secs).await {
+                // GitHub is optional for the sweeper — the DB reclaim runs without it.
+                let gh_opt = gh.as_ref().map(|g| g as &dyn factory_github::GitHubClient);
+                if gh_opt.is_none() {
+                    tracing::warn!("sweeper tick: GitHub creds absent; reclaiming without escalation comments");
+                }
+                match sweeper_tick(&pool, gh_opt, wall_clock_cap_secs).await {
                     Ok((0, 0)) => tracing::info!("sweeper tick: no expired leases"),
                     Ok((reclaimed, escalated)) => {
                         tracing::info!(reclaimed, escalated, "sweeper tick reclaimed expired leases")

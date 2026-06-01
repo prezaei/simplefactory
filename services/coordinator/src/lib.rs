@@ -201,9 +201,15 @@ enum ReclaimResult {
 /// escalation assignee; an item whose repo has no usable config is still reclaimed at
 /// the platform-default cap (its escalation, if any, records the row + terminalizes the
 /// item but posts no GitHub comment — there is no repo identity to post to).
+///
+/// `gh` is OPTIONAL: the DB reclaim (finish attempt, revoke tokens, requeue / record the
+/// escalation row + terminalize) needs no GitHub, and a coordinator running without App
+/// credentials must still free crashed-worker slots — only the escalation *comment* needs
+/// GitHub. When `gh` is `None`, an escalation records its row and terminalizes the item
+/// but posts no comment (same graceful degradation as the no-config case).
 pub async fn sweeper_tick(
     pool: &record::Pool,
-    gh: &dyn GitHubClient,
+    gh: Option<&dyn GitHubClient>,
     wall_clock_cap_secs: f64,
 ) -> anyhow::Result<(usize, usize)> {
     let items = record::fetch_expired_lease_items(pool, wall_clock_cap_secs).await?;
@@ -257,7 +263,7 @@ pub async fn sweeper_tick(
 /// extended the lease (irrelevant to the wall-clock branch) all resolve to exactly-once.
 async fn reclaim_item(
     pool: &record::Pool,
-    gh: &dyn GitHubClient,
+    gh: Option<&dyn GitHubClient>,
     item: &WorkItem,
     repo_and_config: Option<Arc<(RepoIdent, Config)>>,
     wall_clock_cap_secs: f64,
@@ -310,8 +316,13 @@ async fn reclaim_item(
         )
         .await?;
         tx.commit().await?;
-        match repo_and_config {
-            Some(rc) => {
+        // The escalation row + terminal state are committed above regardless of GitHub.
+        // The comment + assignment run only when BOTH GitHub creds AND a repo config are
+        // available; otherwise the escalation is recorded without a comment (the item is
+        // still terminalized, freeing its slot) — degrading gracefully rather than leaving
+        // a crashed-worker lease stuck forever.
+        match (gh, repo_and_config) {
+            (Some(gh), Some(rc)) => {
                 let (ident, config) = rc.as_ref();
                 run_post_commit(
                     gh,
@@ -322,8 +333,11 @@ async fn reclaim_item(
                 )
                 .await?;
             }
-            None => {
-                tracing::warn!(work_item = %item.id, "reclaim escalated retries_exhausted but repo has no config; recorded escalation without a GitHub comment");
+            (None, _) => {
+                tracing::warn!(work_item = %item.id, "reclaim escalated retries_exhausted but GitHub creds absent; recorded escalation without a comment");
+            }
+            (_, None) => {
+                tracing::warn!(work_item = %item.id, "reclaim escalated retries_exhausted but repo has no config; recorded escalation without a comment");
             }
         }
         ReclaimResult::Escalated
