@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use factory_dispatcher::{dispatch_once, DockerLauncher};
+use factory_dispatcher::{dispatch_once, DockerLauncher, WorkerRuntime};
 use factory_github::OctocrabGitHub;
 use uuid::Uuid;
 
@@ -32,7 +32,22 @@ async fn main() -> anyhow::Result<()> {
     let pool = factory_record::connect(&database_url).await?;
     factory_record::migrate(&pool).await?;
 
-    let launcher = DockerLauncher::new(image.clone());
+    // Forward the worker-container runtime wiring (Azure Blob connection string +
+    // claude token) read from the dispatcher's env. A worker launched via `docker
+    // run` isn't on the compose network, so it can't inherit these — they must be
+    // injected explicitly per launch.
+    let runtime = WorkerRuntime::from_env();
+    // Fail loud-but-early-ish: every worker hard-requires the blob connection string
+    // (no Fs fallback), so without it on the dispatcher each launched container would
+    // boot-loop on startup. Warn once here so the cause is one clear dispatcher log,
+    // not a stream of opaque per-worker boot failures.
+    if runtime.blob_connection_string.is_none() {
+        tracing::warn!(
+            "FACTORY_BLOB_CONNECTION_STRING is not set on the dispatcher; launched workers \
+             require it and will fail to start (no checkpoints / crash-resume)"
+        );
+    }
+    let launcher = DockerLauncher::new(image.clone()).with_runtime(runtime);
 
     // The dispatcher mints a per-launch installation token via the GitHub App. If
     // the App credentials are absent we keep the loop alive but skip every tick:

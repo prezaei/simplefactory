@@ -368,10 +368,33 @@ pub async fn checkpoint_loop(
     }
 }
 
-/// Snapshot the worktree to Blob at `checkpoint_uri` and persist the (session_id, uri)
-/// pointer on the attempt. The worktree-snapshot bytes are a DEPLOY SEAM (the real impl
-/// tars `workdir`; the fake records the call) — what is verified in CI is that a
-/// checkpoint is written and its pointer recorded so a resume can find it.
+/// The `claude` session/config directory to capture in a checkpoint, so a re-dispatch in
+/// a fresh container can `claude --resume` the SAME session — `claude` keeps session state
+/// here, not in the worktree. Only included when `CLAUDE_CONFIG_DIR` is explicitly set
+/// (the live worker container sets it); unset (tests/dev) → `None`, so a checkpoint never
+/// tars a developer's real `~/.claude`.
+fn claude_session_dir() -> Option<PathBuf> {
+    std::env::var("CLAUDE_CONFIG_DIR").ok().map(PathBuf::from)
+}
+
+/// The named roots a checkpoint captures: always the worktree, plus the `claude` session
+/// dir when configured. Borrows live for the archive/extract call.
+fn checkpoint_roots<'a>(
+    workdir: &'a Path,
+    session: &'a Option<PathBuf>,
+) -> Vec<(&'a str, &'a Path)> {
+    let mut roots: Vec<(&str, &Path)> = vec![("worktree", workdir)];
+    if let Some(session) = session {
+        roots.push(("session", session.as_path()));
+    }
+    roots
+}
+
+/// Snapshot the worktree (+ the `claude` session dir, when configured) to the checkpoint
+/// store at `checkpoint_uri` and persist the (session_id, uri) pointer on the attempt.
+/// The tar lives in `libs/blob::archive_dirs` (CI-unit-tested round-trip); the store is the
+/// deploy seam (Fs-on-shared-volume locally, Azure Blob in P8). tar is sync, so it runs on
+/// a blocking thread.
 async fn write_checkpoint(
     tools: &dyn ToolsClient,
     store: &dyn factory_blob::CheckpointStore,
@@ -379,19 +402,28 @@ async fn write_checkpoint(
     session_id: &str,
     checkpoint_uri: &str,
 ) -> anyhow::Result<()> {
-    // Deploy seam: a real worker tars `workdir`; the snapshot bytes are opaque to the
-    // resume orchestration, so a marker is sufficient for the CI-tested path.
-    let snapshot = format!("session={session_id};workdir={}", workdir.display());
-    store.write(checkpoint_uri, snapshot.as_bytes()).await?;
+    let workdir = workdir.to_path_buf();
+    let bytes = tokio::task::spawn_blocking(move || {
+        let session = claude_session_dir();
+        factory_blob::archive_dirs(&checkpoint_roots(&workdir, &session))
+    })
+    .await??;
+    store.write(checkpoint_uri, &bytes).await?;
     tools.save_checkpoint(session_id, checkpoint_uri).await?;
-    tracing::info!(session_id, checkpoint_uri, "worker: checkpoint saved");
+    tracing::info!(
+        session_id,
+        checkpoint_uri,
+        bytes = bytes.len(),
+        "worker: checkpoint saved"
+    );
     Ok(())
 }
 
-/// Restore a crashed session's worktree snapshot from Blob into `workdir` before
-/// `claude --resume`. Reading the snapshot is a DEPLOY SEAM (the real impl untars into
-/// `workdir`). A missing/unreadable snapshot is surfaced as an error; [`resolve_session`]
-/// catches it and degrades to a fresh attempt rather than running against an empty tree.
+/// Restore a crashed session's snapshot from the checkpoint store into `workdir` (+ the
+/// `claude` session dir) before `claude --resume`. untar lives in
+/// `libs/blob::extract_dirs`. A missing/unreadable snapshot is surfaced as an error;
+/// [`resolve_session`] catches it and degrades to a fresh attempt rather than running
+/// against an empty tree.
 async fn restore_checkpoint(
     store: &dyn factory_blob::CheckpointStore,
     info: &ResumeInfo,
@@ -399,7 +431,15 @@ async fn restore_checkpoint(
 ) -> anyhow::Result<()> {
     match store.read(&info.checkpoint_uri).await? {
         Some(bytes) => {
-            tracing::info!(checkpoint_uri = %info.checkpoint_uri, bytes = bytes.len(), workdir = %workdir.display(), "worker: restored worktree from checkpoint");
+            let workdir = workdir.to_path_buf();
+            let uri = info.checkpoint_uri.clone();
+            let n = bytes.len();
+            tokio::task::spawn_blocking(move || {
+                let session = claude_session_dir();
+                factory_blob::extract_dirs(&bytes, &checkpoint_roots(&workdir, &session))
+            })
+            .await??;
+            tracing::info!(checkpoint_uri = %uri, bytes = n, "worker: restored worktree + session from checkpoint");
             Ok(())
         }
         None => anyhow::bail!(
@@ -1680,25 +1720,39 @@ mod tests {
         assert_eq!(tools.heartbeats.load(Ordering::SeqCst), 3);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn checkpoint_loop_saves_each_interval() {
+    // The checkpoint LOOP's cadence (one fire per interval) is identical in structure to
+    // `heartbeat_loop` (proven by `heartbeat_loop_beats_each_interval`). Its ACTION —
+    // `write_checkpoint` — is verified directly here, deterministically: it tars the
+    // worktree to the store and records the (session, uri) pointer. (A paused-time loop
+    // test would race `write_checkpoint`'s `spawn_blocking` tar against the mocked clock.)
+    #[tokio::test]
+    async fn write_checkpoint_archives_worktree_and_records_pointer() {
         let tools = FakeTools::seeded();
         let store = factory_blob::InMemoryCheckpoints::new();
-        let workdir = PathBuf::from("/tmp/factory-cp-test");
+        let workdir = std::env::temp_dir().join(format!("factory-wc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(workdir.join("src")).unwrap();
+        std::fs::write(workdir.join("src/lib.rs"), "pub fn f() {}").unwrap();
         let uri = "checkpoints/ses-1/run-a.snapshot";
-        tokio::select! {
-            biased;
-            _ = checkpoint_loop(&tools, &store, &workdir, "ses-1", uri, 1) => unreachable!(),
-            _ = advance_secs(3) => {}
-        }
-        let saved = tools.checkpoints.lock().expect("lock").clone();
-        assert_eq!(saved.len(), 3, "one checkpoint pointer saved per interval");
-        for (session_id, saved_uri) in &saved {
-            assert_eq!(session_id, "ses-1");
-            assert_eq!(saved_uri, uri);
-        }
-        // The snapshot bytes reached the store at the run's uri.
-        assert!(store.read(uri).await.unwrap().is_some());
+
+        write_checkpoint(&tools, &store, &workdir, "ses-1", uri)
+            .await
+            .unwrap();
+
+        // The pointer was recorded against the attempt (via the Tools save_checkpoint).
+        assert_eq!(
+            tools.checkpoints.lock().expect("lock").clone(),
+            vec![("ses-1".to_string(), uri.to_string())]
+        );
+        // A real archive landed at the uri; extracting it round-trips the worktree.
+        let bytes = store.read(uri).await.unwrap().expect("archive stored");
+        let dest = std::env::temp_dir().join(format!("factory-wc-dest-{}", uuid::Uuid::new_v4()));
+        factory_blob::extract_dirs(&bytes, &[("worktree", dest.as_path())]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("src/lib.rs")).unwrap(),
+            "pub fn f() {}"
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+        let _ = std::fs::remove_dir_all(&dest);
     }
 
     #[tokio::test]
@@ -1725,12 +1779,18 @@ mod tests {
         let tools = FakeTools::seeded();
         let git = FakeGit::default();
         let claude = FakeClaude::ok("done");
-        // Seed the store with the prior session's snapshot so the restore succeeds.
+        // Seed the store with a REAL prior-session archive so restore_checkpoint can
+        // untar it (a non-archive blob would fail extraction → fall back to fresh).
+        let prior = std::env::temp_dir().join(format!("factory-prior-wt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(prior.join("src")).unwrap();
+        std::fs::write(prior.join("src/main.rs"), "fn main() {}").unwrap();
+        let archive = factory_blob::archive_dirs(&[("worktree", prior.as_path())]).unwrap();
         let store = std::sync::Arc::new(factory_blob::InMemoryCheckpoints::new());
         store
-            .write("checkpoints/ses-42.snapshot", b"prior worktree")
+            .write("checkpoints/ses-42.snapshot", &archive)
             .await
             .unwrap();
+        let _ = std::fs::remove_dir_all(&prior);
         let mut cfg = config_resume(Some(ResumeInfo {
             session_id: "ses-42".into(),
             checkpoint_uri: "checkpoints/ses-42.snapshot".into(),

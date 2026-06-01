@@ -496,7 +496,7 @@ fn env_secs(key: &str, default: u64) -> u64 {
     }
 }
 
-fn load_config() -> anyhow::Result<HarnessConfig> {
+async fn load_config() -> anyhow::Result<HarnessConfig> {
     let workdir = match std::env::var("FACTORY_WORKDIR") {
         Ok(d) => PathBuf::from(d),
         Err(_) => std::env::temp_dir().join(format!("factory-worker-{}", uuid::Uuid::new_v4())),
@@ -522,13 +522,15 @@ fn load_config() -> anyhow::Result<HarnessConfig> {
         }
         _ => None,
     };
-    // Checkpoints persist to the local filesystem for parity; the Azure Blob swap is P7.
-    let checkpoint_root = std::env::var("FACTORY_CHECKPOINT_ROOT").unwrap_or_else(|_| {
-        std::env::temp_dir()
-            .join("factory-checkpoints")
-            .display()
-            .to_string()
-    });
+    // Checkpoints persist to Azure Blob (Azurite locally in P7, real Azure in P8) so
+    // they survive the worker container for crash-resume. This is the SOLE production
+    // store — there is no filesystem fallback (a dev/prod fork we deliberately removed).
+    let blob_conn = env_var("FACTORY_BLOB_CONNECTION_STRING")?;
+    let checkpoint_store = factory_blob::AzureBlobCheckpoints::connect(
+        &blob_conn,
+        factory_blob::DEFAULT_CHECKPOINT_CONTAINER,
+    )
+    .await?;
     Ok(HarnessConfig {
         repo_url: env_var("FACTORY_REPO_URL")?,
         install_token: env_var("FACTORY_INSTALL_TOKEN")?,
@@ -544,7 +546,7 @@ fn load_config() -> anyhow::Result<HarnessConfig> {
             DEFAULT_CHECKPOINT_INTERVAL_SECS,
         ),
         resume,
-        checkpoint_store: std::sync::Arc::new(factory_blob::FsCheckpoints::new(checkpoint_root)),
+        checkpoint_store: std::sync::Arc::new(checkpoint_store),
     })
 }
 
@@ -553,7 +555,7 @@ async fn main() -> anyhow::Result<()> {
     factory_telemetry::init("worker");
     tracing::info!("worker: starting harness (P3)");
 
-    let cfg = load_config()?;
+    let cfg = load_config().await?;
     // The pinned config sha rides in on the env (FACTORY_CONFIG_SHA) purely for
     // traceability: log it so an in-flight attempt's logs name the exact config version
     // it was dispatched under (telemetry mandate). The run itself uses the prompt Tools

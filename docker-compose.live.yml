@@ -1,0 +1,86 @@
+# Factory LOCAL LIVE SMOKE overlay (P7). Layers the long-running services on top of
+# the base stack (Postgres + Azurite) in docker-compose.yml. NOT a CI artifact — it
+# needs a real GitHub App, a real `claude` setup-token, and Docker on the host.
+#
+#   cp .env.live.example .env.live      # fill in the real secrets
+#   docker build --target worker -t factory-worker:local .          # the worker image
+#   docker compose -f docker-compose.yml -f docker-compose.live.yml --env-file .env.live up --build
+#
+# See docs/runbooks/local-live-smoke.md for the full procedure (App registration,
+# claude setup-token, webhook forwarding, the smoke + crash-resume drill).
+#
+# Networking note: the worker runs as a STANDALONE container launched by the
+# dispatcher via the host docker socket — it is NOT on this compose network, so it
+# reaches Tools + Azurite via `host.docker.internal` (the dispatcher forwards those
+# URLs; DockerLauncher adds the host-gateway mapping). Tools reaches Azurite the same
+# way (via extra_hosts) so a single connection string works everywhere.
+
+services:
+  intake:
+    build:
+      context: .
+      target: services
+    image: factory-services:local
+    command: ["factory-intake"]
+    env_file: .env.live
+    ports:
+      - "8080:8080" # GitHub webhooks → /webhooks/github
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  tools:
+    build:
+      context: .
+      target: services
+    image: factory-services:local
+    command: ["factory-tools"]
+    env_file: .env.live
+    ports:
+      - "8081:8081" # the worker's only channel to Factory (reached at host.docker.internal:8081)
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # reach Azurite at host.docker.internal:10000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      azurite:
+        condition: service_healthy
+
+  dispatcher:
+    build:
+      context: .
+      target: services
+    image: factory-services:local
+    command: ["factory-dispatcher"]
+    env_file: .env.live
+    # Launches worker containers on the HOST daemon via the mounted socket. The worker
+    # image (factory-worker:local) must already be built on the host.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  coordinator:
+    build:
+      context: .
+      target: services
+    image: factory-services:local
+    command: ["factory-coordinator"]
+    env_file: .env.live
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  dashboard-api:
+    build:
+      context: .
+      target: services
+    image: factory-services:local
+    command: ["factory-dashboard-api"]
+    env_file: .env.live
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy

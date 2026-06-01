@@ -165,18 +165,65 @@ impl WorkerLauncher for FakeLauncher {
     }
 }
 
+/// Host-side wiring injected into every worker container that the pure
+/// [`docker_run_args`] can't derive from a [`LaunchSpec`]: the Azure Blob (Azurite
+/// in P7) connection string the worker checkpoints to, and the `claude` auth token.
+/// Read once from the dispatcher's environment in `main`, so the launch path stays
+/// a pure, testable function. A worker launched via `docker run` is NOT on the
+/// compose network, so it reaches Azurite/Tools via `host.docker.internal` — hence
+/// these are passed explicitly rather than inherited from the compose env.
+#[derive(Clone, Default)]
+pub struct WorkerRuntime {
+    /// Azure Blob connection string (Azurite in P7) the worker's `CheckpointStore`
+    /// writes to, forwarded as `FACTORY_BLOB_CONNECTION_STRING`. Survives the
+    /// container so a re-dispatched worker reads the dead attempt's checkpoint
+    /// (crash-resume). Secret-ish (holds the account key for Azurite); never logged.
+    /// `None` ⇒ not forwarded, and the worker (which has no Fs fallback) will fail
+    /// fast — so a live dispatcher must always set `FACTORY_BLOB_CONNECTION_STRING`.
+    pub blob_connection_string: Option<String>,
+    /// `claude` setup-token, forwarded as `CLAUDE_CODE_OAUTH_TOKEN`. Secret; never
+    /// logged. `None` ⇒ not forwarded (the image must supply auth another way).
+    pub claude_oauth_token: Option<String>,
+}
+
+impl WorkerRuntime {
+    /// Read the worker-container runtime wiring from the dispatcher's environment.
+    /// Empty values are treated as unset so a blank env var can't inject an empty
+    /// connection string or token.
+    pub fn from_env() -> Self {
+        Self {
+            blob_connection_string: non_empty_env("FACTORY_BLOB_CONNECTION_STRING"),
+            claude_oauth_token: non_empty_env("CLAUDE_CODE_OAUTH_TOKEN"),
+        }
+    }
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
 /// Live launcher: runs a worker container via `docker run`, injecting the task
 /// token and Tools URL as environment variables. Best-effort — this is the seam
 /// that actually reaches Docker and is exercised in the live environment.
 pub struct DockerLauncher {
     image: String,
+    runtime: WorkerRuntime,
 }
 
 impl DockerLauncher {
     pub fn new(image: impl Into<String>) -> Self {
         Self {
             image: image.into(),
+            runtime: WorkerRuntime::default(),
         }
+    }
+
+    /// Attach the host-side runtime wiring (shared checkpoint mount + claude token)
+    /// read from the environment. Without it, workers launch with no shared
+    /// checkpoint volume — fine for a non-resuming run, not for crash-resume.
+    pub fn with_runtime(mut self, runtime: WorkerRuntime) -> Self {
+        self.runtime = runtime;
+        self
     }
 }
 
@@ -193,7 +240,7 @@ impl WorkerLauncher for DockerLauncher {
             image = %self.image,
             "DockerLauncher: docker run --rm --detach"
         );
-        let args = docker_run_args(&self.image, spec);
+        let args = docker_run_args(&self.image, &self.runtime, spec);
         let output = tokio::process::Command::new("docker")
             .args(&args)
             .output()
@@ -227,13 +274,18 @@ impl WorkerLauncher for DockerLauncher {
 /// place the raw token appears), and the image is the final positional argument
 /// so `docker run` treats everything after it as the container's command. The
 /// returned vec contains the token and MUST NOT be logged.
-fn docker_run_args(image: &str, spec: &LaunchSpec) -> Vec<String> {
+fn docker_run_args(image: &str, runtime: &WorkerRuntime, spec: &LaunchSpec) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "--rm".to_string(),
         "--detach".to_string(),
     ];
-    for (key, value) in docker_env(spec) {
+    // A worker launched via `docker run` is NOT on the compose network, so it reaches
+    // host-published services (Tools, webhooks) via `host.docker.internal`. Map it to
+    // the host gateway so the name resolves on Linux too (Docker Desktop already does).
+    args.push("--add-host".to_string());
+    args.push("host.docker.internal:host-gateway".to_string());
+    for (key, value) in docker_env(runtime, spec) {
         args.push("-e".to_string());
         args.push(format!("{key}={value}"));
     }
@@ -245,7 +297,7 @@ fn docker_run_args(image: &str, spec: &LaunchSpec) -> Vec<String> {
 /// The environment passed into the worker container, as ordered (key, value)
 /// pairs. The raw task token is delivered here (`FACTORY_TASK_TOKEN`) so it never
 /// touches a logged argv string.
-pub fn docker_env(spec: &LaunchSpec) -> Vec<(&'static str, String)> {
+pub fn docker_env(runtime: &WorkerRuntime, spec: &LaunchSpec) -> Vec<(&'static str, String)> {
     let mut env = vec![
         // Secrets — never logged.
         ("FACTORY_TASK_TOKEN", spec.raw_token.clone()),
@@ -271,6 +323,15 @@ pub fn docker_env(spec: &LaunchSpec) -> Vec<(&'static str, String)> {
             "FACTORY_RESUME_CHECKPOINT_URI",
             resume.checkpoint_uri.clone(),
         ));
+    }
+    // Point the worker's checkpoint/transcript stores at the shared Azure Blob
+    // (Azurite in P7) so snapshots survive the container and a resume can read them.
+    if let Some(conn) = &runtime.blob_connection_string {
+        env.push(("FACTORY_BLOB_CONNECTION_STRING", conn.clone()));
+    }
+    // claude auth (setup-token) — secret, forwarded only as an env value.
+    if let Some(token) = &runtime.claude_oauth_token {
+        env.push(("CLAUDE_CODE_OAUTH_TOKEN", token.clone()));
     }
     env
 }
@@ -489,7 +550,7 @@ mod tests {
 
     #[test]
     fn docker_env_carries_token_and_required_keys() {
-        let env = docker_env(&spec());
+        let env = docker_env(&WorkerRuntime::default(), &spec());
         let token = env
             .iter()
             .find(|(k, _)| *k == "FACTORY_TASK_TOKEN")
@@ -524,7 +585,7 @@ mod tests {
 
     #[test]
     fn docker_env_carries_the_pinned_config_sha() {
-        let env = docker_env(&spec());
+        let env = docker_env(&WorkerRuntime::default(), &spec());
         let sha = env
             .iter()
             .find(|(k, _)| *k == "FACTORY_CONFIG_SHA")
@@ -537,7 +598,10 @@ mod tests {
 
     #[test]
     fn docker_env_omits_resume_vars_for_a_fresh_launch() {
-        let keys: Vec<&str> = docker_env(&spec()).iter().map(|(k, _)| *k).collect();
+        let keys: Vec<&str> = docker_env(&WorkerRuntime::default(), &spec())
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
         assert!(!keys.contains(&"FACTORY_RESUME_SESSION_ID"));
         assert!(!keys.contains(&"FACTORY_RESUME_CHECKPOINT_URI"));
     }
@@ -549,7 +613,7 @@ mod tests {
             session_id: "ses-9".into(),
             checkpoint_uri: "checkpoints/ses-9.snapshot".into(),
         });
-        let env = docker_env(&s);
+        let env = docker_env(&WorkerRuntime::default(), &s);
         let sid = env
             .iter()
             .find(|(k, _)| *k == "FACTORY_RESUME_SESSION_ID")
@@ -596,7 +660,11 @@ mod tests {
 
     #[test]
     fn docker_run_args_pass_install_token_only_in_an_env_pair() {
-        let args = docker_run_args("ghcr.io/acme/worker:latest", &spec());
+        let args = docker_run_args(
+            "ghcr.io/acme/worker:latest",
+            &WorkerRuntime::default(),
+            &spec(),
+        );
         // The install token appears exactly once, in the FACTORY_INSTALL_TOKEN env value.
         let hits: Vec<&String> = args.iter().filter(|a| a.contains(INSTALL_TOKEN)).collect();
         assert_eq!(hits.len(), 1, "install token must appear exactly once");
@@ -607,7 +675,11 @@ mod tests {
 
     #[test]
     fn docker_run_args_have_image_last_and_run_flags_first() {
-        let args = docker_run_args("ghcr.io/acme/worker:latest", &spec());
+        let args = docker_run_args(
+            "ghcr.io/acme/worker:latest",
+            &WorkerRuntime::default(),
+            &spec(),
+        );
         assert_eq!(args[0], "run");
         assert_eq!(args[1], "--rm");
         assert_eq!(args[2], "--detach");
@@ -617,7 +689,11 @@ mod tests {
 
     #[test]
     fn docker_run_args_pass_token_only_in_an_env_pair() {
-        let args = docker_run_args("ghcr.io/acme/worker:latest", &spec());
+        let args = docker_run_args(
+            "ghcr.io/acme/worker:latest",
+            &WorkerRuntime::default(),
+            &spec(),
+        );
         // The token appears exactly once, in the FACTORY_TASK_TOKEN env value.
         let token_args: Vec<&String> = args.iter().filter(|a| a.contains(TOKEN)).collect();
         assert_eq!(token_args.len(), 1, "token must appear exactly once");
@@ -629,7 +705,83 @@ mod tests {
 
     #[test]
     fn docker_run_args_never_put_token_in_the_image_position() {
-        let args = docker_run_args("ghcr.io/acme/worker:latest", &spec());
+        let args = docker_run_args(
+            "ghcr.io/acme/worker:latest",
+            &WorkerRuntime::default(),
+            &spec(),
+        );
         assert!(!args.last().unwrap().contains(TOKEN));
+    }
+
+    #[test]
+    fn docker_run_args_always_map_host_gateway() {
+        // The worker (a standalone container, not on the compose network) must be able
+        // to resolve host.docker.internal to reach host-published Tools.
+        let args = docker_run_args("img", &WorkerRuntime::default(), &spec());
+        let idx = args
+            .iter()
+            .position(|a| a == "host.docker.internal:host-gateway")
+            .expect("host-gateway mapping present");
+        assert_eq!(args[idx - 1], "--add-host");
+    }
+
+    #[test]
+    fn docker_env_forwards_the_blob_connection_string_when_configured() {
+        let runtime = WorkerRuntime {
+            blob_connection_string: Some(
+                "BlobEndpoint=http://host.docker.internal:10000/x".to_string(),
+            ),
+            ..WorkerRuntime::default()
+        };
+        let conn = docker_env(&runtime, &spec())
+            .into_iter()
+            .find(|(k, _)| *k == "FACTORY_BLOB_CONNECTION_STRING");
+        assert_eq!(
+            conn,
+            Some((
+                "FACTORY_BLOB_CONNECTION_STRING",
+                "BlobEndpoint=http://host.docker.internal:10000/x".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn docker_env_omits_blob_connection_string_when_unset() {
+        let keys: Vec<&str> = docker_env(&WorkerRuntime::default(), &spec())
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        assert!(!keys.contains(&"FACTORY_BLOB_CONNECTION_STRING"));
+    }
+
+    #[test]
+    fn docker_run_args_forward_claude_token_only_as_an_env_pair() {
+        let runtime = WorkerRuntime {
+            claude_oauth_token: Some("sk-claude-secret".to_string()),
+            ..WorkerRuntime::default()
+        };
+        let args = docker_run_args("img", &runtime, &spec());
+        let hits: Vec<&String> = args
+            .iter()
+            .filter(|a| a.contains("sk-claude-secret"))
+            .collect();
+        assert_eq!(hits.len(), 1, "claude token must appear exactly once");
+        assert_eq!(hits[0], "CLAUDE_CODE_OAUTH_TOKEN=sk-claude-secret");
+        let idx = args
+            .iter()
+            .position(|a| a.contains("sk-claude-secret"))
+            .unwrap();
+        assert_eq!(args[idx - 1], "-e");
+        // Never in the image (trailing) position.
+        assert!(!args.last().unwrap().contains("sk-claude-secret"));
+    }
+
+    #[test]
+    fn docker_env_omits_claude_token_when_unset() {
+        let keys: Vec<&str> = docker_env(&WorkerRuntime::default(), &spec())
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        assert!(!keys.contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
     }
 }

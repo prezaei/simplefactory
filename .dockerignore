@@ -1,0 +1,11 @@
+# Keep the Docker build context small + reproducible: the builder runs a clean
+# `cargo build` inside the image, so the host's build output and local state must
+# not be copied in.
+target/
+.git/
+.ship-it/
+.factory-state/
+**/*.swp
+.env
+.env.live
+.DS_Store
