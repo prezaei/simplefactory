@@ -975,15 +975,18 @@ pub async fn finish_attempt(
 }
 
 /// A resumable checkpoint recovered for a work item: the Claude session to resume
-/// and the Blob URI of its worktree snapshot, plus how many of this item's attempts
-/// have carried a session (the resume budget — see [`last_checkpoint_for_item`]).
+/// and the Blob URI of its worktree snapshot, plus the resume budget consumed so far
+/// (see [`last_checkpoint_for_item`]).
 #[derive(Debug, Clone)]
 pub struct CheckpointInfo {
     pub session_id: String,
     pub checkpoint_uri: String,
-    /// Number of attempts for this work item that recorded a session id — i.e. how many
-    /// times the session has already been carried/resumed. The dispatcher bounds resumes
-    /// against this (`resume_count >= cap` → start a fresh attempt instead).
+    /// Number of attempts started AFTER the latest checkpointed attempt — i.e. how many
+    /// times this session has been re-dispatched (resumed) since it last made progress
+    /// (checkpointed), INCLUDING resumes that crashed before checkpointing. The dispatcher
+    /// bounds resumes against this (`resume_count >= cap` → start a fresh attempt instead);
+    /// a fresh checkpoint resets the budget. See [`last_checkpoint_for_item`] for why this
+    /// counts re-dispatches, not attempts-that-checkpointed.
     pub resume_count: u64,
 }
 

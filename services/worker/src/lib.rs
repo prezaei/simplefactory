@@ -421,10 +421,19 @@ async fn run_coder(
     session_id: &str,
     resume: bool,
 ) -> anyhow::Result<()> {
-    tracing::info!(workdir = %cfg.workdir.display(), "worker(coder): shallow cloning repository");
-    git.shallow_clone(&cfg.repo_url, &cfg.install_token, &cfg.workdir)
-        .await?;
-    tracing::info!("worker(coder): clone complete");
+    // A FRESH coder run clones the repo into workdir. A RESUME must NOT clone: the
+    // worktree was already restored from the checkpoint into this same workdir by
+    // `resolve_session` (run before the role), so a second clone would either fail on the
+    // populated directory or clobber the restored tree, making `claude --resume` continue
+    // against the wrong worktree.
+    if resume {
+        tracing::info!(workdir = %cfg.workdir.display(), "worker(coder): resume — using restored worktree, skipping fresh clone");
+    } else {
+        tracing::info!(workdir = %cfg.workdir.display(), "worker(coder): shallow cloning repository");
+        git.shallow_clone(&cfg.repo_url, &cfg.install_token, &cfg.workdir)
+            .await?;
+        tracing::info!("worker(coder): clone complete");
+    }
 
     tracing::info!(tools_url = %cfg.tools_url, resume, "worker(coder): running Claude Code headless");
     let outcome = claude
@@ -1738,6 +1747,13 @@ mod tests {
             .expect("claude ran");
         assert!(resume, "a resume run sets the resume flag");
         assert_eq!(session_id, "ses-42", "it continues the prior session");
+        // A resumed coder must NOT re-clone: the restored worktree is the working tree, so
+        // a fresh clone would clobber it and `claude --resume` would run against the wrong tree.
+        assert_eq!(
+            git.clones.load(Ordering::SeqCst),
+            0,
+            "resume reuses the restored worktree; no fresh clone"
+        );
     }
 
     #[tokio::test]
