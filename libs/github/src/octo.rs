@@ -185,44 +185,41 @@ fn map_status_state(state: &str) -> CheckConclusion {
 /// next tick), not degrade a green CR to an escalation.
 const PERMISSION_DENIED_MESSAGE: &str = "Resource not accessible by integration";
 
+/// The HTTP status + message of a structured GitHub API error, or `None` for a
+/// transport/parse/auth error that carries no HTTP status. The ONE place that
+/// destructures octocrab's `#[non_exhaustive]` `Error::GitHub` shape, so status-based
+/// classification (404 not-found in `get_file`, 403 permission here) lives in a single
+/// accessor instead of being re-spelled at each call site.
+fn github_status_and_message(e: &octocrab::Error) -> Option<(u16, &str)> {
+    match e {
+        octocrab::Error::GitHub { source, .. } => {
+            Some((source.status_code.as_u16(), source.message.as_str()))
+        }
+        _ => None,
+    }
+}
+
 /// True when an octocrab error is a GitHub **403 App-permission denial** — the App lacks
 /// a permission for this read (e.g. `Commit statuses: read`). DISTINCT from a transient
 /// error (incl. a rate-limit 403): a permission 403 won't fix itself on retry, so the
 /// caller must DEGRADE rather than loop on it forever. Matches on the 403 status AND the
 /// specific permission message (see [`PERMISSION_DENIED_MESSAGE`]) so rate-limit 403s
-/// still propagate. (`Error::GitHub`/`GitHubError` are `#[non_exhaustive]`, so this
-/// matches by shape — it can't be unit-tested by constructing one; the pure rollup policy
-/// lives in [`combined_status_contribution`].)
+/// still propagate.
 fn is_permission_denied(e: &octocrab::Error) -> bool {
     matches!(
-        e,
-        octocrab::Error::GitHub { source, .. }
-            if source.status_code.as_u16() == 403
-                && source.message.contains(PERMISSION_DENIED_MESSAGE)
+        github_status_and_message(e),
+        Some((403, msg)) if msg.contains(PERMISSION_DENIED_MESSAGE)
     )
 }
 
-/// The combined check-rollup contribution from the legacy commit-status read (FIX B),
-/// plus the permission-degradation fold shared by BOTH gating reads. Pure so the policy
-/// is unit-tested without real GitHub:
-/// - `permission_denied` → `Some(Failure)`: a gating read (check-runs OR commit statuses)
-///   was 403'd, so we CANNOT confirm there is no failing check. Contributing `Failure`
-///   keeps the CR off the false-green path (the coordinator escalates it to a human)
-///   instead of the read hard-failing the whole reaction on every tick forever.
-/// - otherwise a status with ≥1 context folds its server-computed rollup `state`.
-/// - a status with ZERO contexts contributes nothing — GitHub reports `pending` for a
-///   SHA with no statuses, so the empty case must stay green (FIX 2).
-fn combined_status_contribution(
-    status: Option<&CombinedStatus>,
-    permission_denied: bool,
-) -> Option<CheckConclusion> {
-    if permission_denied {
-        return Some(CheckConclusion::Failure);
-    }
-    match status {
-        Some(s) if s.total_count > 0 => Some(map_status_state(&s.state)),
-        _ => None,
-    }
+/// The legacy combined-commit-status contribution to the check rollup (FIX B). Pure so
+/// the empty-vs-non-empty policy is unit-tested without real GitHub: a status with ≥1
+/// context folds its server-computed rollup `state`; a status with ZERO contexts
+/// contributes nothing — GitHub reports `pending` for a SHA with no statuses, so the
+/// empty case must stay green (FIX 2). (A permission-denied gating read is handled by the
+/// caller, which folds a single NOT-green contribution; see `check_status`.)
+fn combined_status_contribution(status: &CombinedStatus) -> Option<CheckConclusion> {
+    (status.total_count > 0).then(|| map_status_state(&status.state))
 }
 
 #[async_trait::async_trait]
@@ -580,14 +577,17 @@ impl GitHubClient for OctocrabGitHub {
         // status context) rather than paging the `statuses` array — so a failing status on
         // a later page can never be missed (the false-green a first-page-only read had).
         // Skip the combined-status read entirely if the check-runs read was already
-        // permission-denied (it would almost certainly 403 too): we already degrade below.
-        let mut status_opt: Option<CombinedStatus> = None;
+        // permission-denied (it would almost certainly 403 too): the fold below degrades.
         if !permission_denied {
             let route = format!("/repos/{}/{}/commits/{}/status", repo.owner, repo.name, sha);
             let status_result: Result<CombinedStatus, octocrab::Error> =
                 client.get(&route, None::<&()>).await;
             match status_result {
-                Ok(s) => status_opt = Some(s),
+                Ok(status) => {
+                    if let Some(conclusion) = combined_status_contribution(&status) {
+                        checks.push(("combined-status".to_owned(), conclusion));
+                    }
+                }
                 // Degrade a PERMISSION 403 (App missing `Commit statuses: read`) — same as
                 // the check-runs read above. A non-permission error (transient/5xx) still
                 // propagates so the next tick retries.
@@ -607,17 +607,11 @@ impl GitHubClient for OctocrabGitHub {
                 }
             }
         }
-        // Fold ONE contribution covering both gating reads: a permission denial on either
-        // → NOT-green (escalate); otherwise the legacy combined-status rollup (FIX B).
-        if let Some(conclusion) =
-            combined_status_contribution(status_opt.as_ref(), permission_denied)
-        {
-            let label = if permission_denied {
-                "gating-unreadable"
-            } else {
-                "combined-status"
-            };
-            checks.push((label.to_owned(), conclusion));
+        // A permission denial on EITHER gating read → fold ONE NOT-green contribution so
+        // the rollup can't false-green and the coordinator escalates the CR to a human
+        // (vs. the read hard-failing the whole reaction on every tick forever).
+        if permission_denied {
+            checks.push(("gating-unreadable".to_owned(), CheckConclusion::Failure));
         }
 
         // FIX 2 + FIX 6 + FIX B: roll up through the SHARED rollup over the UNION of
@@ -651,7 +645,7 @@ impl GitHubClient for OctocrabGitHub {
                 Some(item) => Ok(item.decoded_content()),
                 None => Ok(None),
             },
-            Err(octocrab::Error::GitHub { source, .. }) if source.status_code.as_u16() == 404 => {
+            Err(e) if matches!(github_status_and_message(&e), Some((404, _))) => {
                 tracing::info!(path, git_ref, "file not found");
                 Ok(None)
             }
@@ -664,26 +658,7 @@ impl GitHubClient for OctocrabGitHub {
 mod tests {
     use super::*;
 
-    // ---- combined_status_contribution: legacy-commit-status fold + 403 degradation ----
-
-    #[test]
-    fn combined_status_permission_denied_contributes_failure() {
-        // The bug this guards: a 403 reading commit statuses must NOT false-green the CR
-        // and must NOT loop forever — it folds in Failure so the coordinator escalates.
-        assert_eq!(
-            combined_status_contribution(None, true),
-            Some(CheckConclusion::Failure)
-        );
-        // Permission-denied dominates even if a (stale) status happens to be present.
-        let green = CombinedStatus {
-            state: "success".to_owned(),
-            total_count: 3,
-        };
-        assert_eq!(
-            combined_status_contribution(Some(&green), true),
-            Some(CheckConclusion::Failure)
-        );
-    }
+    // ---- combined_status_contribution: legacy-commit-status fold ----
 
     #[test]
     fn combined_status_folds_state_only_when_contexts_exist() {
@@ -692,7 +667,7 @@ mod tests {
             total_count: 2,
         };
         assert_eq!(
-            combined_status_contribution(Some(&success), false),
+            combined_status_contribution(&success),
             Some(CheckConclusion::Success)
         );
         let failing = CombinedStatus {
@@ -700,7 +675,7 @@ mod tests {
             total_count: 1,
         };
         assert_eq!(
-            combined_status_contribution(Some(&failing), false),
+            combined_status_contribution(&failing),
             Some(CheckConclusion::Failure)
         );
         // ZERO contexts → contribute nothing so the empty case stays green (FIX 2):
@@ -709,8 +684,21 @@ mod tests {
             state: "pending".to_owned(),
             total_count: 0,
         };
-        assert_eq!(combined_status_contribution(Some(&empty), false), None);
-        assert_eq!(combined_status_contribution(None, false), None);
+        assert_eq!(combined_status_contribution(&empty), None);
+    }
+
+    // The permission-denied degradation (folded inline in `check_status`) contributes a
+    // `Failure`, which must roll up NOT-green so the coordinator escalates the CR to a
+    // human rather than false-greening it or looping forever on the unreadable gate.
+    #[test]
+    fn permission_denied_contribution_rolls_up_not_green() {
+        let overall = CheckSummary::rollup(vec![(
+            "gating-unreadable".to_owned(),
+            CheckConclusion::Failure,
+        )])
+        .overall;
+        assert_eq!(overall, CheckConclusion::Failure);
+        assert_ne!(overall, CheckConclusion::Success);
     }
 
     // ---- map_conclusion: GitHub Checks API `conclusion` → CheckConclusion ----
