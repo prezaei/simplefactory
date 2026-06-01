@@ -178,14 +178,24 @@ This backs the technical spec's resilience requirements-traceability rows (crash
 
 **Goal:** prove the real **deploy seams actually work** — end-to-end, locally, against a throwaway test repo — *before* adding Azure infrastructure. Every external integration the earlier phases built behind a trait and faked in CI (`OctocrabGitHub`, `ClaudeRunner`=`ClaudeCli`, `Workspace`=`GitCli`, `WorkerLauncher`=`DockerLauncher`, Blob via Azurite) gets its first real exercise here. This deliberately **separates seam-correctness from infra-correctness**: if P8's first cloud run fails, the seams are already known-good, so the failure is Azure plumbing — not git auth, `claude --resume`, docker launch, or the octocrab calls.
 
-**Tasks**
-- **Runbook** (`docs/runbooks/local-live-smoke.md`): register a GitHub App on a throwaway repo (App id + private key PEM + webhook secret), install it on the repo; install + authenticate the `claude` CLI (`ANTHROPIC_API_KEY` / `claude login`); `docker-compose up` (Postgres + Azurite); start `intake`/`dispatcher`/`coordinator`/`tools` with the real-credential env (`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `FACTORY_*`).
-- **Inbound webhooks** to `localhost`: `gh webhook forward` (simplest, no public URL) or smee/ngrok pointing the App webhook at `localhost:8080/webhooks/github` (the intake service).
-- **Live wiring** (a compose `live` profile / env): the worker uses the REAL `ClaudeCli` + `GitCli` + `DockerLauncher`, and Blob points at **Azurite** (so transcripts/checkpoints round-trip through a real object store, not `FsTranscripts`/`FsCheckpoints`).
-- **`scripts/smoke.sh`**: drive ONE labelled issue → **manager triage → coder CR → reviewer verdict → merge-handoff**, then capture the run's transcript + the resulting real CR as the artifact.
+**Decisions (locked).** The smoke runs at **full P8 fidelity locally** so the only thing P8 adds is cloud infra:
+- **Worker runtime: real Docker image + `DockerLauncher`** (not the binary-direct shortcut) — `services/worker/Dockerfile` packages the worker binary + `git` + the `claude` CLI; the dispatcher launches it via `docker run`, exercising the launch seam.
+- **Claude auth: `claude setup-token`** — a long-lived token (generated once, interactively, on the host via `claude login` → `claude setup-token`) injected into the worker container as an env var. No host `~/.claude` bind-mount; mirrors how P8 injects a Key Vault secret into Container Apps.
+- **Blob: an Azure-Blob `TranscriptStore`/`CheckpointStore` client pointed at Azurite** — the **P8 Blob client pulled forward**. A throwaway worker container can't use `FsTranscripts`/`FsCheckpoints` (its filesystem dies with it), so checkpoints/transcripts must round-trip a real object store; Azurite is that store locally, and P8 just repoints it at Azure Blob.
+- **Real checkpoint/restore (closes the P5 deploy seam):** `write_checkpoint` tars the worktree (+ the `claude` session state) → Blob; `restore_checkpoint` untars it → `workdir` before `claude --resume`. (P5 shipped these as faked seams; P7 makes them real.)
+- **Scope: happy path + crash-resume** — not only issue→CR→handoff, but also **kill the worker container mid-run → the sweeper reclaims → the re-dispatch restores from Azurite and `claude --resume`s the same session**.
 
-**Tests:** this is a **scripted manual smoke**, not a CI test (it needs real credentials + the `claude` binary + Docker, exactly the things CI can't have). The artifact is the captured transcript + CR URL proving the loop ran for real once.
-**Exit:** a labelled issue in a throwaway test repo runs the full loop **locally, end-to-end** — real GitHub App, real `claude`, real Docker worker, Azurite Blob — producing a real change request and a merge-handoff. **Depends on:** P4 (the full loop); ideally P4.5/P5/P6 for a production-honest run. It is the first real validation of the deploy seams P3+ built behind traits, so it is the natural predecessor to P8.
+**Tasks**
+- **Worker `Dockerfile`** (worker binary + `git` + `claude` CLI) + a built local image.
+- **Azure-Blob client** for `TranscriptStore` + `CheckpointStore` (the P8 client), wired to Azurite via the compose `live` profile.
+- **Real tar/untar** in `write_checkpoint`/`restore_checkpoint` (worktree + claude session).
+- **Compose `live` profile / env**: worker uses the REAL `ClaudeCli` + `GitCli` + `DockerLauncher` + the Azurite Blob client; services started with the real-credential env (`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, the `claude` setup-token, `FACTORY_*`).
+- **Inbound webhooks** to `localhost`: `gh webhook forward` (simplest, no public URL) or smee/ngrok → `localhost:8080/webhooks/github` (the intake service).
+- **Runbook** (`docs/runbooks/local-live-smoke.md`): register a GitHub App (perms issues/pull_requests/contents/checks read-write; events issues/pull_request/pull_request_review/issue_comment/push; webhook secret) + install on a throwaway repo (default `prezaei/factory-smoke`, opt-in label `factory`, a `.factory/config.yml` with manager+coder+reviewer); `claude login` → `claude setup-token`; `docker-compose up` (Postgres + Azurite) + the `live` profile; run steps.
+- **`scripts/smoke.sh`**: label an issue → **manager triage → coder CR → reviewer verdict → merge-handoff**, capture the transcript + the real CR; a second pass exercises the crash-resume drill.
+
+**Tests:** the **CI-testable parts are real tests** — the Azure-Blob client against Azurite (an integration lane) and the checkpoint tar/untar round-trip (with a fake store). The **live run + crash-resume drill** are a scripted manual smoke (they need real credentials + the `claude` binary + Docker, exactly what CI can't have); the artifact is the captured transcript + CR URL.
+**Exit:** a labelled issue in the throwaway repo runs the full loop **locally, end-to-end** — real GitHub App, real `claude`, real Docker worker, Azurite Blob — producing a real change request + merge-handoff, AND a worker killed mid-run resumes the same session from its Azurite checkpoint. **Depends on:** P4 (the full loop); ideally P4.5/P5/P6 for a production-honest run. It is the first real validation of the deploy seams P3+ built behind traits, so it is the natural predecessor to P8.
 
 ## P8 — Azure productionization
 
