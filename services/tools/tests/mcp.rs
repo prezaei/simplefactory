@@ -163,11 +163,11 @@ async fn mcp_initialize_returns_protocol_and_server_info() {
 }
 
 // ===========================================================================
-// 2. tools/list — exactly 11 tools, each with a name + inputSchema
+// 2. tools/list — exactly 12 tools, each with a name + inputSchema
 // ===========================================================================
 
 #[tokio::test]
-async fn mcp_tools_list_lists_exactly_eleven_tools() {
+async fn mcp_tools_list_lists_exactly_twelve_tools() {
     let Some(pool) = pool_or_skip().await else {
         eprintln!("SKIP: DATABASE_URL not set");
         return;
@@ -183,7 +183,7 @@ async fn mcp_tools_list_lists_exactly_eleven_tools() {
 
     assert_eq!(status, StatusCode::OK);
     let tools = body["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 11, "exactly 11 tools listed");
+    assert_eq!(tools.len(), 12, "exactly 12 tools listed");
     for t in tools {
         assert!(t["name"].is_string(), "each tool has a name");
         assert_eq!(t["inputSchema"]["type"], "object", "each tool has a schema");

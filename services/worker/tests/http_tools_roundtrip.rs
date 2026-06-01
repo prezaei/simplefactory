@@ -206,6 +206,8 @@ impl ClaudeRunner for FixedClaude {
         _prompt: &str,
         _tools_url: &str,
         _token: &str,
+        _session_id: &str,
+        _resume: bool,
     ) -> anyhow::Result<RunOutcome> {
         Ok(self.0.clone())
     }
@@ -294,6 +296,12 @@ fn harness(base_url: &str, token: &str) -> HarnessConfig {
         tools_url: base_url.into(),
         task_token: token.into(),
         workdir: std::env::temp_dir().join(unique("p45-wd")),
+        // Long intervals so the background liveness loops never fire during these fast
+        // over-the-wire runs (the run completes and `select!` cancels them first).
+        heartbeat_interval_secs: 3600,
+        checkpoint_interval_secs: 3600,
+        resume: None,
+        checkpoint_store: Arc::new(factory_blob::InMemoryCheckpoints::new()),
     }
 }
 

@@ -357,6 +357,15 @@ fn tool_descriptors() -> Vec<Value> {
             &[],
         ),
         descriptor(
+            Tool::SaveCheckpoint,
+            "Save this attempt's Claude session id and worktree checkpoint URI for crash-resume.",
+            json!({
+                "session_id": { "type": "string" },
+                "checkpoint_uri": { "type": "string" }
+            }),
+            &["session_id", "checkpoint_uri"],
+        ),
+        descriptor(
             Tool::Escalate,
             "Escalate to a human with a reason and context; idempotent per task.",
             json!({
@@ -387,9 +396,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lists_exactly_eleven_tools_each_with_name_and_schema() {
+    fn lists_exactly_twelve_tools_each_with_name_and_schema() {
         let tools = tool_descriptors();
-        assert_eq!(tools.len(), 11, "all 11 tools listed");
+        assert_eq!(tools.len(), 12, "all 12 tools listed");
         for t in &tools {
             let name = t["name"].as_str().expect("name is a string");
             assert!(Tool::parse(name).is_some(), "{name} is a real tool");
@@ -426,6 +435,7 @@ mod tests {
             "append_transcript",
             "record_outcome",
             "heartbeat",
+            "save_checkpoint",
             "escalate",
         ] {
             assert_eq!(

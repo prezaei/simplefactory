@@ -122,6 +122,9 @@ pub trait ToolsClient: Send + Sync {
     async fn append_transcript(&self, chunk: &str) -> anyhow::Result<()>;
     /// Signal liveness so the lease is not reclaimed.
     async fn heartbeat(&self) -> anyhow::Result<()>;
+    /// Persist the Claude session id + worktree checkpoint URI onto the current
+    /// attempt so a crash-resume re-dispatch can continue the same session (P5).
+    async fn save_checkpoint(&self, session_id: &str, checkpoint_uri: &str) -> anyhow::Result<()>;
     /// Record the terminal outcome of the run (`succeeded` / `failed` / `blocked`).
     async fn record_outcome(&self, status: &str, summary: &str) -> anyhow::Result<()>;
 }
@@ -142,6 +145,10 @@ pub trait ClaudeRunner: Send + Sync {
     /// Tools service at `tools_url` authenticated with `token`. Returns the
     /// role-shaped [`RunOutcome`] (the implementation is contractually expected to
     /// return the variant matching `role`; the harness guards a mismatch).
+    /// Run Claude under the given `session_id` (so the worker — not Claude — owns the
+    /// id and can checkpoint it mid-run). `resume` selects `claude --resume <id>`
+    /// (continue an earlier crashed session) vs `--session-id <id>` (start fresh).
+    #[allow(clippy::too_many_arguments)] // the run seam needs the full task + session context
     async fn run(
         &self,
         workdir: &Path,
@@ -149,11 +156,21 @@ pub trait ClaudeRunner: Send + Sync {
         prompt: &str,
         tools_url: &str,
         token: &str,
+        session_id: &str,
+        resume: bool,
     ) -> anyhow::Result<RunOutcome>;
 }
 
-/// Everything the harness needs to execute one task, assembled by `main` from env.
+/// A resumable checkpoint handed to the worker by the dispatcher (via env): the
+/// Claude session to resume and the Blob URI of its last worktree snapshot.
 #[derive(Debug, Clone)]
+pub struct ResumeInfo {
+    pub session_id: String,
+    pub checkpoint_uri: String,
+}
+
+/// Everything the harness needs to execute one task, assembled by `main` from env.
+#[derive(Clone)]
 pub struct HarnessConfig {
     /// Clone URL of the repository to work in.
     pub repo_url: String,
@@ -165,6 +182,14 @@ pub struct HarnessConfig {
     pub task_token: String,
     /// Directory the fresh clone lives in.
     pub workdir: PathBuf,
+    /// Seconds between liveness heartbeats during a run (P5 loop; ~60s in prod).
+    pub heartbeat_interval_secs: u64,
+    /// Seconds between session/worktree checkpoints during a run (P5 loop).
+    pub checkpoint_interval_secs: u64,
+    /// When set, this run resumes a crashed attempt's session instead of starting fresh.
+    pub resume: Option<ResumeInfo>,
+    /// Where worktree/session checkpoints are written (deploy seam; faked in tests).
+    pub checkpoint_store: std::sync::Arc<dyn factory_blob::CheckpointStore>,
 }
 
 /// Drive one task end-to-end: clone → run Claude → push → open/update CR → record.
@@ -233,19 +258,154 @@ async fn run_task_inner(
         base = %task.base,
         "worker: task acquired"
     );
+    // Initial beat: extend the lease immediately on acquire, before the (possibly long)
+    // run. The periodic `heartbeat_loop` below keeps it alive for the rest of the run.
     tools.heartbeat().await?;
-    tracing::info!("worker: heartbeat sent");
+    tracing::info!("worker: initial heartbeat sent");
 
-    // Branch on the role: each role has a different terminal action, and ONLY the
-    // Coder produces a change request (see the technical spec's "Worker lifecycle by
-    // role"). `tester` is a valid role but has no lifecycle yet, so it — and any
-    // unknown role — fails loudly here rather than silently running the coder default.
-    match task.role.as_str() {
-        "coder" => run_coder(tools, git, claude, cfg, &task).await,
-        "manager" => run_manager(tools, claude, cfg, &task).await,
-        "reviewer" => run_reviewer(tools, claude, cfg, &task).await,
-        other => anyhow::bail!(
-            "worker: role {other:?} has no run lifecycle (tester is reserved/unsupported)"
+    // The role + checkpoint loop run UNDER the heartbeat loop: heartbeats keep the lease
+    // alive for the WHOLE run, including the (possibly slow) worktree restore on a resume,
+    // so a large restore can't let the lease lapse before the periodic beats start. The
+    // loops never return on their own, so each `select!` resolves on the inner work and
+    // cancels the loop; a loop arm returning is therefore an unexpected failure, not Ok.
+    let role_and_checkpoint = async {
+        // Resolve the session (restoring a crashed worktree when resuming) only after the
+        // heartbeat loop is live; the checkpoint loop then uses the resolved id + uri.
+        let (session_id, resume, checkpoint_uri) = resolve_session(cfg).await;
+        let role = async {
+            match task.role.as_str() {
+                "coder" => run_coder(tools, git, claude, cfg, &task, &session_id, resume).await,
+                "manager" => run_manager(tools, claude, cfg, &task, &session_id, resume).await,
+                "reviewer" => run_reviewer(tools, claude, cfg, &task, &session_id, resume).await,
+                other => anyhow::bail!(
+                    "worker: role {other:?} has no run lifecycle (tester is reserved/unsupported)"
+                ),
+            }
+        };
+        tokio::select! {
+            biased;
+            result = role => result,
+            _ = checkpoint_loop(tools, cfg.checkpoint_store.as_ref(), &cfg.workdir, &session_id, &checkpoint_uri, cfg.checkpoint_interval_secs) =>
+                Err(anyhow::anyhow!("worker: checkpoint loop exited unexpectedly")),
+        }
+    };
+    tokio::select! {
+        biased;
+        result = role_and_checkpoint => result,
+        _ = heartbeat_loop(tools, cfg.heartbeat_interval_secs) =>
+            Err(anyhow::anyhow!("worker: heartbeat loop exited unexpectedly")),
+    }
+}
+
+/// Decide the session to run under. A fresh run mints a new id; a crash-resume restores
+/// the prior worktree and continues the same session. If the prior checkpoint is
+/// UNRECOVERABLE (snapshot aged out / lost / never written), this degrades to a fresh
+/// session (resume=false) rather than failing — a missing checkpoint must not strand the
+/// work item (technical spec: "If checkpoint state is unrecoverable, it's a fresh
+/// attempt."), and a fresh coder run is idempotent on the same CR. Returns
+/// `(session_id, resume, checkpoint_uri)`.
+async fn resolve_session(cfg: &HarnessConfig) -> (String, bool, String) {
+    if let Some(info) = &cfg.resume {
+        match restore_checkpoint(cfg.checkpoint_store.as_ref(), info, &cfg.workdir).await {
+            Ok(()) => {
+                tracing::info!(session_id = %info.session_id, "worker: resuming crashed session");
+                let uri = new_checkpoint_uri(&info.session_id);
+                return (info.session_id.clone(), true, uri);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, checkpoint_uri = %info.checkpoint_uri, "worker: checkpoint unrecoverable; starting a fresh session instead of resuming");
+            }
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    tracing::info!(session_id = %id, "worker: starting fresh session");
+    let uri = new_checkpoint_uri(&id);
+    (id, false, uri)
+}
+
+/// The Blob URI this run checkpoints to. Unique per RUN (not just per session) so a
+/// resumed run and a still-alive original (the split-brain window of a wall-clock
+/// reclaim) never overwrite each other's snapshot; the attempt's stored `checkpoint_uri`
+/// pointer (set by `save_checkpoint`) tracks the latest, so resume reads the right one.
+fn new_checkpoint_uri(session_id: &str) -> String {
+    format!("checkpoints/{session_id}/{}.snapshot", uuid::Uuid::new_v4())
+}
+
+/// Periodic liveness loop: beat every `interval_secs` to keep the 15-min lease from
+/// expiring during a long run. Never returns — the caller's `select!` cancels it when
+/// the run finishes. A heartbeat error is logged and retried, never fatal (a transient
+/// Tools blip must not kill an otherwise-healthy run; the sweeper is the real backstop).
+pub async fn heartbeat_loop(tools: &dyn ToolsClient, interval_secs: u64) {
+    let interval = std::time::Duration::from_secs(interval_secs.max(1));
+    loop {
+        tokio::time::sleep(interval).await;
+        match tools.heartbeat().await {
+            Ok(()) => tracing::info!("worker: heartbeat (loop)"),
+            Err(e) => tracing::warn!(error = %e, "worker: heartbeat failed (will retry)"),
+        }
+    }
+}
+
+/// Periodic checkpoint loop: snapshot the session + worktree to Blob (at `checkpoint_uri`)
+/// and persist the pointer on the attempt every `interval_secs`, so a crash-resume can
+/// continue. Never returns — cancelled by the caller's `select!`. A checkpoint error is
+/// logged, never fatal (a missed checkpoint only costs progress on a later resume).
+#[allow(clippy::too_many_arguments)] // checkpoint needs the full session + store context
+pub async fn checkpoint_loop(
+    tools: &dyn ToolsClient,
+    store: &dyn factory_blob::CheckpointStore,
+    workdir: &Path,
+    session_id: &str,
+    checkpoint_uri: &str,
+    interval_secs: u64,
+) {
+    let interval = std::time::Duration::from_secs(interval_secs.max(1));
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Err(e) = write_checkpoint(tools, store, workdir, session_id, checkpoint_uri).await {
+            tracing::warn!(error = %e, "worker: checkpoint failed (will retry)");
+        }
+    }
+}
+
+/// Snapshot the worktree to Blob at `checkpoint_uri` and persist the (session_id, uri)
+/// pointer on the attempt. The worktree-snapshot bytes are a DEPLOY SEAM (the real impl
+/// tars `workdir`; the fake records the call) — what is verified in CI is that a
+/// checkpoint is written and its pointer recorded so a resume can find it.
+async fn write_checkpoint(
+    tools: &dyn ToolsClient,
+    store: &dyn factory_blob::CheckpointStore,
+    workdir: &Path,
+    session_id: &str,
+    checkpoint_uri: &str,
+) -> anyhow::Result<()> {
+    // Deploy seam: a real worker tars `workdir`; the snapshot bytes are opaque to the
+    // resume orchestration, so a marker is sufficient for the CI-tested path.
+    let snapshot = format!("session={session_id};workdir={}", workdir.display());
+    store.write(checkpoint_uri, snapshot.as_bytes()).await?;
+    tools.save_checkpoint(session_id, checkpoint_uri).await?;
+    tracing::info!(session_id, checkpoint_uri, "worker: checkpoint saved");
+    Ok(())
+}
+
+/// Restore a crashed session's worktree snapshot from Blob into `workdir` before
+/// `claude --resume`. Reading the snapshot is a DEPLOY SEAM (the real impl untars into
+/// `workdir`). A missing/unreadable snapshot is surfaced as an error; [`resolve_session`]
+/// catches it and degrades to a fresh attempt rather than running against an empty tree.
+async fn restore_checkpoint(
+    store: &dyn factory_blob::CheckpointStore,
+    info: &ResumeInfo,
+    workdir: &Path,
+) -> anyhow::Result<()> {
+    match store.read(&info.checkpoint_uri).await? {
+        Some(bytes) => {
+            tracing::info!(checkpoint_uri = %info.checkpoint_uri, bytes = bytes.len(), workdir = %workdir.display(), "worker: restored worktree from checkpoint");
+            Ok(())
+        }
+        None => anyhow::bail!(
+            "worker: checkpoint {} not found; cannot resume session {}",
+            info.checkpoint_uri,
+            info.session_id
         ),
     }
 }
@@ -258,13 +418,24 @@ async fn run_coder(
     claude: &dyn ClaudeRunner,
     cfg: &HarnessConfig,
     task: &TaskInfo,
+    session_id: &str,
+    resume: bool,
 ) -> anyhow::Result<()> {
-    tracing::info!(workdir = %cfg.workdir.display(), "worker(coder): shallow cloning repository");
-    git.shallow_clone(&cfg.repo_url, &cfg.install_token, &cfg.workdir)
-        .await?;
-    tracing::info!("worker(coder): clone complete");
+    // A FRESH coder run clones the repo into workdir. A RESUME must NOT clone: the
+    // worktree was already restored from the checkpoint into this same workdir by
+    // `resolve_session` (run before the role), so a second clone would either fail on the
+    // populated directory or clobber the restored tree, making `claude --resume` continue
+    // against the wrong worktree.
+    if resume {
+        tracing::info!(workdir = %cfg.workdir.display(), "worker(coder): resume — using restored worktree, skipping fresh clone");
+    } else {
+        tracing::info!(workdir = %cfg.workdir.display(), "worker(coder): shallow cloning repository");
+        git.shallow_clone(&cfg.repo_url, &cfg.install_token, &cfg.workdir)
+            .await?;
+        tracing::info!("worker(coder): clone complete");
+    }
 
-    tracing::info!(tools_url = %cfg.tools_url, "worker(coder): running Claude Code headless");
+    tracing::info!(tools_url = %cfg.tools_url, resume, "worker(coder): running Claude Code headless");
     let outcome = claude
         .run(
             &cfg.workdir,
@@ -272,6 +443,8 @@ async fn run_coder(
             &task.prompt,
             &cfg.tools_url,
             &cfg.task_token,
+            session_id,
+            resume,
         )
         .await?;
     let RunOutcome::Code { summary } = outcome else {
@@ -324,6 +497,8 @@ async fn run_manager(
     claude: &dyn ClaudeRunner,
     cfg: &HarnessConfig,
     task: &TaskInfo,
+    session_id: &str,
+    resume: bool,
 ) -> anyhow::Result<()> {
     // Validate the subject BEFORE running Claude: a manager's success only makes the
     // Coordinator assign a Coder for an `issue#<number>` subject
@@ -347,7 +522,7 @@ async fn run_manager(
             task.subject_ref
         );
     }
-    tracing::info!(tools_url = %cfg.tools_url, "worker(manager): running Claude Code headless (triage)");
+    tracing::info!(tools_url = %cfg.tools_url, resume, "worker(manager): running Claude Code headless (triage)");
     let outcome = claude
         .run(
             &cfg.workdir,
@@ -355,6 +530,8 @@ async fn run_manager(
             &task.prompt,
             &cfg.tools_url,
             &cfg.task_token,
+            session_id,
+            resume,
         )
         .await?;
     let RunOutcome::Triage {
@@ -407,6 +584,8 @@ async fn run_reviewer(
     claude: &dyn ClaudeRunner,
     cfg: &HarnessConfig,
     task: &TaskInfo,
+    session_id: &str,
+    resume: bool,
 ) -> anyhow::Result<()> {
     // Validate the subject BEFORE running Claude: a reviewer can only act on a `cr#N`
     // subject. Resolving it up front means a bad subject (which non-CR triggers could
@@ -427,7 +606,7 @@ async fn run_reviewer(
                 task.subject_ref
             )
         })?;
-    tracing::info!(tools_url = %cfg.tools_url, "worker(reviewer): running Claude Code headless (review)");
+    tracing::info!(tools_url = %cfg.tools_url, resume, "worker(reviewer): running Claude Code headless (review)");
     let outcome = claude
         .run(
             &cfg.workdir,
@@ -435,6 +614,8 @@ async fn run_reviewer(
             &task.prompt,
             &cfg.tools_url,
             &cfg.task_token,
+            session_id,
+            resume,
         )
         .await?;
     let RunOutcome::Review { verdict, summary } = outcome else {
@@ -649,6 +830,16 @@ impl ToolsClient for HttpTools {
         Ok(())
     }
 
+    async fn save_checkpoint(&self, session_id: &str, checkpoint_uri: &str) -> anyhow::Result<()> {
+        tracing::info!(session_id, "HttpTools: save_checkpoint");
+        self.call_tool(
+            "save_checkpoint",
+            serde_json::json!({ "session_id": session_id, "checkpoint_uri": checkpoint_uri }),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn record_outcome(&self, status: &str, summary: &str) -> anyhow::Result<()> {
         tracing::info!(status, "HttpTools: record_outcome");
         self.call_tool(
@@ -682,6 +873,7 @@ fn validate_role(role: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use factory_blob::CheckpointStore;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -743,6 +935,7 @@ mod tests {
         task: Mutex<TaskInfo>,
         cr_calls: AtomicUsize,
         heartbeats: AtomicUsize,
+        checkpoints: Mutex<Vec<(String, String)>>, // (session_id, checkpoint_uri)
         transcripts: Mutex<Vec<String>>,
         outcomes: Mutex<Vec<(String, String)>>,
         last_cr_request: Mutex<Option<CrRequest>>,
@@ -752,6 +945,9 @@ mod tests {
         /// When set, open_or_update_change_request returns ClaimContended (models a
         /// concurrent attempt holding the idempotency claim past the retry budget).
         contend_cr: bool,
+        /// When set, heartbeat() returns an error (still counted) so a test can assert
+        /// the heartbeat loop keeps beating despite transient Tools failures.
+        heartbeat_should_fail: bool,
         fixed_cr_number: i64,
     }
 
@@ -839,6 +1035,20 @@ mod tests {
         }
         async fn heartbeat(&self) -> anyhow::Result<()> {
             self.heartbeats.fetch_add(1, Ordering::SeqCst);
+            if self.heartbeat_should_fail {
+                anyhow::bail!("simulated heartbeat failure");
+            }
+            Ok(())
+        }
+        async fn save_checkpoint(
+            &self,
+            session_id: &str,
+            checkpoint_uri: &str,
+        ) -> anyhow::Result<()> {
+            self.checkpoints
+                .lock()
+                .expect("lock")
+                .push((session_id.into(), checkpoint_uri.into()));
             Ok(())
         }
         async fn record_outcome(&self, status: &str, summary: &str) -> anyhow::Result<()> {
@@ -883,6 +1093,9 @@ mod tests {
         outcome: Option<RunOutcome>,
         fail: bool,
         last_role: Mutex<Option<String>>,
+        /// The (session_id, resume) the harness passed on the last run — so tests can
+        /// assert a crash-resume drove `claude --resume <session>` vs a fresh session.
+        last_session: Mutex<Option<(String, bool)>>,
     }
 
     impl FakeClaude {
@@ -892,6 +1105,7 @@ mod tests {
                 outcome: Some(outcome),
                 fail: false,
                 last_role: Mutex::new(None),
+                last_session: Mutex::new(None),
             }
         }
         /// Coder convenience: a Code outcome with the given summary.
@@ -906,6 +1120,7 @@ mod tests {
                 outcome: None,
                 fail: true,
                 last_role: Mutex::new(None),
+                last_session: Mutex::new(None),
             }
         }
     }
@@ -919,9 +1134,12 @@ mod tests {
             _prompt: &str,
             _tools_url: &str,
             _token: &str,
+            session_id: &str,
+            resume: bool,
         ) -> anyhow::Result<RunOutcome> {
             self.ran.fetch_add(1, Ordering::SeqCst);
             *self.last_role.lock().expect("lock") = Some(role.into());
+            *self.last_session.lock().expect("lock") = Some((session_id.into(), resume));
             if self.fail {
                 anyhow::bail!("claude run failed");
             }
@@ -929,13 +1147,24 @@ mod tests {
         }
     }
 
+    /// Test [`HarnessConfig`]: long liveness intervals so the background loops never
+    /// fire during a fast fake run (heartbeat assertions stay exact — only the initial
+    /// beat counts); a resume-less fresh run; an in-memory checkpoint store.
     fn config() -> HarnessConfig {
+        config_resume(None)
+    }
+
+    fn config_resume(resume: Option<ResumeInfo>) -> HarnessConfig {
         HarnessConfig {
             repo_url: "https://github.com/acme/repo.git".into(),
             install_token: "ghs_installtoken".into(),
             tools_url: "https://tools.factory.test".into(),
             task_token: "task_bearer".into(),
             workdir: PathBuf::from("/tmp/factory-workdir"),
+            heartbeat_interval_secs: 3600,
+            checkpoint_interval_secs: 3600,
+            resume,
+            checkpoint_store: std::sync::Arc::new(factory_blob::InMemoryCheckpoints::new()),
         }
     }
 
@@ -1400,6 +1629,159 @@ mod tests {
             outcomes[0].1.contains("claude run failed"),
             "failure summary should carry the error: {}",
             outcomes[0].1
+        );
+    }
+
+    // ===========================================================================
+    // P5: heartbeat loop, checkpoint loop, crash-resume.
+    // ===========================================================================
+
+    /// Advance paused time `n` one-second steps. Each loop sleep is relative to its
+    /// creation, so the steps must be separate (one big jump would fire only the single
+    /// already-registered sleep). The caller's `select!` is `biased` so the loop
+    /// registers its next sleep BEFORE each step advances time, making the count
+    /// deterministic; the leading yield each iteration hands the loop that poll. Trailing
+    /// yields let the loop process the final fired sleep before the controller returns
+    /// and `select!` cancels it; no time passes during a yield, so it can't over-count.
+    async fn advance_secs(n: u64) {
+        for _ in 0..n {
+            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        }
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_loop_beats_each_interval() {
+        let tools = FakeTools::seeded();
+        tokio::select! {
+            biased;
+            _ = heartbeat_loop(&tools, 1) => unreachable!("the loop never returns on its own"),
+            _ = advance_secs(5) => {}
+        }
+        // Exactly one beat per elapsed interval (exact count — no "at least").
+        assert_eq!(tools.heartbeats.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_loop_continues_despite_errors() {
+        let tools = FakeTools {
+            heartbeat_should_fail: true,
+            ..FakeTools::seeded()
+        };
+        tokio::select! {
+            biased;
+            _ = heartbeat_loop(&tools, 1) => unreachable!(),
+            _ = advance_secs(3) => {}
+        }
+        // A failing heartbeat is logged and retried, never fatal: it kept beating.
+        assert_eq!(tools.heartbeats.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_loop_saves_each_interval() {
+        let tools = FakeTools::seeded();
+        let store = factory_blob::InMemoryCheckpoints::new();
+        let workdir = PathBuf::from("/tmp/factory-cp-test");
+        let uri = "checkpoints/ses-1/run-a.snapshot";
+        tokio::select! {
+            biased;
+            _ = checkpoint_loop(&tools, &store, &workdir, "ses-1", uri, 1) => unreachable!(),
+            _ = advance_secs(3) => {}
+        }
+        let saved = tools.checkpoints.lock().expect("lock").clone();
+        assert_eq!(saved.len(), 3, "one checkpoint pointer saved per interval");
+        for (session_id, saved_uri) in &saved {
+            assert_eq!(session_id, "ses-1");
+            assert_eq!(saved_uri, uri);
+        }
+        // The snapshot bytes reached the store at the run's uri.
+        assert!(store.read(uri).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn run_task_fresh_run_pins_a_session_without_resume() {
+        let tools = FakeTools::seeded();
+        let git = FakeGit::default();
+        let claude = FakeClaude::ok("done");
+        let cfg = config(); // resume: None
+
+        run_task(&tools, &git, &claude, &cfg).await.unwrap();
+
+        let (session_id, resume) = claude
+            .last_session
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("claude ran");
+        assert!(!resume, "a fresh run does not resume");
+        assert!(!session_id.is_empty(), "a fresh run pins a new session id");
+    }
+
+    #[tokio::test]
+    async fn run_task_resume_continues_the_same_session() {
+        let tools = FakeTools::seeded();
+        let git = FakeGit::default();
+        let claude = FakeClaude::ok("done");
+        // Seed the store with the prior session's snapshot so the restore succeeds.
+        let store = std::sync::Arc::new(factory_blob::InMemoryCheckpoints::new());
+        store
+            .write("checkpoints/ses-42.snapshot", b"prior worktree")
+            .await
+            .unwrap();
+        let mut cfg = config_resume(Some(ResumeInfo {
+            session_id: "ses-42".into(),
+            checkpoint_uri: "checkpoints/ses-42.snapshot".into(),
+        }));
+        cfg.checkpoint_store = store;
+
+        run_task(&tools, &git, &claude, &cfg).await.unwrap();
+
+        let (session_id, resume) = claude
+            .last_session
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("claude ran");
+        assert!(resume, "a resume run sets the resume flag");
+        assert_eq!(session_id, "ses-42", "it continues the prior session");
+        // A resumed coder must NOT re-clone: the restored worktree is the working tree, so
+        // a fresh clone would clobber it and `claude --resume` would run against the wrong tree.
+        assert_eq!(
+            git.clones.load(Ordering::SeqCst),
+            0,
+            "resume reuses the restored worktree; no fresh clone"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_task_resume_without_a_snapshot_falls_back_to_fresh() {
+        let tools = FakeTools::seeded();
+        let git = FakeGit::default();
+        let claude = FakeClaude::ok("done");
+        // resume points at a checkpoint that is NOT in the (empty) store — unrecoverable.
+        let cfg = config_resume(Some(ResumeInfo {
+            session_id: "ses-missing".into(),
+            checkpoint_uri: "checkpoints/ses-missing.snapshot".into(),
+        }));
+
+        // An unrecoverable checkpoint must NOT strand the item: the run degrades to a
+        // fresh session (idempotent on the same CR) rather than failing.
+        run_task(&tools, &git, &claude, &cfg)
+            .await
+            .expect("a missing snapshot degrades to a fresh run, not an error");
+        let (session_id, resume) = claude
+            .last_session
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("claude ran");
+        assert!(!resume, "fell back to a fresh run, not a resume");
+        assert_ne!(
+            session_id, "ses-missing",
+            "a brand-new session id, not the unrecoverable one"
         );
     }
 }

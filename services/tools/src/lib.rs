@@ -101,6 +101,7 @@ pub enum Tool {
     AppendTranscript,
     RecordOutcome,
     Heartbeat,
+    SaveCheckpoint,
     Escalate,
 }
 
@@ -119,6 +120,7 @@ impl Tool {
             "append_transcript" => Tool::AppendTranscript,
             "record_outcome" => Tool::RecordOutcome,
             "heartbeat" => Tool::Heartbeat,
+            "save_checkpoint" => Tool::SaveCheckpoint,
             "escalate" => Tool::Escalate,
             _ => return None,
         })
@@ -137,6 +139,7 @@ impl Tool {
             Tool::AppendTranscript => "append_transcript",
             Tool::RecordOutcome => "record_outcome",
             Tool::Heartbeat => "heartbeat",
+            Tool::SaveCheckpoint => "save_checkpoint",
             Tool::Escalate => "escalate",
         }
     }
@@ -205,6 +208,15 @@ pub async fn dispatch(state: &ToolsState, auth: &TaskAuth, tool: Tool, args: &Va
             .await
         }
         Tool::Heartbeat => heartbeat(state, auth).await,
+        Tool::SaveCheckpoint => {
+            save_checkpoint(
+                state,
+                auth,
+                arg_str(args, "session_id")?,
+                arg_str(args, "checkpoint_uri")?,
+            )
+            .await
+        }
         Tool::Escalate => {
             escalate(
                 state,
@@ -664,6 +676,40 @@ pub async fn heartbeat(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
     Ok(json!({ "lease_expires_at": expires }))
 }
 
+/// Persist the Claude session id + worktree checkpoint URI onto this task's attempt
+/// (P5 crash-resume). The attempt id is carried on the token, so a task can only ever
+/// checkpoint its own attempt. A token minted without an attempt id (should not happen
+/// for a worker task) is a bad request rather than a silent no-op.
+pub async fn save_checkpoint(
+    state: &ToolsState,
+    auth: &TaskAuth,
+    session_id: &str,
+    checkpoint_uri: &str,
+) -> ToolResult {
+    let attempt_id = auth
+        .attempt_id
+        .ok_or_else(|| ToolError::BadRequest("token has no attempt to checkpoint".to_string()))?;
+    // Reject empty/whitespace-only values before persisting: an empty session_id would
+    // make a later resume run `claude --resume ""`, and an empty checkpoint_uri makes a
+    // filesystem checkpoint store join its root with "" (a degenerate path). The pointer
+    // must be usable for a resume to mean anything.
+    if session_id.trim().is_empty() {
+        return Err(ToolError::BadRequest(
+            "session_id must be non-empty".to_string(),
+        ));
+    }
+    if checkpoint_uri.trim().is_empty() {
+        return Err(ToolError::BadRequest(
+            "checkpoint_uri must be non-empty".to_string(),
+        ));
+    }
+    let saved =
+        record::save_attempt_checkpoint(&state.pool, attempt_id, session_id, checkpoint_uri)
+            .await?;
+    tracing::info!(work_item = %auth.work_item_id, %attempt_id, session_id, saved, "save_checkpoint");
+    Ok(json!({ "saved": saved }))
+}
+
 /// Escalate to a human — the single human channel. The invariant is ONE escalation
 /// per `(task, reason)`: idempotent under scope `"escalate"` via the claim-first
 /// pattern, defaulting (when the caller passes NO `dedupe_key`) to a per-reason key
@@ -746,57 +792,91 @@ async fn escalate_won(
         record::create_escalation_idempotent(&state.pool, auth.work_item_id, reason, context, None)
             .await?;
 
-    // A repeat (work_item, reason) escalation already has a delivered question and a
-    // settled work-item state; do not post a second comment or re-set the state.
-    if !created {
-        tracing::info!(
-            work_item = %auth.work_item_id,
-            reason,
-            %escalation_id,
-            "escalate: idempotent no-op (escalation already exists for this work_item+reason)"
-        );
-        let item_state = record::work_item_by_id(&state.pool, auth.work_item_id)
-            .await?
-            .map(|w| w.state)
-            .unwrap_or(item.state);
-        return Ok(json!({
-            "escalation_id": escalation_id.to_string(),
-            "delivered_comment_id": Option::<String>::None,
-            "state": item_state.as_str(),
-            "state_changed": false,
-        }));
-    }
-
-    // Post the human-facing question on the subject (best-effort delivery target).
-    let delivered = if let Some(target) = subject_comment_target(&item.subject_ref) {
-        let body = format!("Factory needs a decision ({reason}):\n\n{context}");
-        match state.gh.post_comment(&repo, target, &body).await {
-            Ok(id) => Some(id),
-            Err(e) => {
-                tracing::warn!(work_item = %auth.work_item_id, error = %e, "escalate: comment delivery failed");
-                None
+    // The human-facing question is the ONE non-idempotent side effect (posting twice would
+    // create two comments), so it is posted ONLY on first creation. A repeat
+    // (work_item, reason) escalation — reached via a distinct caller `dedupe_key` that
+    // bypassed the task-level claim — skips the comment.
+    let delivered = if created {
+        if let Some(target) = subject_comment_target(&item.subject_ref) {
+            let body = format!("Factory needs a decision ({reason}):\n\n{context}");
+            match state.gh.post_comment(&repo, target, &body).await {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::warn!(work_item = %auth.work_item_id, error = %e, "escalate: comment delivery failed");
+                    None
+                }
             }
+        } else {
+            tracing::info!(subject = %item.subject_ref, "escalate: no GitHub subject to comment on");
+            None
         }
     } else {
-        tracing::info!(subject = %item.subject_ref, "escalate: no GitHub subject to comment on");
+        tracing::info!(work_item = %auth.work_item_id, reason, %escalation_id, "escalate: row already existed; finalizing state + attempt idempotently, no second comment");
         None
     };
 
     // Map the reason to the work-item state: needs-human-input is resumable (blocked,
     // re-queued on a human reply via requeue_blocked); the rest are terminal.
     //
-    // NOTE: escalate deliberately does NOT revoke the task token or finish the attempt
-    // here — it must stay safely RETRYABLE (a lost HTTP response → the worker's client
-    // retries → the claim-based idempotency makes it a no-op success). Revoking the
-    // token would 401 that retry. The bounded token TTL plus the P5 lease sweeper (which
-    // reclaims orphaned attempts and revokes their tokens) handle end-of-task cleanup.
+    // The state transition AND the attempt finalization run on EVERY path (first creation
+    // OR a retry that hit the existing row), NOT just the `created` path: a first escalate
+    // that created the row then failed/crashed before finalizing releases the
+    // idempotency claim, so the retry re-enters here with `created = false` and must still
+    // set the state and finish the attempt. Both are idempotent — `set_state` guards
+    // terminal states, `finish_attempt` guards `status='running'` — so re-running them is a
+    // safe no-op, keeping escalate retryable.
+    //
+    // NOTE: escalate deliberately does NOT revoke the task token — it must stay safely
+    // RETRYABLE (a lost HTTP response → the worker's client retries → no-op success);
+    // revoking the token would 401 that retry. The bounded token TTL plus the P5 lease
+    // sweeper handle token cleanup.
     let target_state = escalation_target_state(reason);
-    let state_changed = record::set_state(&state.pool, auth.work_item_id, target_state).await?;
+
+    // Finish THIS attempt FIRST so it is no longer `running`. A blocked-on-human attempt
+    // left running would, after the human reply re-queues the item and a fresh attempt
+    // starts, still satisfy the wall-clock-cap predicate (any running attempt past the cap)
+    // and make the sweeper reclaim the new, healthy run — counting blocked-on-human time
+    // against it, which the spec forbids. The checkpoint the attempt saved before blocking
+    // is still discoverable for resume (last_checkpoint_for_item ignores attempt status).
+    // Blocked target → `blocked`; terminal escalation → `failed`. finish_attempt is
+    // idempotent (guards status='running') and returns whether it actually finished a
+    // running attempt — which discriminates the in-flight escalation from a stale one.
+    let attempt_was_running = if let Some(attempt_id) = auth.attempt_id {
+        let attempt_status = if target_state == record::State::Blocked {
+            record::AttemptStatus::Blocked
+        } else {
+            record::AttemptStatus::Failed
+        };
+        record::finish_attempt(&state.pool, attempt_id, attempt_status, Some(context)).await?
+    } else {
+        false
+    };
+
+    // Move the work item to the escalation state ONLY on first creation, OR when we just
+    // finished a still-running attempt (the first escalate created the row then crashed
+    // before finalizing, and THIS retry completed it — the item is still in flight under
+    // this attempt). Do NOT set it for a stale duplicate whose attempt was already finished:
+    // a human reply may have re-queued the (blocked) item and started a fresh attempt, and
+    // `set_state(Blocked)` is NOT a terminal-guarded no-op, so clobbering it back to blocked
+    // would stall the healthy run. (set_state still guards the terminal states.)
+    let state_changed = if created || attempt_was_running {
+        record::set_state(&state.pool, auth.work_item_id, target_state).await?
+    } else {
+        tracing::info!(work_item = %auth.work_item_id, reason, "escalate: stale duplicate after the item moved on; not re-setting state");
+        false
+    };
+    // Report the state we actually left the item in: the target when we set it, else the
+    // item's current state (the stale-duplicate path must not claim a transition).
+    let reported_state = if state_changed {
+        target_state.as_str()
+    } else {
+        item.state.as_str()
+    };
 
     Ok(json!({
         "escalation_id": escalation_id.to_string(),
         "delivered_comment_id": delivered,
-        "state": target_state.as_str(),
+        "state": reported_state,
         "state_changed": state_changed,
     }))
 }
@@ -1347,6 +1427,7 @@ mod tests {
             Tool::AppendTranscript,
             Tool::RecordOutcome,
             Tool::Heartbeat,
+            Tool::SaveCheckpoint,
             Tool::Escalate,
         ] {
             assert_eq!(Tool::parse(t.as_str()), Some(t), "roundtrip {}", t.as_str());

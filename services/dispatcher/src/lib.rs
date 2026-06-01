@@ -20,13 +20,42 @@ use record::{Kind, LeaseRequest, Pool};
 use serde_json::json;
 use uuid::Uuid;
 
-/// Per-task lease/token TTL in seconds. The lease sweeper that reclaims expired
-/// leases and revokes their tokens lands in P5; until then an expired lease is
-/// NOT auto-reclaimed within this window.
+/// Per-task lease/token TTL in seconds. The coordinator's lease sweeper (P5) reclaims
+/// leases that expire past this window, marking the attempt reclaimed and revoking the
+/// token, so a crashed worker's slot is freed and the item re-dispatched.
 const TASK_TTL_SECS: f64 = 900.0;
 
 /// Default per-worker concurrency cap when a worker does not set `max_concurrent`.
 const DEFAULT_PER_WORKER_CAP: i64 = 2;
+
+/// How many times a work item may be resumed from a checkpoint before the dispatcher
+/// gives up on the crashed session and launches a fresh attempt (P5). Bounds a
+/// deterministic crash loop from resuming forever.
+const DEFAULT_RESUME_CAP: u32 = 3;
+
+/// A crash-resume launch: continue the prior Claude session from its worktree snapshot
+/// instead of starting fresh. Injected into the worker's env by [`docker_env`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeLaunch {
+    pub session_id: String,
+    pub checkpoint_uri: String,
+}
+
+/// Decide whether a re-dispatch resumes the prior session or starts fresh: resume only
+/// while a recoverable checkpoint exists AND the resume budget is not exhausted. A pure
+/// function so the resume policy is unit-tested without a database.
+pub fn decide_resume(
+    prior: Option<&record::CheckpointInfo>,
+    resume_cap: u32,
+) -> Option<ResumeLaunch> {
+    match prior {
+        Some(info) if info.resume_count < u64::from(resume_cap) => Some(ResumeLaunch {
+            session_id: info.session_id.clone(),
+            checkpoint_uri: info.checkpoint_uri.clone(),
+        }),
+        _ => None,
+    }
+}
 
 /// Everything a launcher needs to start one worker job.
 ///
@@ -45,6 +74,11 @@ pub struct LaunchSpec {
     pub repo_url: String,
     /// Short-lived GitHub installation token for clone + push. Secret.
     pub install_token: String,
+    /// The config sha pinned on the work item at enqueue — passed to the worker so a
+    /// mid-flight config change can't retarget an in-flight attempt (P5 config pinning).
+    pub config_sha: String,
+    /// When set, this launch resumes a crashed attempt's session (P5 crash-resume).
+    pub resume: Option<ResumeLaunch>,
 }
 
 /// Starts a single worker job for a leased task. Implementations return a job
@@ -75,6 +109,8 @@ pub struct LaunchRecord {
     pub tools_url: String,
     pub repo_url: String,
     pub install_token: String,
+    pub config_sha: String,
+    pub resume: Option<ResumeLaunch>,
 }
 
 /// Test launcher: records every launch and returns a synthetic job id. Never
@@ -111,6 +147,8 @@ impl WorkerLauncher for FakeLauncher {
             tools_url: spec.tools_url.clone(),
             repo_url: spec.repo_url.clone(),
             install_token: spec.install_token.clone(),
+            config_sha: spec.config_sha.clone(),
+            resume: spec.resume.clone(),
         };
         let job_id = format!("fake-job-{}", Uuid::new_v4().simple());
         match self.launched.lock() {
@@ -207,21 +245,34 @@ fn docker_run_args(image: &str, spec: &LaunchSpec) -> Vec<String> {
 /// The environment passed into the worker container, as ordered (key, value)
 /// pairs. The raw task token is delivered here (`FACTORY_TASK_TOKEN`) so it never
 /// touches a logged argv string.
-fn docker_env(spec: &LaunchSpec) -> Vec<(&'static str, String)> {
-    vec![
+pub fn docker_env(spec: &LaunchSpec) -> Vec<(&'static str, String)> {
+    let mut env = vec![
         // Secrets — never logged.
         ("FACTORY_TASK_TOKEN", spec.raw_token.clone()),
         ("FACTORY_INSTALL_TOKEN", spec.install_token.clone()),
         // Config the worker needs to clone + reach Tools.
         ("FACTORY_REPO_URL", spec.repo_url.clone()),
         ("FACTORY_TOOLS_URL", spec.tools_url.clone()),
+        // The config sha pinned at enqueue — the worker logs it so an in-flight attempt
+        // is traceable to the exact config it was dispatched under (P5 config pinning).
+        ("FACTORY_CONFIG_SHA", spec.config_sha.clone()),
         // Retained for logging/correlation only (the worker reads head_branch/base
         // from get_task, not from env).
         ("FACTORY_WORK_ITEM", spec.work_item_id.to_string()),
         ("FACTORY_REPO_ID", spec.repo_id.to_string()),
         ("FACTORY_ROLE", spec.role.as_str().to_string()),
         ("FACTORY_WORKER_NAME", spec.worker_name.clone()),
-    ]
+    ];
+    // Crash-resume: both vars present ⇒ the worker continues the prior session from its
+    // worktree snapshot; absent ⇒ a fresh run (P5).
+    if let Some(resume) = &spec.resume {
+        env.push(("FACTORY_RESUME_SESSION_ID", resume.session_id.clone()));
+        env.push((
+            "FACTORY_RESUME_CHECKPOINT_URI",
+            resume.checkpoint_uri.clone(),
+        ));
+    }
+    env
 }
 
 /// Generate a fresh raw task token. Two v4 UUIDs concatenated give 256 bits of
@@ -348,6 +399,16 @@ async fn launch_leased(
     // record_outcome requires the attempt id, and the dispatcher guarantees it: the
     // task token is always minted with `Some(attempt_id)` from the attempt opened
     // here, so the worker can always record its terminal outcome against it.
+    // Decide resume-vs-fresh BEFORE opening the new attempt, so the resume budget
+    // counts only the PRIOR attempts that carried a session (not the one we open now).
+    let prior_checkpoint = record::last_checkpoint_for_item(pool, item.id).await?;
+    let resume = decide_resume(prior_checkpoint.as_ref(), DEFAULT_RESUME_CAP);
+    tracing::info!(
+        work_item = %item.id,
+        resuming = resume.is_some(),
+        "dispatcher: resume decision for re-dispatch"
+    );
+
     let attempt_id = record::start_attempt(pool, item.id, None).await?;
 
     let raw_token = new_raw_token();
@@ -371,6 +432,8 @@ async fn launch_leased(
         worker_name: item.worker_name.clone(),
         repo_url,
         install_token,
+        config_sha: item.config_sha.clone(),
+        resume,
     };
     let job_id = launcher.launch(&spec).await?;
 
@@ -419,6 +482,8 @@ mod tests {
             worker_name: "coder-1".to_string(),
             repo_url: REPO_URL.to_string(),
             install_token: INSTALL_TOKEN.to_string(),
+            config_sha: "cfgsha123".to_string(),
+            resume: None,
         }
     }
 
@@ -455,6 +520,78 @@ mod tests {
             .find(|(k, _)| *k == "FACTORY_ROLE")
             .expect("role env present");
         assert_eq!(role.1, "coder");
+    }
+
+    #[test]
+    fn docker_env_carries_the_pinned_config_sha() {
+        let env = docker_env(&spec());
+        let sha = env
+            .iter()
+            .find(|(k, _)| *k == "FACTORY_CONFIG_SHA")
+            .expect("config sha env present");
+        assert_eq!(
+            sha.1, "cfgsha123",
+            "the pinned config sha reaches the worker"
+        );
+    }
+
+    #[test]
+    fn docker_env_omits_resume_vars_for_a_fresh_launch() {
+        let keys: Vec<&str> = docker_env(&spec()).iter().map(|(k, _)| *k).collect();
+        assert!(!keys.contains(&"FACTORY_RESUME_SESSION_ID"));
+        assert!(!keys.contains(&"FACTORY_RESUME_CHECKPOINT_URI"));
+    }
+
+    #[test]
+    fn docker_env_injects_resume_vars_for_a_resume_launch() {
+        let mut s = spec();
+        s.resume = Some(ResumeLaunch {
+            session_id: "ses-9".into(),
+            checkpoint_uri: "checkpoints/ses-9.snapshot".into(),
+        });
+        let env = docker_env(&s);
+        let sid = env
+            .iter()
+            .find(|(k, _)| *k == "FACTORY_RESUME_SESSION_ID")
+            .expect("resume session env present");
+        assert_eq!(sid.1, "ses-9");
+        let uri = env
+            .iter()
+            .find(|(k, _)| *k == "FACTORY_RESUME_CHECKPOINT_URI")
+            .expect("resume uri env present");
+        assert_eq!(uri.1, "checkpoints/ses-9.snapshot");
+    }
+
+    fn checkpoint(resume_count: u64) -> record::CheckpointInfo {
+        record::CheckpointInfo {
+            session_id: "ses-1".into(),
+            checkpoint_uri: "checkpoints/ses-1.snapshot".into(),
+            resume_count,
+        }
+    }
+
+    #[test]
+    fn decide_resume_is_fresh_without_a_checkpoint() {
+        assert_eq!(decide_resume(None, DEFAULT_RESUME_CAP), None);
+    }
+
+    #[test]
+    fn decide_resume_resumes_under_the_cap() {
+        let info = checkpoint(2);
+        assert_eq!(
+            decide_resume(Some(&info), 3),
+            Some(ResumeLaunch {
+                session_id: "ses-1".into(),
+                checkpoint_uri: "checkpoints/ses-1.snapshot".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn decide_resume_is_fresh_at_and_over_the_cap() {
+        // At the cap and beyond, the crashed session is abandoned for a fresh attempt.
+        assert_eq!(decide_resume(Some(&checkpoint(3)), 3), None);
+        assert_eq!(decide_resume(Some(&checkpoint(5)), 3), None);
     }
 
     #[test]

@@ -69,6 +69,7 @@ struct Seeded {
     owner: String,
     name: String,
     worker_name: String,
+    config_sha: String,
     work_ids: Vec<Uuid>,
 }
 
@@ -128,6 +129,7 @@ async fn seed(pool: &record::Pool, n: usize) -> Seeded {
         owner,
         name,
         worker_name,
+        config_sha,
         work_ids: ids,
     }
 }
@@ -238,6 +240,113 @@ async fn second_pass_launches_nothing_while_cap_bound() {
         launches_for_repo(&launcher, repo_id).len(),
         2,
         "second pass launches 0 more for this repo (cap still bound)"
+    );
+}
+
+/// Test 4 (P5): the launch carries the work item's pinned config sha (so an in-flight
+/// attempt is traceable to the config it was dispatched under), and a first dispatch of
+/// a never-checkpointed item is a FRESH launch (no resume).
+#[tokio::test]
+async fn launch_carries_config_sha_and_is_fresh_without_a_checkpoint() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("DATABASE_URL unset; skipping");
+        return;
+    };
+    let _guard = DISPATCH_GUARD.lock().await;
+    let seeded = seed(&pool, 1).await;
+    let repo_id = seeded.repo_id;
+    let lease_owner = format!("disp-{}", Uuid::now_v7());
+
+    let launcher = FakeLauncher::new();
+    let gh = FakeGitHub::new();
+    dispatch_once(&pool, &launcher, &gh, TOOLS_URL, &lease_owner)
+        .await
+        .expect("dispatch_once");
+
+    let launched = launches_for_repo(&launcher, repo_id);
+    assert_eq!(launched.len(), 1, "the single queued item launched");
+    assert_eq!(
+        launched[0].config_sha, seeded.config_sha,
+        "the launch carries the pinned config sha"
+    );
+    assert_eq!(
+        launched[0].resume, None,
+        "a never-checkpointed item launches fresh, not resumed"
+    );
+}
+
+/// Test 5 (P5): when a crashed attempt left a checkpoint and the item is re-queued, the
+/// next dispatch RESUMES it — the launch carries the prior session id + checkpoint uri.
+#[tokio::test]
+async fn redispatch_after_checkpoint_resumes_the_same_session() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("DATABASE_URL unset; skipping");
+        return;
+    };
+    let _guard = DISPATCH_GUARD.lock().await;
+    let seeded = seed(&pool, 1).await;
+    let repo_id = seeded.repo_id;
+    let item_id = seeded.work_ids[0];
+    let lease_owner = format!("disp-{}", Uuid::now_v7());
+
+    // First dispatch opens attempt #1 and launches fresh.
+    let launcher = FakeLauncher::new();
+    let gh = FakeGitHub::new();
+    dispatch_once(&pool, &launcher, &gh, TOOLS_URL, &lease_owner)
+        .await
+        .expect("first dispatch");
+    let first = launches_for_repo(&launcher, repo_id);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].resume, None, "first launch is fresh");
+
+    // The attempt checkpoints its session, then the worker "crashes": the lease
+    // sweeper reclaims the item back to queued (attempt #1 carries the checkpoint).
+    let attempt = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM attempts WHERE work_item_id = $1 ORDER BY started_at DESC LIMIT 1",
+    )
+    .bind(item_id)
+    .fetch_one(&pool)
+    .await
+    .expect("attempt row");
+    record::save_attempt_checkpoint(
+        &pool,
+        attempt,
+        "ses-redispatch",
+        "checkpoints/ses-redispatch.snapshot",
+    )
+    .await
+    .expect("save checkpoint");
+    // The worker crashed: expire its lease so the sweeper reclaims it.
+    sqlx::query(
+        "UPDATE work_items SET lease_expires_at = now() - interval '1 minute' WHERE id = $1",
+    )
+    .bind(item_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    record::reclaim_running_attempt(&pool, item_id)
+        .await
+        .unwrap();
+    assert!(
+        record::reclaim_claim(&pool, item_id, 1e9, record::State::Queued)
+            .await
+            .unwrap(),
+        "the crashed item is requeued"
+    );
+
+    // Second dispatch leases the requeued item and RESUMES the crashed session.
+    dispatch_once(&pool, &launcher, &gh, TOOLS_URL, &lease_owner)
+        .await
+        .expect("second dispatch");
+    let all = launches_for_repo(&launcher, repo_id);
+    let second = all.last().expect("a second launch");
+    assert_eq!(
+        second.resume,
+        Some(factory_dispatcher::ResumeLaunch {
+            session_id: "ses-redispatch".into(),
+            checkpoint_uri: "checkpoints/ses-redispatch.snapshot".into(),
+        }),
+        "the re-dispatch resumes the prior session from its checkpoint"
     );
 }
 

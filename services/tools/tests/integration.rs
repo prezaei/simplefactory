@@ -398,6 +398,83 @@ async fn heartbeat_extends_the_lease() {
 }
 
 // ===========================================================================
+// save_checkpoint — persists the session + uri on the token's attempt (P5).
+// ===========================================================================
+
+#[tokio::test]
+async fn save_checkpoint_persists_to_the_attempt() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#71", FakeGitHub::new()).await;
+
+    let (status, body) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "save_checkpoint",
+        json!({ "session_id": "ses-71", "checkpoint_uri": "checkpoints/ses-71.snapshot" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["saved"], json!(true));
+
+    // The pointer is now recoverable for a crash-resume re-dispatch.
+    let info = record::last_checkpoint_for_item(&pool, fx.work_item_id)
+        .await
+        .expect("query")
+        .expect("checkpoint persisted");
+    assert_eq!(info.session_id, "ses-71");
+    assert_eq!(info.checkpoint_uri, "checkpoints/ses-71.snapshot");
+}
+
+#[tokio::test]
+async fn save_checkpoint_without_attempt_errors() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#72", FakeGitHub::new()).await;
+    let auth_no_attempt = TaskAuth {
+        attempt_id: None,
+        ..fx.auth.clone()
+    };
+    let err = factory_tools::save_checkpoint(&fx.state, &auth_no_attempt, "s", "u")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no attempt"));
+}
+
+#[tokio::test]
+async fn save_checkpoint_rejects_empty_values() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#73", FakeGitHub::new()).await;
+    // Empty/whitespace session_id or checkpoint_uri is a 400 — an empty pointer is
+    // unusable for a resume and would make an FS store join its root with "".
+    for (sid, uri) in [
+        ("", "cp://1"),
+        ("   ", "cp://1"),
+        ("ses", ""),
+        ("ses", "  "),
+    ] {
+        let err = factory_tools::save_checkpoint(&fx.state, &fx.auth, sid, uri)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("non-empty"),
+            "({sid:?},{uri:?}) should be rejected, got: {err}"
+        );
+    }
+    // Nothing was persisted (the attempt has no checkpoint).
+    assert!(record::last_checkpoint_for_item(&pool, fx.work_item_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+// ===========================================================================
 // 7. escalate — exactly one escalation, idempotent, work item escalated
 // ===========================================================================
 
@@ -1321,6 +1398,18 @@ async fn escalate_blocked_input_is_resumable_and_terminal_reasons_escalate() {
         .unwrap();
     assert_eq!(item.state, State::Blocked, "blocked_input parks at blocked");
 
+    // The attempt is FINISHED as `blocked`, not left running — so after the re-dispatch
+    // its stale started_at can't trip the wall-clock cap on the resumed run.
+    let attempt_status: String = sqlx::query_scalar("SELECT status FROM attempts WHERE id = $1")
+        .bind(fx.auth.attempt_id.unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        attempt_status, "blocked",
+        "the blocked attempt is finished, not left running"
+    );
+
     // A human reply re-queues exactly this blocked item.
     let requeued = record::requeue_blocked(&pool, item.repo_id, "issue#304")
         .await
@@ -1357,6 +1446,81 @@ async fn escalate_blocked_input_is_resumable_and_terminal_reasons_escalate() {
         .await
         .unwrap();
     assert_eq!(requeued2, 0, "escalated items are not re-queued");
+}
+
+/// A STALE duplicate escalate (distinct dedupe_key, same reason) arriving AFTER a human
+/// reply re-queued the blocked item must NOT clobber the re-queued/healthy item back to
+/// blocked. The state transition is gated on `created || attempt_was_running`: the stale
+/// call hits the existing escalation row (created=false) and the original attempt is
+/// already finished (attempt_was_running=false), so set_state is skipped.
+#[tokio::test]
+async fn stale_duplicate_escalate_after_requeue_does_not_clobber_state() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#306", FakeGitHub::new()).await;
+
+    // First escalate(blocked_input): item → blocked, original attempt finished as blocked.
+    let (s1, _) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "escalate",
+        json!({ "reason": "blocked_input", "context": "need a key", "dedupe_key": "k1" }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(
+        record::work_item_by_id(&pool, fx.work_item_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        State::Blocked
+    );
+
+    // A human reply re-queues the item (now Queued, healthy, awaiting re-dispatch).
+    record::requeue_blocked(&pool, fx.auth.repo_id, "issue#306")
+        .await
+        .unwrap();
+
+    // A STALE duplicate escalate for the SAME (work_item, reason) but a DISTINCT key —
+    // the worker's token is intentionally never revoked, so this is reachable. It hits
+    // the existing escalation row (created=false); the original attempt is already
+    // finished, so set_state must be SKIPPED and the re-queued item left Queued.
+    let (s2, b2) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "escalate",
+        json!({ "reason": "blocked_input", "context": "need a key", "dedupe_key": "k2" }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(
+        b2["state_changed"],
+        json!(false),
+        "no transition by the stale call"
+    );
+    assert_eq!(
+        record::work_item_by_id(&pool, fx.work_item_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        State::Queued,
+        "the re-queued healthy item is NOT clobbered back to blocked"
+    );
+    // Still exactly one escalation row, no second comment.
+    assert_eq!(
+        record::count_escalations_for_item(&pool, fx.work_item_id)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        count_calls(&fx.gh, "post_comment"),
+        1,
+        "no duplicate comment"
+    );
 }
 
 // ===========================================================================
