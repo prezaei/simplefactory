@@ -1536,6 +1536,46 @@ async fn last_checkpoint_none_when_no_session() {
 }
 
 #[tokio::test]
+async fn save_checkpoint_rejected_on_a_terminal_attempt() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("checkpoint-terminal"), 1)
+        .await
+        .unwrap();
+    record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap();
+    let leased = record::lease_next(&pool, &lease_req(repo, 10, 10))
+        .await
+        .unwrap()
+        .unwrap();
+    let attempt = record::start_attempt(&pool, leased.id, None).await.unwrap();
+    // The attempt is reclaimed (no longer running).
+    assert_eq!(
+        record::reclaim_running_attempt(&pool, leased.id)
+            .await
+            .unwrap(),
+        1
+    );
+    // A late/in-flight checkpoint on the now-terminal attempt is DROPPED (not persisted),
+    // so it can't resurrect a reclaimed attempt as resumable.
+    assert!(
+        !record::save_attempt_checkpoint(&pool, attempt, "ses-late", "cp://late")
+            .await
+            .unwrap(),
+        "a checkpoint on a non-running attempt must be rejected"
+    );
+    assert!(
+        record::last_checkpoint_for_item(&pool, leased.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the reclaimed attempt is not advertised as resumable"
+    );
+}
+
+#[tokio::test]
 async fn last_checkpoint_returns_latest_with_resume_count() {
     let Some(pool) = pool_or_skip().await else {
         return;

@@ -992,8 +992,11 @@ pub struct CheckpointInfo {
 
 /// Persist the Claude session id + worktree checkpoint URI onto an attempt (the
 /// worker reports these via the Tools `save_checkpoint` call as the run progresses).
-/// Last write wins (a later checkpoint supersedes an earlier one). Returns whether a
-/// row was updated.
+/// Last write wins (a later checkpoint supersedes an earlier one). Gated to a
+/// still-`running` attempt — matching [`finish_attempt`] / [`reclaim_running_attempt`]
+/// — so a late/in-flight checkpoint that arrives AFTER the attempt was reclaimed or
+/// finished is dropped (returns `false`), never resurrecting a terminal attempt as a
+/// resumable one for [`last_checkpoint_for_item`]. Returns whether a row was updated.
 pub async fn save_attempt_checkpoint(
     pool: &Pool,
     attempt_id: Uuid,
@@ -1001,7 +1004,8 @@ pub async fn save_attempt_checkpoint(
     checkpoint_uri: &str,
 ) -> Result<bool> {
     let row = sqlx::query(
-        "UPDATE attempts SET session_id = $2, checkpoint_uri = $3 WHERE id = $1 RETURNING id",
+        "UPDATE attempts SET session_id = $2, checkpoint_uri = $3
+          WHERE id = $1 AND status = 'running' RETURNING id",
     )
     .bind(attempt_id)
     .bind(session_id)

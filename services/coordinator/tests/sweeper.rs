@@ -17,6 +17,14 @@ use uuid::Uuid;
 /// timestamp range so `now() - cap` can't underflow): ~100 years.
 const NEVER_WALL_CLOCK: f64 = 3.15e9;
 
+/// `sweeper_tick` is GLOBAL — it scans/reclaims every repo's expired leases. Two of
+/// these tests running in parallel would have one's sweep reclaim the other's item out
+/// from under it (e.g. requeue an at-cap item before it's marked at-cap, so it never
+/// escalates). Serialize all sweeper tests on this guard so each owns the global expired
+/// set for its assertions. (`concurrent_sweeps_escalate_exactly_once` still runs its two
+/// sweeps concurrently WITHIN the guarded test — that's the concurrency it exercises.)
+static SWEEPER_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn pool_or_skip() -> Option<record::Pool> {
     let url = std::env::var("DATABASE_URL").ok()?;
     let pool = record::connect(&url).await.expect("connect");
@@ -106,6 +114,7 @@ async fn set_attempt_count(pool: &record::Pool, item: Uuid, n: i32) {
 
 #[tokio::test]
 async fn sweeper_reclaims_an_expired_leased_item() {
+    let _serial = SWEEPER_SERIAL.lock().await;
     let Some(pool) = pool_or_skip().await else {
         eprintln!("SKIP: DATABASE_URL not set");
         return;
@@ -150,6 +159,7 @@ async fn sweeper_reclaims_an_expired_leased_item() {
 
 #[tokio::test]
 async fn sweeper_reclaims_an_expired_running_item_and_finishes_its_attempt() {
+    let _serial = SWEEPER_SERIAL.lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -173,6 +183,7 @@ async fn sweeper_reclaims_an_expired_running_item_and_finishes_its_attempt() {
 
 #[tokio::test]
 async fn sweeper_escalates_at_the_retry_cap() {
+    let _serial = SWEEPER_SERIAL.lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -222,6 +233,7 @@ async fn sweeper_escalates_at_the_retry_cap() {
 
 #[tokio::test]
 async fn sweeper_does_not_touch_a_valid_lease() {
+    let _serial = SWEEPER_SERIAL.lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -241,6 +253,7 @@ async fn sweeper_does_not_touch_a_valid_lease() {
 
 #[tokio::test]
 async fn sweeper_wall_clock_cap_reclaims_a_long_running_attempt() {
+    let _serial = SWEEPER_SERIAL.lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -268,6 +281,7 @@ async fn sweeper_wall_clock_cap_reclaims_a_long_running_attempt() {
 
 #[tokio::test]
 async fn concurrent_sweeps_escalate_exactly_once() {
+    let _serial = SWEEPER_SERIAL.lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
