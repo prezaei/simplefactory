@@ -287,10 +287,15 @@ pub async fn get_task(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
         }
         Ok(Subject::ChangeRequest(n)) => {
             let cr = state.gh.read_change_request(&repo, n).await?;
+            // A rework coder must push to the CR's EXISTING branch to UPDATE the same CR.
+            // Override the subject-derived default (`factory/cr-N`, which would open a new
+            // CR) with the CR's real head branch.
+            out["head_branch"] = json!(cr.head_branch);
             out["subject"] = json!({
                 "type": "change_request",
                 "number": cr.number,
                 "head_sha": cr.head_sha,
+                "head_branch": cr.head_branch,
                 "diff": cr.diff,
                 "files": cr.files,
                 "reviews": cr.reviews,

@@ -267,6 +267,7 @@ impl GitHubClient for OctocrabGitHub {
         Ok(ChangeRequestView {
             number,
             head_sha,
+            head_branch: pr.head.ref_field.clone(),
             diff,
             files,
             reviews: vec![],

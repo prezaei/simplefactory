@@ -24,6 +24,10 @@ pub struct IssueView {
 pub struct ChangeRequestView {
     pub number: i64,
     pub head_sha: String,
+    /// The CR's head BRANCH name (e.g. `factory/issue-10`). A rework coder
+    /// (cr_changes_requested) must push to THIS branch to update the same CR, rather
+    /// than a branch derived from the `cr#N` subject (which would open a new CR).
+    pub head_branch: String,
     pub diff: String,
     pub files: Vec<String>,
     pub reviews: Vec<String>,
@@ -236,6 +240,8 @@ struct FakeState {
     /// Seeded change-request file lists, keyed by CR number. Defaults to a single
     /// non-gating file when unset (see `read_change_request`).
     cr_files: HashMap<i64, Vec<String>>,
+    /// Seeded change-request head BRANCH names, keyed by CR number.
+    cr_head_branches: HashMap<i64, String>,
     /// PR number assigned per head branch (idempotency).
     pr_by_branch: HashMap<String, i64>,
     next_pr: i64,
@@ -306,6 +312,17 @@ impl FakeGitHub {
         self
     }
 
+    /// Seed the head BRANCH `read_change_request` reports for a CR number (so a rework
+    /// coder's get_task can be asserted to target the CR's existing branch).
+    pub fn with_cr_head_branch(self, cr_number: i64, branch: &str) -> Self {
+        self.state
+            .lock()
+            .unwrap()
+            .cr_head_branches
+            .insert(cr_number, branch.to_owned());
+        self
+    }
+
     /// The mutating calls recorded so far (for assertions).
     pub fn calls(&self) -> Vec<String> {
         self.state.lock().unwrap().pub_calls.clone()
@@ -360,9 +377,18 @@ impl GitHubClient for FakeGitHub {
             .get(&number)
             .cloned()
             .unwrap_or_else(|| vec!["src/lib.rs".to_owned()]);
+        let head_branch = self
+            .state
+            .lock()
+            .unwrap()
+            .cr_head_branches
+            .get(&number)
+            .cloned()
+            .unwrap_or_else(|| format!("factory/issue-from-cr-{number}"));
         Ok(ChangeRequestView {
             number,
             head_sha: format!("sha-{number}"),
+            head_branch,
             diff: "--- fake diff ---".to_owned(),
             files,
             reviews: vec![],
