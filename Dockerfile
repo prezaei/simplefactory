@@ -51,10 +51,16 @@ FROM node:20-bookworm-slim AS worker
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g @anthropic-ai/claude-code
+    && npm install -g @anthropic-ai/claude-code \
+    && useradd --create-home --uid 10001 factory
 COPY --from=builder /src/target/release/factory-worker /usr/local/bin/factory-worker
+# Run as a NON-root user: claude refuses `--dangerously-skip-permissions` under
+# root/sudo. The worker writes its worktree + scratch under $TMPDIR (world-writable)
+# and its checkpoint session under CLAUDE_CONFIG_DIR in this user's home.
+USER factory
+ENV HOME=/home/factory
 # The worker tars this dir into each checkpoint (claude session state) so a resume
 # can `claude --resume`; auth (CLAUDE_CODE_OAUTH_TOKEN) is injected per run by the
 # dispatcher. Keep it on the container-local fs — the archive carries it across.
-ENV CLAUDE_CONFIG_DIR=/root/.claude
+ENV CLAUDE_CONFIG_DIR=/home/factory/.claude
 ENTRYPOINT ["/usr/local/bin/factory-worker"]
