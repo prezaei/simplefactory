@@ -287,10 +287,15 @@ pub async fn get_task(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
         }
         Ok(Subject::ChangeRequest(n)) => {
             let cr = state.gh.read_change_request(&repo, n).await?;
+            // A rework coder must push to the CR's EXISTING branch to UPDATE the same CR.
+            // Override the subject-derived default (`factory/cr-N`, which would open a new
+            // CR) with the CR's real head branch.
+            out["head_branch"] = json!(cr.head_branch);
             out["subject"] = json!({
                 "type": "change_request",
                 "number": cr.number,
                 "head_sha": cr.head_sha,
+                "head_branch": cr.head_branch,
                 "diff": cr.diff,
                 "files": cr.files,
                 "reviews": cr.reviews,
@@ -671,7 +676,7 @@ pub async fn record_outcome(
 /// the item is no longer in flight (e.g. already terminal or reclaimed).
 pub async fn heartbeat(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
     let expires =
-        record::heartbeat_task(&state.pool, auth.work_item_id, HEARTBEAT_TTL_SECS).await?;
+        record::heartbeat_task(&state.pool, auth.work_item_id, heartbeat_ttl_secs()).await?;
     tracing::info!(work_item = %auth.work_item_id, extended = expires.is_some(), "heartbeat");
     Ok(json!({ "lease_expires_at": expires }))
 }
@@ -885,8 +890,20 @@ async fn escalate_won(
 // Helpers
 // ===========================================================================
 
-/// Default heartbeat lease extension (15 minutes), per the spec.
-const HEARTBEAT_TTL_SECS: f64 = 900.0;
+/// Default heartbeat lease extension (15 minutes), per the spec. Overridable via
+/// `FACTORY_HEARTBEAT_TTL_SECS` (kept well above the worker's heartbeat interval so a
+/// live worker keeps the lease valid; a lower value makes crash-resume reclaim faster).
+const DEFAULT_HEARTBEAT_TTL_SECS: f64 = 900.0;
+
+/// The effective heartbeat lease extension: `FACTORY_HEARTBEAT_TTL_SECS` if a positive
+/// number, else [`DEFAULT_HEARTBEAT_TTL_SECS`].
+fn heartbeat_ttl_secs() -> f64 {
+    std::env::var("FACTORY_HEARTBEAT_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|n| *n > 0.0)
+        .unwrap_or(DEFAULT_HEARTBEAT_TTL_SECS)
+}
 
 /// Prefix for the per-reason default idempotency key used by [`escalate`] when the
 /// caller supplies no explicit `dedupe_key`. The key is `escalate:<reason>`, so distinct

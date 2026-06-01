@@ -33,10 +33,21 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let transcript_dir =
-        std::env::var("TOOLS_TRANSCRIPT_DIR").unwrap_or_else(|_| "./transcripts".to_owned());
-    let blob: Arc<dyn factory_blob::TranscriptStore> =
-        Arc::new(factory_blob::FsTranscripts::new(transcript_dir));
+    // Transcripts persist to Azure Blob (Azurite locally in P7, real Azure in P8) —
+    // the SOLE production store, same Blob backend as worker checkpoints. Required:
+    // there is no filesystem fallback (a dev/prod fork we deliberately removed).
+    let blob_conn = std::env::var("FACTORY_BLOB_CONNECTION_STRING")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("FACTORY_BLOB_CONNECTION_STRING is required"))?;
+    let blob: Arc<dyn factory_blob::TranscriptStore> = Arc::new(
+        factory_blob::AzureBlobTranscripts::connect(
+            &blob_conn,
+            factory_blob::DEFAULT_TRANSCRIPT_CONTAINER,
+        )
+        .await?,
+    );
 
     let state = Arc::new(ToolsState { pool, gh, blob });
     let app = build_router(state);

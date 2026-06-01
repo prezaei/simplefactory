@@ -1028,6 +1028,28 @@ async fn get_task_returns_head_branch_base_and_layered_prompt() {
 }
 
 #[tokio::test]
+async fn get_task_for_a_cr_subject_uses_the_crs_existing_branch() {
+    // Rework loop: a cr_changes_requested coder MUST update the SAME CR, so get_task's
+    // head_branch for a cr#N subject is the CR's real branch (factory/issue-10), NOT the
+    // subject-derived factory/cr-N (which would open a brand-new CR).
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let gh = FakeGitHub::new().with_cr_head_branch(11, "factory/issue-10");
+    let fx = fixture_with(&pool, "cr#11", gh).await;
+
+    let (status, body) = http_call(fx.state.clone(), &fx.raw_token, "get_task", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["head_branch"], "factory/issue-10",
+        "rework coder must target the CR's existing branch, not factory/cr-11"
+    );
+    assert_eq!(body["subject"]["type"], "change_request");
+    assert_eq!(body["subject"]["head_branch"], "factory/issue-10");
+}
+
+#[tokio::test]
 async fn get_task_prompt_falls_back_to_role_default_without_config() {
     let Some(pool) = pool_or_skip().await else {
         eprintln!("SKIP: DATABASE_URL not set");

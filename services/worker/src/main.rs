@@ -231,11 +231,29 @@ async fn run_claude_with_config(
     write_mcp_config_file(&config_path, tools_url, token).await?;
 
     let args = claude_args(&config_path, prompt, session_id, resume);
-    let output = tokio::process::Command::new("claude")
+    // Bound the run: a wedged claude (e.g. a stalled MCP/network call) would otherwise
+    // run forever while the heartbeat keeps renewing the lease, so the sweeper never
+    // reclaims it. On timeout the child is killed (kill_on_drop) and the attempt fails →
+    // it gets reclaimed/retried. The bound is generous (real coding runs are minutes).
+    let run_timeout = std::time::Duration::from_secs(env_secs(
+        "FACTORY_CLAUDE_TIMEOUT_SECS",
+        DEFAULT_CLAUDE_TIMEOUT_SECS,
+    ));
+    let child = tokio::process::Command::new("claude")
         .current_dir(workdir)
         .args(&args)
-        .output()
-        .await?;
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let output = match tokio::time::timeout(run_timeout, child.wait_with_output()).await {
+        Ok(res) => res?,
+        Err(_) => {
+            // The timeout future dropped the child → kill_on_drop terminates claude.
+            tracing::error!(role, secs = run_timeout.as_secs(), "claude run timed out");
+            anyhow::bail!("claude run timed out after {}s", run_timeout.as_secs());
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -316,7 +334,9 @@ fn strip_marker_lines(summary: &str, prefix: &str) -> String {
     summary
         .lines()
         .filter(|line| {
-            line.trim()
+            // Strip decoration first so a decorated marker (`**VERDICT: ...**`) is also
+            // removed from the user-facing body, matching what last_marker parses.
+            strip_decoration(line)
                 .get(..prefix.len())
                 .map(|head| !head.eq_ignore_ascii_case(prefix))
                 .unwrap_or(true)
@@ -364,18 +384,30 @@ fn marker_first_token(value: &str) -> Option<String> {
         .map(|t| t.to_ascii_lowercase())
 }
 
-/// If the FINAL non-empty line starts with `prefix` (case-insensitive), return its
-/// trimmed, lowercased value; otherwise `None`. The prompt requires the control marker
-/// to be the last line, so only that line is consulted — a marker-looking line quoted
-/// earlier in Claude's output (e.g. echoing issue text) cannot drive the decision.
+/// Strip the markdown decoration a model commonly wraps a marker line in, so
+/// `**VERDICT: approve**`, `> VERDICT: approve`, or `` `VERDICT: approve` `` still match.
+fn strip_decoration(line: &str) -> &str {
+    line.trim()
+        .trim_start_matches(['>', '#', '*', '-', '`', ' '])
+        .trim_end_matches(['*', '`', ' '])
+        .trim()
+}
+
+/// Find the control marker (`ACTIONABLE:` / `VERDICT:`) near the END of Claude's output
+/// and return its trimmed, lowercased value. Scans the last few non-empty lines (a model
+/// often adds a closing ``` fence or a trailing sentence after the marker) and strips
+/// markdown decoration before matching, taking the LAST match. Bounded to the tail so a
+/// marker-looking line quoted earlier (e.g. echoing issue text) can't drive the decision.
 fn last_marker(text: &str, prefix: &str) -> Option<String> {
-    let last = text.lines().rev().map(str::trim).find(|l| !l.is_empty())?;
-    let head = last.get(..prefix.len())?;
-    if head.eq_ignore_ascii_case(prefix) {
-        Some(last[prefix.len()..].trim().to_ascii_lowercase())
-    } else {
-        None
+    for raw in text.lines().rev().filter(|l| !l.trim().is_empty()).take(10) {
+        let line = strip_decoration(raw);
+        if let Some(head) = line.get(..prefix.len()) {
+            if head.eq_ignore_ascii_case(prefix) {
+                return Some(line[prefix.len()..].trim().to_ascii_lowercase());
+            }
+        }
     }
+    None
 }
 
 /// Best-effort delete the entire MCP scratch directory (and its token-bearing config)
@@ -462,13 +494,20 @@ fn claude_args(
     } else {
         ("--session-id", session_id)
     };
+    // `--mcp-config <configs...>` is VARIADIC (claude: "Load MCP servers from JSON
+    // files or strings, space-separated"). If it sits immediately before the positional
+    // prompt it greedily swallows the prompt as a second "config"; the prompt isn't
+    // valid JSON, so claude tries to open() it as a file and dies with ENAMETOOLONG.
+    // So terminate the variadic with a flag (`--strict-mcp-config`, which also pins us
+    // to ONLY our MCP server) and keep the prompt strictly last.
     vec![
         "--print".to_string(),
         "--dangerously-skip-permissions".to_string(),
-        session_flag.to_string(),
-        session_value.to_string(),
         "--mcp-config".to_string(),
         mcp_config_path.display().to_string(),
+        "--strict-mcp-config".to_string(),
+        session_flag.to_string(),
+        session_value.to_string(),
         prompt.to_string(),
     ]
 }
@@ -483,6 +522,9 @@ fn env_var(key: &str) -> anyhow::Result<String> {
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 /// Default seconds between worktree/session checkpoints during a run.
 const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 300;
+/// Default hard ceiling on a single `claude` run before it is killed (a wedged run must
+/// not hold the lease open forever). 30 min is well beyond a normal coding/triage run.
+const DEFAULT_CLAUDE_TIMEOUT_SECS: u64 = 1800;
 
 /// Parse an optional positive-int env var, falling back to `default` when unset or
 /// unparseable (a malformed override must not silently disable the loop).
@@ -496,7 +538,7 @@ fn env_secs(key: &str, default: u64) -> u64 {
     }
 }
 
-fn load_config() -> anyhow::Result<HarnessConfig> {
+async fn load_config() -> anyhow::Result<HarnessConfig> {
     let workdir = match std::env::var("FACTORY_WORKDIR") {
         Ok(d) => PathBuf::from(d),
         Err(_) => std::env::temp_dir().join(format!("factory-worker-{}", uuid::Uuid::new_v4())),
@@ -522,13 +564,21 @@ fn load_config() -> anyhow::Result<HarnessConfig> {
         }
         _ => None,
     };
-    // Checkpoints persist to the local filesystem for parity; the Azure Blob swap is P7.
-    let checkpoint_root = std::env::var("FACTORY_CHECKPOINT_ROOT").unwrap_or_else(|_| {
-        std::env::temp_dir()
-            .join("factory-checkpoints")
-            .display()
-            .to_string()
-    });
+    // Checkpoints persist to Azure Blob (Azurite locally in P7, real Azure in P8) so
+    // they survive the worker container for crash-resume. This is the SOLE production
+    // store — there is no filesystem fallback (a dev/prod fork we deliberately removed).
+    // Trim + reject empty so a blank/whitespace env value fails clearly here, not as an
+    // opaque connection-string parse error later (matches WorkerRuntime::from_env).
+    let blob_conn = std::env::var("FACTORY_BLOB_CONNECTION_STRING")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("FACTORY_BLOB_CONNECTION_STRING is required"))?;
+    let checkpoint_store = factory_blob::AzureBlobCheckpoints::connect(
+        &blob_conn,
+        factory_blob::DEFAULT_CHECKPOINT_CONTAINER,
+    )
+    .await?;
     Ok(HarnessConfig {
         repo_url: env_var("FACTORY_REPO_URL")?,
         install_token: env_var("FACTORY_INSTALL_TOKEN")?,
@@ -544,7 +594,7 @@ fn load_config() -> anyhow::Result<HarnessConfig> {
             DEFAULT_CHECKPOINT_INTERVAL_SECS,
         ),
         resume,
-        checkpoint_store: std::sync::Arc::new(factory_blob::FsCheckpoints::new(checkpoint_root)),
+        checkpoint_store: std::sync::Arc::new(checkpoint_store),
     })
 }
 
@@ -553,7 +603,7 @@ async fn main() -> anyhow::Result<()> {
     factory_telemetry::init("worker");
     tracing::info!("worker: starting harness (P3)");
 
-    let cfg = load_config()?;
+    let cfg = load_config().await?;
     // The pinned config sha rides in on the env (FACTORY_CONFIG_SHA) purely for
     // traceability: log it so an in-flight attempt's logs name the exact config version
     // it was dispatched under (telemetry mandate). The run itself uses the prompt Tools
@@ -819,14 +869,44 @@ mod tests {
         let args = claude_args(path, "Fix the bug", "ses-123", false);
         assert_eq!(args[0], "--print");
         assert_eq!(args[1], "--dangerously-skip-permissions");
-        // A fresh run pins the session id with --session-id.
-        assert_eq!(args[2], "--session-id");
-        assert_eq!(args[3], "ses-123");
-        assert_eq!(args[4], "--mcp-config");
+        assert_eq!(args[2], "--mcp-config");
         // The config is referenced BY PATH, not as inline JSON.
-        assert_eq!(args[5], "/work/.factory-mcp.json");
+        assert_eq!(args[3], "/work/.factory-mcp.json");
+        // A fresh run pins the session id with --session-id <id> (both, adjacent).
+        let sid = args
+            .iter()
+            .position(|a| a == "--session-id")
+            .expect("--session-id present");
+        assert_eq!(
+            args[sid + 1],
+            "ses-123",
+            "the session id value follows the flag"
+        );
         // The prompt is the final positional argument.
         assert_eq!(args.last().unwrap(), "Fix the bug");
+    }
+
+    #[test]
+    fn claude_args_terminate_variadic_mcp_config_before_the_prompt() {
+        // Regression: `--mcp-config` is variadic; if the prompt immediately follows the
+        // config PATH, claude swallows the prompt as a second config and dies with
+        // ENAMETOOLONG. The arg right after the config path must be a flag, NOT the
+        // prompt, and the prompt must stay last.
+        let path = Path::new("/work/.factory-mcp.json");
+        let args = claude_args(path, "Fix the bug", "ses-123", false);
+        let cfg = args.iter().position(|a| a == "--mcp-config").unwrap();
+        assert_eq!(
+            args[cfg + 1],
+            "/work/.factory-mcp.json",
+            "path follows --mcp-config"
+        );
+        assert!(
+            args[cfg + 2].starts_with("--"),
+            "a flag (not the prompt) must terminate the variadic --mcp-config, got: {}",
+            args[cfg + 2]
+        );
+        assert_eq!(args.last().unwrap(), "Fix the bug", "prompt stays last");
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"));
     }
 
     #[test]
@@ -834,9 +914,10 @@ mod tests {
         let path = Path::new("/work/.factory-mcp.json");
         let args = claude_args(path, "Continue", "ses-abc", true);
         // A crash-resume continues the same session with --resume <id>.
-        assert_eq!(args[2], "--resume");
-        assert_eq!(args[3], "ses-abc");
+        let r = args.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(args[r + 1], "ses-abc");
         assert!(!args.iter().any(|a| a == "--session-id"));
+        assert_eq!(args.last().unwrap(), "Continue");
     }
 
     #[test]
@@ -1020,6 +1101,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_reviewer_verdict_tolerates_decoration_and_trailing_lines() {
+        // A model commonly bolds the marker and/or adds a closing fence or sentence after
+        // it. request_changes must NOT silently degrade to comment (that weakens the gate).
+        assert_eq!(
+            parse_reviewer_verdict("Issues found.\n**VERDICT: request_changes**"),
+            ReviewVerdict::RequestChanges
+        );
+        assert_eq!(
+            parse_reviewer_verdict("review\n```\nVERDICT: request_changes\n```"),
+            ReviewVerdict::RequestChanges
+        );
+        assert_eq!(
+            parse_reviewer_verdict("> VERDICT: approve\n\nThanks for the contribution!"),
+            ReviewVerdict::Approve
+        );
+        // Still bounded to the tail: a marker far above a long trailer is not picked up.
+        let long_trailer = format!("VERDICT: request_changes\n{}", "filler\n".repeat(20));
+        assert_eq!(
+            parse_reviewer_verdict(&long_trailer),
+            ReviewVerdict::Comment
+        );
+    }
+
+    #[test]
     fn strip_marker_lines_removes_the_control_marker_only() {
         assert_eq!(
             strip_marker_lines("Triaged it.\nACTIONABLE: no", "ACTIONABLE:"),
@@ -1052,26 +1157,31 @@ mod tests {
     }
 
     #[test]
-    fn last_marker_only_reads_the_final_nonempty_line() {
-        // The marker must be the FINAL non-empty line.
+    fn last_marker_scans_the_tail_tolerating_decoration_and_trailing_lines() {
         assert_eq!(last_marker("kEy: Val", "KEY:"), Some("val".to_string()));
+        // The LAST matching marker (scanning from the end) wins.
         assert_eq!(
             last_marker("a\nKEY: first\nKEY: second", "KEY:"),
             Some("second".to_string()),
-            "the last line wins"
         );
-        // Trailing blank lines are ignored; the last NON-EMPTY line is the marker.
+        // Trailing blank lines are ignored.
         assert_eq!(
             last_marker("KEY: val\n\n  ", "KEY:"),
             Some("val".to_string())
         );
-        // A marker quoted EARLIER does NOT count when the final line isn't a marker —
-        // this is the contract that stops echoed issue/CR text from driving the decision.
-        assert_eq!(last_marker("KEY: no\nsome closing prose", "KEY:"), None);
+        // A marker followed by a few trailing lines (closing fence / prose) is still
+        // found — this is the robustness fix so a decorated/trailing verdict isn't lost.
+        assert_eq!(
+            last_marker("KEY: no\nsome closing prose", "KEY:"),
+            Some("no".to_string())
+        );
+        assert_eq!(last_marker("**KEY: yes**", "KEY:"), Some("yes".to_string()));
+        // ...but it stays bounded to the tail: a marker far above a long trailer is NOT
+        // picked up, so echoed text high in the output can't drive the decision.
+        let buried = format!("KEY: no\n{}", "filler\n".repeat(20));
+        assert_eq!(last_marker(&buried, "KEY:"), None);
         assert_eq!(last_marker("nothing here", "KEY:"), None);
-        // A short final line (shorter than the prefix) is None, not a panic.
-        assert_eq!(last_marker("hi", "KEY:"), None);
-        // Multibyte content doesn't panic the prefix slice.
-        assert_eq!(last_marker("héllo", "KEY:"), None);
+        assert_eq!(last_marker("hi", "KEY:"), None); // shorter than prefix → no panic
+        assert_eq!(last_marker("héllo", "KEY:"), None); // multibyte → no panic
     }
 }

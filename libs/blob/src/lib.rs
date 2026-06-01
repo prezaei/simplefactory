@@ -1,15 +1,27 @@
-//! Run-transcript storage (P3). The worker never touches Blob directly — the
-//! Tools service appends transcript chunks here on the worker's behalf.
+//! Run-transcript + checkpoint storage (P3/P5/P7). The worker never touches Blob
+//! directly — the Tools service appends transcript chunks here on the worker's
+//! behalf; the worker snapshots session/worktree checkpoints here for crash-resume.
 //!
-//! [`TranscriptStore`] is a trait so callers depend on behavior, not on a live
-//! object store: [`InMemoryTranscripts`] is the test double, [`FsTranscripts`]
-//! gives local-parity persistence, and an Azure Blob / Azurite implementation is
-//! the P8 swap (see `docs/factory-implementation-plan.md`). Session/worktree
-//! checkpoints (also Blob) land in P5.
+//! [`TranscriptStore`]/[`CheckpointStore`] are traits so callers depend on behavior,
+//! not on a live object store. The **production** impls are Azure Blob–backed
+//! ([`AzureBlobTranscripts`]/[`AzureBlobCheckpoints`], in `azure.rs`), exercised
+//! against Azurite locally (P7) and real Azure in P8. [`InMemoryTranscripts`]/
+//! [`InMemoryCheckpoints`] are the hermetic **test doubles** for caller unit tests.
 #![forbid(unsafe_code)]
 
+mod archive;
+mod azure;
+pub use archive::{archive_dirs, extract_dirs};
+pub use azure::{AzureBlobCheckpoints, AzureBlobTranscripts};
+
+/// Default Blob container for crash-resume checkpoints. A fixed convention (not an
+/// env override) so the worker and a re-dispatch always agree on where checkpoints
+/// live — the name has one home next to the store that uses it.
+pub const DEFAULT_CHECKPOINT_CONTAINER: &str = "checkpoints";
+/// Default Blob container for run transcripts.
+pub const DEFAULT_TRANSCRIPT_CONTAINER: &str = "transcripts";
+
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Append-only storage for run transcripts, keyed by an opaque `uri`.
@@ -56,76 +68,11 @@ impl TranscriptStore for InMemoryTranscripts {
     }
 }
 
-/// Resolve a `uri` to a path under `root`, rejecting absolute paths and `..` traversal
-/// so a uri can never escape `root`. This is a security boundary shared by every
-/// filesystem-backed store ([`FsTranscripts`], [`FsCheckpoints`]) — hardening it here
-/// (e.g. new escape vectors) covers all of them at once.
-fn resolve_under(root: &Path, uri: &str) -> anyhow::Result<PathBuf> {
-    let rel = Path::new(uri);
-    if rel.is_absolute()
-        || rel
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        anyhow::bail!("invalid blob uri: {uri}");
-    }
-    Ok(root.join(rel))
-}
-
-/// Filesystem-backed transcript store (local parity). `uri` is treated as a path
-/// relative to `root`; path traversal outside `root` is rejected.
-pub struct FsTranscripts {
-    root: PathBuf,
-}
-
-impl FsTranscripts {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-
-    fn resolve(&self, uri: &str) -> anyhow::Result<PathBuf> {
-        resolve_under(&self.root, uri)
-    }
-}
-
-#[async_trait::async_trait]
-impl TranscriptStore for FsTranscripts {
-    async fn append(&self, uri: &str, chunk: &str) -> anyhow::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        let path = self.resolve(uri)?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let mut f = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await?;
-        f.write_all(chunk.as_bytes()).await?;
-        // `tokio::fs::File` buffers writes and does NOT guarantee a flush on drop, so
-        // dropping `f` here (without this) can lose the just-written chunk — a later
-        // append/read then sees a truncated transcript (a lost append). Flush explicitly
-        // so the bytes reach the file before the handle is dropped.
-        f.flush().await?;
-        Ok(())
-    }
-
-    async fn read(&self, uri: &str) -> anyhow::Result<String> {
-        let path = self.resolve(uri)?;
-        match tokio::fs::read_to_string(&path).await {
-            Ok(s) => Ok(s),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-            Err(e) => Err(e.into()),
-        }
-    }
-}
-
 /// Crash-resume checkpoint storage (P5): the worker snapshots its Claude session +
 /// worktree here on an interval/at tool boundaries, keyed by an opaque `uri`, so a
 /// re-dispatch after a crash can restore it and `claude --resume`. Unlike the
 /// append-only transcript, a checkpoint is the latest-wins whole-snapshot blob.
-/// [`InMemoryCheckpoints`] is the test double, [`FsCheckpoints`] gives local-parity
-/// persistence, and an Azure Blob implementation is the P8 swap.
+/// [`InMemoryCheckpoints`] is the test double; [`AzureBlobCheckpoints`] is production.
 #[async_trait::async_trait]
 pub trait CheckpointStore: Send + Sync {
     /// Write (overwrite) the checkpoint at `uri`.
@@ -161,44 +108,6 @@ impl CheckpointStore for InMemoryCheckpoints {
     }
 }
 
-/// Filesystem-backed checkpoint store (local parity). `uri` is treated as a path
-/// relative to `root`; path traversal outside `root` is rejected.
-pub struct FsCheckpoints {
-    root: PathBuf,
-}
-
-impl FsCheckpoints {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-
-    fn resolve(&self, uri: &str) -> anyhow::Result<PathBuf> {
-        resolve_under(&self.root, uri)
-    }
-}
-
-#[async_trait::async_trait]
-impl CheckpointStore for FsCheckpoints {
-    async fn write(&self, uri: &str, data: &[u8]) -> anyhow::Result<()> {
-        let path = self.resolve(uri)?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        // Whole-snapshot, latest-wins: a plain write truncates any prior checkpoint.
-        tokio::fs::write(&path, data).await?;
-        Ok(())
-    }
-
-    async fn read(&self, uri: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        let path = self.resolve(uri)?;
-        match tokio::fs::read(&path).await {
-            Ok(b) => Ok(Some(b)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,29 +122,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fs_appends_accumulate_and_reject_traversal() {
-        let dir = std::env::temp_dir().join(format!("factory-blob-test-{}", std::process::id()));
-        // Start from a clean dir so a stale `a/b.log` left by a prior run (e.g. a reused
-        // PID) can't make the appends accumulate onto old content.
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        let store = FsTranscripts::new(&dir);
-        store.append("a/b.log", "one\n").await.unwrap();
-        store.append("a/b.log", "two\n").await.unwrap();
-        // Two sequential appends must accumulate; this is the regression guard for the
-        // missing-flush bug (a dropped buffered write would yield only "one\n").
-        assert_eq!(store.read("a/b.log").await.unwrap(), "one\ntwo\n");
-        // Both escape vectors are rejected: a `..` traversal AND an absolute path
-        // (which would otherwise ignore `root` entirely).
-        assert!(store.append("../escape", "x").await.is_err());
-        assert!(
-            store.append("/etc/passwd", "x").await.is_err(),
-            "an absolute uri must be rejected, not resolved outside root"
-        );
-        assert!(store.read("/etc/passwd").await.is_err());
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
     async fn in_memory_checkpoint_roundtrip_and_overwrite() {
         let store = InMemoryCheckpoints::new();
         assert_eq!(store.read("cp/1").await.unwrap(), None);
@@ -244,25 +130,5 @@ mod tests {
         // Latest-wins: a second write replaces, not appends.
         store.write("cp/1", b"second").await.unwrap();
         assert_eq!(store.read("cp/1").await.unwrap(), Some(b"second".to_vec()));
-    }
-
-    #[tokio::test]
-    async fn fs_checkpoint_roundtrip_overwrite_and_reject_traversal() {
-        let dir =
-            std::env::temp_dir().join(format!("factory-checkpoint-test-{}", std::process::id()));
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        let store = FsCheckpoints::new(&dir);
-        assert_eq!(store.read("a/cp.bin").await.unwrap(), None);
-        store.write("a/cp.bin", b"one").await.unwrap();
-        store.write("a/cp.bin", b"two").await.unwrap();
-        // Whole-snapshot overwrite (regression guard against an accidental append).
-        assert_eq!(store.read("a/cp.bin").await.unwrap(), Some(b"two".to_vec()));
-        assert!(store.write("../escape", b"x").await.is_err());
-        assert!(
-            store.write("/etc/passwd", b"x").await.is_err(),
-            "an absolute uri must be rejected, not resolved outside root"
-        );
-        assert!(store.read("/etc/passwd").await.is_err());
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

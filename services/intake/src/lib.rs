@@ -259,7 +259,17 @@ pub async fn apply_config_from_push(
         return Ok(None);
     };
 
-    let Some(yaml) = gh.get_file(repo, CONFIG_PATH, head_sha).await? else {
+    // Fetch the config using the STORED installation_id, not the one on the inbound
+    // webhook's RepoRef: a repository webhook payload (e.g. via `gh webhook forward`)
+    // carries no `installation` object, so `repo.installation_id` is 0 there. The repos
+    // row is the authoritative source of the installation to mint a token with.
+    let Some(ident) = record::repo_by_id(pool, rc.id).await? else {
+        // The row resolved by name a line ago; absence here means it was just removed.
+        tracing::info!(owner = %repo.owner, repo = %repo.name, "repo removed mid-apply; ignoring");
+        return Ok(None);
+    };
+    let repo_ident = RepoRef::new(ident.owner, ident.name, ident.installation_id);
+    let Some(yaml) = gh.get_file(&repo_ident, CONFIG_PATH, head_sha).await? else {
         tracing::info!(
             owner = %repo.owner,
             repo = %repo.name,

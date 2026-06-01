@@ -52,9 +52,23 @@ octocrab = "0.51"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
 
+# Worktree/session checkpoint archives (P7 crash-resume): tar + gzip the worktree to Blob.
+tar = "0.4"
+flate2 = "1"
+
+# Azure Blob storage (P7): the production CheckpointStore/TranscriptStore, exercised
+# locally against Azurite and against real Azure in P8. 0.21 is the line that supports
+# shared-key/emulator auth (Azurite); the GA 1.0 crate is TokenCredential-only and is the
+# P8 swap once we move to managed identity. See docs/factory-implementation-plan.md P7.
+# rustls (not native-tls/openssl) to match the rest of the stack — keeps the runtime
+# images openssl-free (no libssl needed) and pure-Rust HMAC for shared-key signing.
+azure_core = { version = "0.21", default-features = false, features = ["enable_reqwest_rustls"] }
+azure_storage = { version = "0.21", default-features = false, features = ["enable_reqwest_rustls", "hmac_rust"] }
+azure_storage_blobs = { version = "0.21", default-features = false, features = ["enable_reqwest_rustls", "hmac_rust"] }
+
 # Reserved for later phases (declared for intent; only fetched once a crate uses them):
 # octocrab + jsonwebtoken (P3 GitHub App auth / installation tokens / Checks-PR API),
-# azure_storage_blobs (P3 blob), opentelemetry + opentelemetry-otlp (P7 telemetry export).
+# opentelemetry + opentelemetry-otlp (P8 telemetry export).
 
 # Internal crates
 factory-telemetry = { path = "libs/telemetry" }

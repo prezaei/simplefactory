@@ -10,6 +10,11 @@ async-trait.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
+tar.workspace = true
+flate2.workspace = true
+azure_core.workspace = true
+azure_storage.workspace = true
+azure_storage_blobs.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

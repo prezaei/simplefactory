@@ -49,10 +49,22 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://factory:factory@localhost:5432/factory?sslmode=disable
+      # The Azure Blob (Azurite) connection string that gates the libs/blob integration
+      # tests (the production CheckpointStore/TranscriptStore). Mirrors the local Azurite
+      # well-known dev account; pointed at the emulator started below. Without this the
+      # blob round-trip tests skip cleanly (like the DATABASE_URL gate).
+      FACTORY_BLOB_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Azurite (Azure Blob emulator) for the blob integration lane — started from the
+      # committed docker-compose.yml so the image/command/healthcheck have ONE source of
+      # truth (no CI-vs-compose drift). `--wait` blocks until its healthcheck passes.
+      # This is what makes the *production* Azure store path CI-tested rather than
+      # first-run-in-prod (P7).
+      - name: Start Azurite
+        run: docker compose up -d --wait azurite
       # Migration gate (activated in P1+, when migrations/ has content):
       # - run: cargo install sqlx-cli --no-default-features --features native-tls,postgres
       # - run: cargo sqlx migrate run
