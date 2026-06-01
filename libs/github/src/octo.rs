@@ -218,14 +218,25 @@ impl GitHubClient for OctocrabGitHub {
             .collect();
         tracing::info!(owner = %repo.owner, name = %repo.name, number, files = files.len(), "read change request files");
 
-        // diff/reviews stay best-effort empty; `checks` stays the `Pending` stub here
+        // The unified diff is the Reviewer's PRIMARY signal (it reviews from the CR view,
+        // not a local clone), so it MUST be populated — an empty diff left the reviewer
+        // with "no usable data" against real GitHub. octocrab returns the raw unified
+        // diff as text.
+        let diff = client
+            .pulls(&repo.owner, &repo.name)
+            .get_diff(number_u64)
+            .await
+            .map_err(|e| anyhow::anyhow!("fetching diff for change request #{number}: {e}"))?;
+        tracing::info!(owner = %repo.owner, name = %repo.name, number, diff_bytes = diff.len(), "read change request diff");
+
+        // `reviews` stays best-effort empty; `checks` stays the `Pending` stub here
         // because the coordinator reads checks via `check_status` directly (not this
-        // CR-view rollup), so the CR-view checks are off the hot approval path. `files`,
-        // by contrast, is now REAL — the gating guard depends on it (FIX 5).
+        // CR-view rollup), so the CR-view checks are off the hot approval path. `files`
+        // and `diff` are REAL — the gating guard depends on `files`, the reviewer on `diff`.
         Ok(ChangeRequestView {
             number,
             head_sha,
-            diff: String::new(),
+            diff,
             files,
             reviews: vec![],
             checks: CheckSummary {
