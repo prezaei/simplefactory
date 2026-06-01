@@ -535,7 +535,7 @@ impl GitHubClient for OctocrabGitHub {
                 // status below — NOT-green + escalate, never an infinite tick loop.
                 Err(e) if is_permission_denied(&e) => {
                     tracing::warn!(
-                        owner = %repo.owner, name = %repo.name, %sha,
+                        owner = %repo.owner, name = %repo.name, %sha, error = ?e,
                         "check runs unreadable (403 — App missing 'Checks: read'); treating as \
                          NOT-green so the CR is escalated for a human. Grant the permission to \
                          restore automatic green-gating."
@@ -593,7 +593,7 @@ impl GitHubClient for OctocrabGitHub {
                 // propagates so the next tick retries.
                 Err(e) if is_permission_denied(&e) => {
                     tracing::warn!(
-                        owner = %repo.owner, name = %repo.name, %sha,
+                        owner = %repo.owner, name = %repo.name, %sha, error = ?e,
                         "combined commit status unreadable (403 — App missing 'Commit statuses: read'); \
                          treating as NOT-green so the CR is escalated for a human. Grant the \
                          permission to restore automatic green-gating."
