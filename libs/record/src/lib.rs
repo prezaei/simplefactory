@@ -430,18 +430,25 @@ pub async fn fetch_expired_lease_items(
 /// (`Queued` to requeue, `Escalated` to terminalize), bumping `attempt_count`, and
 /// clearing the lease. Returns `true` only for the caller that wins.
 ///
-/// `expected_expiry` is the `lease_expires_at` observed by [`fetch_expired_lease_items`]:
-/// the guard `lease_expires_at IS NOT DISTINCT FROM expected` makes this optimistic —
-/// if a heartbeat extended the lease, or another sweeper replica already reclaimed and
-/// the dispatcher re-leased it (new expiry), the value differs and the claim no-ops
-/// (`false`). That, plus the `state IN ('leased','running')` guard (a terminal item is
-/// never resurrected — see [`set_state`]), gives exactly-once reclaim without a row lock.
+/// Exactly-once + correctness come from RE-CHECKING the same expired predicate
+/// [`fetch_expired_lease_items`] used (lease past expiry OR the running attempt past the
+/// wall-clock cap), atomically inside the claiming `UPDATE`, NOT from an expiry snapshot:
+/// - A heartbeat that *extended* the lease is irrelevant to the wall-clock branch — a
+///   stuck-but-alive worker keeps heart-beating, so a guard keyed on the (mutating)
+///   `lease_expires_at` value would let it dodge reclaim forever. Re-checking the
+///   predicate reclaims it regardless of heartbeats (the case the wall-clock cap exists for).
+/// - A concurrent sweeper / dispatcher re-lease is excluded: a re-leased item has a fresh
+///   future `lease_expires_at` and a brand-new running attempt, so it satisfies neither
+///   branch; and the `state IN ('leased','running')` guard (a terminal item is never
+///   resurrected — see [`set_state`]) plus the row lock taken by the `UPDATE` serialize
+///   racing reclaims so only the first flips the state and the rest no-op (`false`).
+///
 /// Executor-generic so the sweeper binds it, the attempt-finish, and the token-revoke
 /// into one transaction.
 pub async fn reclaim_claim(
     executor: impl sqlx::PgExecutor<'_>,
     work_item_id: Uuid,
-    expected_expiry: Option<DateTime<Utc>>,
+    wall_clock_cap_secs: f64,
     to_state: State,
 ) -> Result<bool> {
     let row = sqlx::query(
@@ -455,11 +462,18 @@ pub async fn reclaim_claim(
                 updated_at = now()
           WHERE id = $1
             AND state IN ('leased', 'running')
-            AND lease_expires_at IS NOT DISTINCT FROM $2
+            AND (
+              lease_expires_at < now()
+              OR EXISTS (
+                SELECT 1 FROM attempts a
+                 WHERE a.work_item_id = $1 AND a.status = 'running'
+                   AND a.started_at < now() - make_interval(secs => $2)
+              )
+            )
          RETURNING id",
     )
     .bind(work_item_id)
-    .bind(expected_expiry)
+    .bind(wall_clock_cap_secs)
     .bind(to_state.as_str())
     .fetch_optional(executor)
     .await?;
@@ -995,6 +1009,16 @@ pub async fn save_attempt_checkpoint(
 /// The most recent resumable checkpoint for a work item (its latest attempt that
 /// recorded both a `session_id` and a `checkpoint_uri`), with the resume budget. `None`
 /// when no attempt has checkpointed — the dispatcher then launches a fresh attempt.
+///
+/// `resume_count` is the number of attempts started AFTER that latest checkpointed
+/// attempt — i.e. how many times this session has been re-dispatched (resumed) since it
+/// last made progress (checkpointed). It must count *re-dispatches*, NOT
+/// attempts-that-checkpointed: a resumed attempt that crashes before its first checkpoint
+/// records no `session_id`, so counting only checkpointed attempts would let a
+/// crash-before-checkpoint loop resume the same snapshot forever, never reaching the cap.
+/// Counting attempts-after means a fresh checkpoint resets the budget (progress is being
+/// made) while a stuck loop exhausts it — matching "repeated resumes failing at the same
+/// point fall through after a few" (technical spec, Crash-resume).
 pub async fn last_checkpoint_for_item(
     pool: &Pool,
     work_item_id: Uuid,
@@ -1002,12 +1026,12 @@ pub async fn last_checkpoint_for_item(
     let row = sqlx::query(
         "SELECT a.session_id, a.checkpoint_uri,
                 (SELECT count(*) FROM attempts a2
-                  WHERE a2.work_item_id = $1 AND a2.session_id IS NOT NULL) AS resume_count
+                  WHERE a2.work_item_id = $1 AND a2.started_at > a.started_at) AS resume_count
            FROM attempts a
           WHERE a.work_item_id = $1
             AND a.session_id IS NOT NULL
             AND a.checkpoint_uri IS NOT NULL
-          ORDER BY a.started_at DESC
+          ORDER BY a.started_at DESC, a.id DESC
           LIMIT 1",
     )
     .bind(work_item_id)

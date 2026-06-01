@@ -3479,24 +3479,22 @@ mod acceptance {
         .await
         .unwrap();
 
-        // The lease sweeper reclaims the crashed run: attempt finished `reclaimed`, item
-        // back to `queued` (a fresh checkpoint preserved on the attempt).
-        let leased = record::work_item_by_id(&pool, work_item_id)
-            .await
-            .unwrap()
-            .unwrap();
+        // The worker crashed: its lease expires, and the sweeper reclaims it — attempt
+        // finished `reclaimed`, item back to `queued` (the checkpoint preserved on it).
+        sqlx::query(
+            "UPDATE work_items SET lease_expires_at = now() - interval '1 minute' WHERE id = $1",
+        )
+        .bind(work_item_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         record::reclaim_running_attempt(&pool, work_item_id)
             .await
             .unwrap();
         assert!(
-            record::reclaim_claim(
-                &pool,
-                work_item_id,
-                leased.lease_expires_at,
-                record::State::Queued
-            )
-            .await
-            .unwrap(),
+            record::reclaim_claim(&pool, work_item_id, 1e9, record::State::Queued)
+                .await
+                .unwrap(),
             "the crashed lease was reclaimed"
         );
 

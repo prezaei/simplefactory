@@ -56,6 +56,22 @@ impl TranscriptStore for InMemoryTranscripts {
     }
 }
 
+/// Resolve a `uri` to a path under `root`, rejecting absolute paths and `..` traversal
+/// so a uri can never escape `root`. This is a security boundary shared by every
+/// filesystem-backed store ([`FsTranscripts`], [`FsCheckpoints`]) — hardening it here
+/// (e.g. new escape vectors) covers all of them at once.
+fn resolve_under(root: &Path, uri: &str) -> anyhow::Result<PathBuf> {
+    let rel = Path::new(uri);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("invalid blob uri: {uri}");
+    }
+    Ok(root.join(rel))
+}
+
 /// Filesystem-backed transcript store (local parity). `uri` is treated as a path
 /// relative to `root`; path traversal outside `root` is rejected.
 pub struct FsTranscripts {
@@ -68,16 +84,7 @@ impl FsTranscripts {
     }
 
     fn resolve(&self, uri: &str) -> anyhow::Result<PathBuf> {
-        // Reject absolute paths and `..` traversal — a uri must stay under root.
-        let rel = Path::new(uri);
-        if rel.is_absolute()
-            || rel
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            anyhow::bail!("invalid transcript uri: {uri}");
-        }
-        Ok(self.root.join(rel))
+        resolve_under(&self.root, uri)
     }
 }
 
@@ -166,15 +173,7 @@ impl FsCheckpoints {
     }
 
     fn resolve(&self, uri: &str) -> anyhow::Result<PathBuf> {
-        let rel = Path::new(uri);
-        if rel.is_absolute()
-            || rel
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            anyhow::bail!("invalid checkpoint uri: {uri}");
-        }
-        Ok(self.root.join(rel))
+        resolve_under(&self.root, uri)
     }
 }
 

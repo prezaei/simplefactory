@@ -554,6 +554,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("worker: starting harness (P3)");
 
     let cfg = load_config()?;
+    // The pinned config sha rides in on the env (FACTORY_CONFIG_SHA) purely for
+    // traceability: log it so an in-flight attempt's logs name the exact config version
+    // it was dispatched under (telemetry mandate). The run itself uses the prompt Tools
+    // composed; the pin is enforced by the dispatcher (a removed worker isn't re-leased).
+    tracing::info!(
+        config_sha = %std::env::var("FACTORY_CONFIG_SHA").unwrap_or_else(|_| "<unset>".to_string()),
+        "worker: dispatched under pinned config"
+    );
     let tools = HttpTools::new(cfg.tools_url.clone(), cfg.task_token.clone());
     let git = GitCli {
         install_token: cfg.install_token.clone(),

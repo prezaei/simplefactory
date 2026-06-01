@@ -316,22 +316,21 @@ async fn redispatch_after_checkpoint_resumes_the_same_session() {
     )
     .await
     .expect("save checkpoint");
-    let reclaimed = record::work_item_by_id(&pool, item_id)
-        .await
-        .unwrap()
-        .unwrap();
+    // The worker crashed: expire its lease so the sweeper reclaims it.
+    sqlx::query(
+        "UPDATE work_items SET lease_expires_at = now() - interval '1 minute' WHERE id = $1",
+    )
+    .bind(item_id)
+    .execute(&pool)
+    .await
+    .unwrap();
     record::reclaim_running_attempt(&pool, item_id)
         .await
         .unwrap();
     assert!(
-        record::reclaim_claim(
-            &pool,
-            item_id,
-            reclaimed.lease_expires_at,
-            record::State::Queued
-        )
-        .await
-        .unwrap(),
+        record::reclaim_claim(&pool, item_id, 1e9, record::State::Queued)
+            .await
+            .unwrap(),
         "the crashed item is requeued"
     );
 

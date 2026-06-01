@@ -48,7 +48,7 @@ async fn sweep_expired(pool: &record::Pool) {
             .await
             .unwrap();
         record::revoke_task_tokens(pool, item.id).await.unwrap();
-        record::reclaim_claim(pool, item.id, item.lease_expires_at, State::Queued)
+        record::reclaim_claim(pool, item.id, NEVER_WALL_CLOCK, State::Queued)
             .await
             .unwrap();
     }
@@ -1378,29 +1378,38 @@ async fn reclaim_claim_is_optimistic_and_exactly_once() {
     record::enqueue(&pool, &coder_item(repo, "issue#1"))
         .await
         .unwrap();
+    // A VALID (future) lease first: reclaim_claim re-checks the expired predicate, so a
+    // live lease (not past expiry, no over-cap running attempt) is NOT claimed.
+    let valid = record::lease_next(&pool, &lease_req(repo, 10, 10)) // ttl 60s, future
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !record::reclaim_claim(&pool, valid.id, NEVER_WALL_CLOCK, State::Queued)
+            .await
+            .unwrap(),
+        "a live lease is not reclaimed (predicate not met)"
+    );
+
+    // Now an EXPIRED lease (ttl 0): the first claim wins, the second loses.
+    record::enqueue(&pool, &coder_item(repo, "issue#2"))
+        .await
+        .unwrap();
     let mut req = lease_req(repo, 10, 10);
     req.ttl_secs = 0.0;
     let leased = record::lease_next(&pool, &req).await.unwrap().unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // A claim with the WRONG expected expiry no-ops (optimistic-concurrency guard).
     assert!(
-        !record::reclaim_claim(&pool, leased.id, Some(Utc::now()), State::Queued)
+        record::reclaim_claim(&pool, leased.id, NEVER_WALL_CLOCK, State::Queued)
             .await
             .unwrap(),
-        "a stale expected_expiry must not claim"
+        "an expired lease is reclaimed"
     );
-    // The correct observed expiry wins exactly once.
+    // A second claim loses: the item is queued, no longer leased/running, so it can't be
+    // reclaimed twice — exactly-once via the state guard + the UPDATE's row lock.
     assert!(
-        record::reclaim_claim(&pool, leased.id, leased.lease_expires_at, State::Queued)
-            .await
-            .unwrap(),
-        "the observed expiry claims the item"
-    );
-    // A second claim with the same (now stale) expiry loses: the item is queued, no
-    // longer leased/running, so it can't be reclaimed twice.
-    assert!(
-        !record::reclaim_claim(&pool, leased.id, leased.lease_expires_at, State::Queued)
+        !record::reclaim_claim(&pool, leased.id, NEVER_WALL_CLOCK, State::Queued)
             .await
             .unwrap(),
         "an already-reclaimed item is not reclaimed again"
@@ -1480,7 +1489,10 @@ async fn save_and_load_checkpoint_roundtrip_and_overwrite() {
         .expect("checkpoint present");
     assert_eq!(info.session_id, "ses-1");
     assert_eq!(info.checkpoint_uri, "cp://1");
-    assert_eq!(info.resume_count, 1);
+    assert_eq!(
+        info.resume_count, 0,
+        "no re-dispatch yet (no attempt after this one)"
+    );
 
     // Last write wins.
     assert!(
@@ -1494,7 +1506,10 @@ async fn save_and_load_checkpoint_roundtrip_and_overwrite() {
         .expect("checkpoint present");
     assert_eq!(info.session_id, "ses-2");
     assert_eq!(info.checkpoint_uri, "cp://2");
-    assert_eq!(info.resume_count, 1, "still one checkpointed attempt");
+    assert_eq!(
+        info.resume_count, 0,
+        "still no attempt after the checkpoint"
+    );
 }
 
 #[tokio::test]
@@ -1535,12 +1550,14 @@ async fn last_checkpoint_returns_latest_with_resume_count() {
         .await
         .unwrap()
         .unwrap();
-    // Three attempts; only the 2nd and 3rd carry a session id.
+    // Four attempts. a1 (oldest) and a2 both checkpoint; a3 and a4 are later
+    // re-dispatches (resumes) that crashed before checkpointing (no session id).
     let a1 = record::start_attempt(&pool, leased.id, None).await.unwrap();
     let a2 = record::start_attempt(&pool, leased.id, None).await.unwrap();
     let a3 = record::start_attempt(&pool, leased.id, None).await.unwrap();
+    let a4 = record::start_attempt(&pool, leased.id, None).await.unwrap();
     // Deterministic ordering by started_at (now_v7 ids can tie within a ms).
-    for (id, ago) in [(a1, 3), (a2, 2), (a3, 1)] {
+    for (id, ago) in [(a1, 4), (a2, 3), (a3, 2), (a4, 1)] {
         sqlx::query(&format!(
             "UPDATE attempts SET started_at = now() - interval '{ago} minutes' WHERE id = $1"
         ))
@@ -1549,10 +1566,10 @@ async fn last_checkpoint_returns_latest_with_resume_count() {
         .await
         .unwrap();
     }
-    record::save_attempt_checkpoint(&pool, a2, "ses-2", "cp://2")
+    record::save_attempt_checkpoint(&pool, a1, "ses-1", "cp://1")
         .await
         .unwrap();
-    record::save_attempt_checkpoint(&pool, a3, "ses-3", "cp://3")
+    record::save_attempt_checkpoint(&pool, a2, "ses-2", "cp://2")
         .await
         .unwrap();
 
@@ -1561,8 +1578,13 @@ async fn last_checkpoint_returns_latest_with_resume_count() {
         .unwrap()
         .expect("checkpoint present");
     assert_eq!(
-        info.session_id, "ses-3",
-        "the most recent session is returned"
+        info.session_id, "ses-2",
+        "the most recent CHECKPOINTED session is returned (a2, not the later crashed a3/a4)"
     );
-    assert_eq!(info.resume_count, 2, "two attempts carried a session id");
+    // a3 and a4 started after a2 → two resumes since the last checkpoint, even though
+    // they recorded no session id (the crash-before-checkpoint case the budget must catch).
+    assert_eq!(
+        info.resume_count, 2,
+        "two re-dispatches since the last checkpoint count toward the resume budget"
+    );
 }

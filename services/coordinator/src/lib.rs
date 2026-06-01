@@ -231,7 +231,7 @@ pub async fn sweeper_tick(
                 }
             },
         };
-        match reclaim_item(pool, gh, &item, repo).await {
+        match reclaim_item(pool, gh, &item, repo, wall_clock_cap_secs).await {
             Ok(ReclaimResult::Requeued) => reclaimed += 1,
             Ok(ReclaimResult::Escalated) => {
                 reclaimed += 1;
@@ -249,16 +249,18 @@ pub async fn sweeper_tick(
     Ok((reclaimed, escalated))
 }
 
-/// Reclaim one expired-lease item atomically: claim it (optimistic on the observed
-/// lease expiry, serialized per issue with the coordinator's reaction), finish its
-/// running attempt, revoke its tokens, and requeue-or-escalate by the retry cap. The
-/// claim's expiry guard + `state IN ('leased','running')` make this exactly-once: a
-/// racing sweeper, a heartbeat that extended the lease, or a re-lease all lose the claim.
+/// Reclaim one expired-lease item atomically: claim it (re-checking the expired
+/// predicate, serialized per issue with the coordinator's reaction), finish its running
+/// attempt, revoke its tokens, and requeue-or-escalate by the retry cap. The claim
+/// re-validates `lease past expiry OR running attempt past the wall-clock cap` + guards
+/// `state IN ('leased','running')`, so a racing sweeper, a re-lease, or a heartbeat that
+/// extended the lease (irrelevant to the wall-clock branch) all resolve to exactly-once.
 async fn reclaim_item(
     pool: &record::Pool,
     gh: &dyn GitHubClient,
     item: &WorkItem,
     repo_and_config: Option<Arc<(RepoIdent, Config)>>,
+    wall_clock_cap_secs: f64,
 ) -> anyhow::Result<ReclaimResult> {
     // The retry cap (and, for an escalation, the assignee + repo identity) come from the
     // repo config. With no usable config, reclaim at the platform-default cap; an
@@ -282,8 +284,8 @@ async fn reclaim_item(
     let mut tx = pool.begin().await?;
     record::issue_advisory_lock(&mut tx, item.repo_id, lock_key).await?;
 
-    // Claim the lease optimistically on its observed expiry — exactly one caller wins.
-    if !record::reclaim_claim(&mut *tx, item.id, item.lease_expires_at, to_state).await? {
+    // Claim by re-checking the expired predicate — exactly one caller wins.
+    if !record::reclaim_claim(&mut *tx, item.id, wall_clock_cap_secs, to_state).await? {
         tx.rollback().await?;
         return Ok(ReclaimResult::Skipped);
     }
