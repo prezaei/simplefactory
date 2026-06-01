@@ -460,3 +460,53 @@ async fn http_tools_retries_409_conflict_then_succeeds() {
 
     server.abort();
 }
+
+#[tokio::test]
+async fn http_tools_persistent_409_surfaces_claim_contended() {
+    use axum::http::StatusCode as Sc;
+    use axum::routing::post;
+    use axum::Json;
+    use factory_worker::ClaimContended;
+
+    // A mock Tools endpoint that ALWAYS returns 409 (a concurrent attempt holds the
+    // claim for the whole window). call_tool must exhaust its retry budget and surface
+    // ClaimContended — NOT a generic error — so run_task can bow out without
+    // terminalizing the work item.
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let hits_route = hits.clone();
+    let app = axum::Router::new().route(
+        "/tools/heartbeat",
+        post(move || {
+            hits_route.fetch_add(1, Ordering::SeqCst);
+            async move {
+                (
+                    Sc::CONFLICT,
+                    Json(serde_json::json!({"error": "claim in flight"})),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let tools = HttpTools::new(format!("http://{addr}"), "tok".into());
+    let err = tools
+        .heartbeat()
+        .await
+        .expect_err("persistent 409 must surface an error");
+    assert!(
+        err.downcast_ref::<ClaimContended>().is_some(),
+        "persistent 409 surfaces ClaimContended (non-terminal), got: {err}"
+    );
+    // Tried the full bounded budget (more than one attempt), not just once.
+    assert!(
+        hits.load(Ordering::SeqCst) >= 6,
+        "exhausted the retry budget: {} attempts",
+        hits.load(Ordering::SeqCst)
+    );
+
+    server.abort();
+}

@@ -180,6 +180,16 @@ pub async fn run_task(
     match run_task_inner(tools, git, claude, cfg).await {
         Ok(()) => Ok(()),
         Err(err) => {
+            // A contended idempotency claim ([`ClaimContended`]) means a CONCURRENT
+            // attempt owns this work item's terminal action (a lease-expiry re-dispatch
+            // overlap). This worker must NOT record `failed` — that would terminalize the
+            // item and, because terminal states are final, prevent the owning attempt's
+            // success from ever landing. Bow out without terminalizing; the owning attempt
+            // completes the item (or the lease sweeper re-dispatches if it died).
+            if err.downcast_ref::<ClaimContended>().is_some() {
+                tracing::warn!(error = %err, "worker: idempotency claim held by a concurrent attempt; bowing out without terminalizing");
+                return Err(err);
+            }
             tracing::error!(error = %err, "worker: task failed");
             // Best effort — the original error is what we return regardless.
             if let Err(record_err) = tools.record_outcome("failed", &err.to_string()).await {
@@ -189,6 +199,24 @@ pub async fn run_task(
         }
     }
 }
+
+/// Error returned by [`HttpTools`] when a Tools call keeps getting 409 Conflict — a
+/// concurrent attempt holds the idempotency claim past our retry budget. It is NOT a
+/// task failure: [`run_task`] recognizes it and bows out without recording a terminal
+/// `failed` outcome, leaving the work item for the owning attempt (or the lease sweeper).
+#[derive(Debug)]
+pub struct ClaimContended;
+
+impl std::fmt::Display for ClaimContended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tools idempotency claim is held by a concurrent attempt (409 after retries)"
+        )
+    }
+}
+
+impl std::error::Error for ClaimContended {}
 
 async fn run_task_inner(
     tools: &dyn ToolsClient,
@@ -302,13 +330,15 @@ async fn run_manager(
     // (`decide_manager_succeeded` no-ops for any other subject, which would strand a
     // reacted item). Config/intake could enqueue a manager on a non-issue trigger, so
     // fail loudly at the seam — before spending a Claude run or any side effect —
-    // rather than succeed into a dead end. Parse the full `issue#<number>` form (not a
-    // bare prefix), so a malformed `issue#not-a-number` — or a non-positive
-    // `issue#-1`/`issue#0` — also fails here (GitHub issue numbers are positive).
+    // rather than succeed into a dead end. Parse as a POSITIVE `i32`: malformed
+    // (`issue#not-a-number`), non-positive (`issue#-1`/`issue#0`), AND out-of-i32-range
+    // (`issue#2147483648`) all fail here. The i32 bound matches the record/coordinator
+    // layer (issue numbers are stored as `int`), so a subject the coordinator would later
+    // fail to narrow can't first run Claude + post + record success into a dead end.
     if task
         .subject_ref
         .strip_prefix("issue#")
-        .and_then(|n| n.parse::<i64>().ok())
+        .and_then(|n| n.parse::<i32>().ok())
         .filter(|n| *n > 0)
         .is_none()
     {
@@ -381,14 +411,19 @@ async fn run_reviewer(
     // Validate the subject BEFORE running Claude: a reviewer can only act on a `cr#N`
     // subject. Resolving it up front means a bad subject (which non-CR triggers could
     // enqueue) fails at the seam without spending a Claude run or writing a transcript.
+    // Parse as a POSITIVE `i32` (the Tools/record layer narrows CR numbers to `int`):
+    // malformed, non-positive, and out-of-i32-range subjects all fail here, so a subject
+    // that `submit_review` would later reject with `invalid cr_number` can't first spend a
+    // Claude run and submit a GitHub review. Widened to i64 for the Tools call signature.
     let cr_number = task
         .subject_ref
         .strip_prefix("cr#")
-        .and_then(|n| n.parse::<i64>().ok())
+        .and_then(|n| n.parse::<i32>().ok())
         .filter(|n| *n > 0)
+        .map(i64::from)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "worker(reviewer): task subject {:?} is not a cr#<number> (positive)",
+                "worker(reviewer): task subject {:?} is not a cr#<number> (positive, in range)",
                 task.subject_ref
             )
         })?;
@@ -497,18 +532,25 @@ impl HttpTools {
             // idempotency claim (a lease-expiry re-dispatch overlapping the original
             // run). That is a transient race the claim is meant to absorb — NOT a task
             // failure. Retry a bounded number of times so the re-dispatched worker waits
-            // for the in-flight action to complete/dedupe instead of recording a spurious
-            // `failed`. Applies to every Tools call (open CR, comment, review, escalate).
-            if resp.status() == reqwest::StatusCode::CONFLICT
-                && attempt < TOOLS_CONFLICT_MAX_ATTEMPTS
-            {
-                tracing::info!(
-                    tool,
-                    attempt,
-                    "HttpTools: 409 conflict (idempotency claim in flight); retrying"
-                );
-                tokio::time::sleep(tools_conflict_backoff(attempt)).await;
-                continue;
+            // for the in-flight action to complete/dedupe. Applies to every Tools call
+            // (open CR, comment, review, escalate).
+            if resp.status() == reqwest::StatusCode::CONFLICT {
+                if attempt < TOOLS_CONFLICT_MAX_ATTEMPTS {
+                    tracing::info!(
+                        tool,
+                        attempt,
+                        "HttpTools: 409 conflict (idempotency claim in flight); retrying"
+                    );
+                    tokio::time::sleep(tools_conflict_backoff(attempt)).await;
+                    continue;
+                }
+                // Still contended after the retry budget: surface a typed
+                // [`ClaimContended`] so `run_task` bows out WITHOUT terminalizing the
+                // item as `failed` — the attempt that owns the claim will complete it,
+                // and terminal states are final, so a spurious `failed` here would block
+                // that success forever.
+                tracing::warn!(tool, attempt, "HttpTools: 409 conflict persisted past retry budget; treating as claim-contended (non-terminal)");
+                return Err(ClaimContended.into());
             }
             let resp = resp.error_for_status()?;
             return Ok(resp.json().await?);
@@ -707,6 +749,9 @@ mod tests {
         comments: Mutex<Vec<(String, String, String)>>, // (target, body, dedupe_key)
         reviews: Mutex<Vec<(i64, String, String, String)>>, // (cr, verdict, body, dedupe_key)
         escalations: Mutex<Vec<(String, String, String)>>, // (reason, context, dedupe_key)
+        /// When set, open_or_update_change_request returns ClaimContended (models a
+        /// concurrent attempt holding the idempotency claim past the retry budget).
+        contend_cr: bool,
         fixed_cr_number: i64,
     }
 
@@ -738,6 +783,9 @@ mod tests {
         async fn open_or_update_change_request(&self, req: &CrRequest) -> anyhow::Result<CrResult> {
             self.cr_calls.fetch_add(1, Ordering::SeqCst);
             *self.last_cr_request.lock().expect("lock") = Some(req.clone());
+            if self.contend_cr {
+                return Err(ClaimContended.into());
+            }
             // Idempotent: same number regardless of how many times it is called.
             Ok(CrResult {
                 cr_number: self.fixed_cr_number,
@@ -1181,7 +1229,13 @@ mod tests {
         // A reviewer subject must be a POSITIVE `cr#<number>`. A non-cr subject — or a
         // non-positive `cr#-1`/`cr#0` — bails loudly BEFORE running Claude (validation is
         // up front), so it costs no Claude run, writes no transcript, submits no verdict.
-        for bad_subject in ["issue#5", "cr#-1", "cr#0", "cr#not-a-number"] {
+        for bad_subject in [
+            "issue#5",
+            "cr#-1",
+            "cr#0",
+            "cr#not-a-number",
+            "cr#2147483648",
+        ] {
             let tools = FakeTools::seeded_role("reviewer", bad_subject, "factory/x");
             let git = FakeGit::default();
             let claude = FakeClaude::with(RunOutcome::Review {
@@ -1230,6 +1284,7 @@ mod tests {
             "schedule@nightly",
             "issue#-1",
             "issue#0",
+            "issue#2147483648", // > i32::MAX
         ] {
             let tools = FakeTools::seeded_role("manager", bad_subject, "factory/x");
             let git = FakeGit::default();
@@ -1266,6 +1321,33 @@ mod tests {
             assert_eq!(outcomes.len(), 1);
             assert_eq!(outcomes[0].0, "failed");
         }
+    }
+
+    #[tokio::test]
+    async fn claim_contended_bows_out_without_recording_failed() {
+        // A contended idempotency claim (another attempt owns the terminal action) must
+        // NOT terminalize the work item as `failed` — run_task returns the error but
+        // records NO outcome, so the owning attempt's eventual success can still land.
+        let tools = FakeTools {
+            contend_cr: true,
+            ..FakeTools::seeded()
+        };
+        let git = FakeGit::default();
+        let claude = FakeClaude::ok("Implemented");
+        let cfg = config();
+
+        let err = run_task(&tools, &git, &claude, &cfg)
+            .await
+            .expect_err("a contended claim surfaces an error");
+        assert!(
+            err.downcast_ref::<ClaimContended>().is_some(),
+            "the error is ClaimContended: {err}"
+        );
+        assert_eq!(
+            tools.outcomes.lock().expect("lock").len(),
+            0,
+            "must NOT record a (failed) outcome — the owning attempt completes the item"
+        );
     }
 
     #[tokio::test]
