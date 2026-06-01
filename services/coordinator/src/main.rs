@@ -44,11 +44,19 @@ async fn main() -> anyhow::Result<()> {
     // without a rebuild; a malformed value falls back to the default rather than
     // disabling the bound. Uses the SHARED parser + default from `factory_record` so the
     // cap the sweeper enforces here can never drift from the cap the dispatcher sizes the
-    // task-token TTL against. The effective value is logged below.
-    let wall_clock_cap_secs = factory_record::parse_positive_secs(
+    // task-token TTL against. A PRESENT-but-invalid value is logged (telemetry invariant:
+    // an operator must be able to diagnose the ignored misconfig from logs); the effective
+    // value is also logged below.
+    let (wall_clock_cap_secs, cap_invalid) = factory_record::parse_positive_secs_reported(
         std::env::var("FACTORY_WALL_CLOCK_CAP_SECS").ok().as_deref(),
         factory_record::DEFAULT_WALL_CLOCK_CAP_SECS,
     );
+    if cap_invalid {
+        tracing::warn!(
+            default = factory_record::DEFAULT_WALL_CLOCK_CAP_SECS,
+            "invalid FACTORY_WALL_CLOCK_CAP_SECS; using default"
+        );
+    }
 
     tracing::info!(
         tick_secs = COORDINATE_TICK.as_secs(),
