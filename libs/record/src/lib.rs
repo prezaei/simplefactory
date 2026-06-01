@@ -1033,7 +1033,8 @@ pub async fn last_checkpoint_for_item(
     let row = sqlx::query(
         "SELECT a.session_id, a.checkpoint_uri,
                 (SELECT count(*) FROM attempts a2
-                  WHERE a2.work_item_id = $1 AND a2.started_at > a.started_at) AS resume_count
+                  WHERE a2.work_item_id = $1
+                    AND (a2.started_at, a2.id) > (a.started_at, a.id)) AS resume_count
            FROM attempts a
           WHERE a.work_item_id = $1
             AND a.session_id IS NOT NULL

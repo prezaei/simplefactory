@@ -303,7 +303,9 @@ async fn reclaim_item(
                 comment_target,
                 assign_issue,
                 reason: "retries_exhausted",
-                context: format!("lease reclaimed after {} attempts", item.attempt_count),
+                // reclaim_claim above already counted THIS lapsed attempt (attempt_count + 1),
+                // so report the post-claim total, not the pre-claim value.
+                context: format!("lease reclaimed after {} attempts", item.attempt_count + 1),
             },
         )
         .await?;
