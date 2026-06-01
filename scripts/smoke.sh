@@ -25,7 +25,9 @@ TOOLS_URL="${TOOLS_HEALTH_URL:-http://localhost:8081}"
 WORKER_IMAGE="${FACTORY_WORKER_IMAGE:-factory-worker:local}"
 TIMEOUT_SECS="${FACTORY_SMOKE_TIMEOUT:-1200}"   # generous: real claude runs
 OWNER="${REPO%%/*}"; NAME="${REPO##*/}"
-WORKDIR="$(mktemp -d)/factory-smoke"
+# One temp root for the whole run, removed on exit (no leaked per-run dirs).
+TMPROOT="$(mktemp -d)"
+WORKDIR="$TMPROOT/factory-smoke"
 
 log()  { printf '\033[1;36m[smoke]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ ok ]\033[0m %s\n' "$*"; }
@@ -34,7 +36,8 @@ die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # Results store as a temp file ("scenario status" per line) — works on macOS's stock
 # bash 3.2, which has no associative arrays.
-RESULTS_FILE="$(mktemp)"
+RESULTS_FILE="$TMPROOT/results"
+trap 'rm -rf "$TMPROOT"' EXIT
 set_result() { echo "$1 $2" >> "$RESULTS_FILE"; }
 get_result() { awk -v s="$1" '$1==s{print $2}' "$RESULTS_FILE" | tail -1; }
 
