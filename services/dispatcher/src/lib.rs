@@ -20,22 +20,50 @@ use record::{Kind, LeaseRequest, Pool};
 use serde_json::json;
 use uuid::Uuid;
 
-/// Default per-task lease/token TTL in seconds. The coordinator's lease sweeper (P5)
+/// Default per-task **lease** TTL in seconds. The coordinator's lease sweeper (P5)
 /// reclaims leases that expire past this window, marking the attempt reclaimed and
 /// revoking the token, so a crashed worker's slot is freed and the item re-dispatched.
 /// Overridable via `FACTORY_LEASE_TTL_SECS` (e.g. a shorter TTL makes crash-resume
 /// reclaim faster for a smoke; it must stay comfortably above the worker's heartbeat
-/// interval so a live worker keeps renewing it).
-const DEFAULT_TASK_TTL_SECS: f64 = 900.0;
+/// interval so a live worker keeps renewing it). NAMED for the lease, NOT the token —
+/// the token TTL is sized separately from the wall-clock cap (see [`token_ttl_secs`]).
+const DEFAULT_LEASE_TTL_SECS: f64 = 900.0;
 
-/// The effective per-task lease TTL: `FACTORY_LEASE_TTL_SECS` if set to a positive
-/// number, else [`DEFAULT_TASK_TTL_SECS`].
+/// Grace added on top of the wall-clock cap when sizing the task-token TTL, so a worker
+/// running right up to the cap can still authenticate its terminal `record_outcome`
+/// (and final checkpoint) before the token expires.
+const TOKEN_TTL_GRACE_SECS: f64 = 5.0 * 60.0;
+
+/// The effective per-task **lease** TTL: `FACTORY_LEASE_TTL_SECS` if set to a positive
+/// number, else [`DEFAULT_LEASE_TTL_SECS`]. Governs how fast a *dead* worker's lease is
+/// reclaimed — deliberately short for crash-resume smokes.
 fn task_ttl_secs() -> f64 {
-    std::env::var("FACTORY_LEASE_TTL_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|n| *n > 0.0)
-        .unwrap_or(DEFAULT_TASK_TTL_SECS)
+    record::resolve_positive_secs_env("FACTORY_LEASE_TTL_SECS", DEFAULT_LEASE_TTL_SECS)
+}
+
+/// Size a task-token TTL from a wall-clock `cap`. Pure half of [`token_ttl_secs`].
+fn token_ttl_from_cap(cap: f64) -> f64 {
+    cap + TOKEN_TTL_GRACE_SECS
+}
+
+/// The effective task-**token** TTL — DECOUPLED from the (possibly short) lease TTL.
+///
+/// The lease governs how fast a *dead* worker is reclaimed, but a *live* worker's token
+/// must stay valid for the WHOLE run, which can last up to the absolute wall-clock cap
+/// (`FACTORY_WALL_CLOCK_CAP_SECS`). It reads the SAME env var + shared
+/// [`record::DEFAULT_WALL_CLOCK_CAP_SECS`] + shared parser the coordinator's sweeper
+/// uses, so the token can never be sized for a different cap than the one actually
+/// enforced. Sizing the token from the short lease TTL instead silently 401s a healthy
+/// long run mid-flight: it can no longer heartbeat, so its lease lapses and it is wrongly
+/// reclaimed and re-dispatched — an infinite churn (observed live with
+/// `FACTORY_LEASE_TTL_SECS=120`: real coder runs take minutes, far past a 120s token).
+/// Reclaim security does NOT rely on token expiry — the sweeper REVOKES a reclaimed
+/// attempt's token, killing it immediately regardless of this (generous) TTL.
+fn token_ttl_secs() -> f64 {
+    token_ttl_from_cap(record::resolve_positive_secs_env(
+        "FACTORY_WALL_CLOCK_CAP_SECS",
+        record::DEFAULT_WALL_CLOCK_CAP_SECS,
+    ))
 }
 
 /// Default per-worker concurrency cap when a worker does not set `max_concurrent`.
@@ -492,6 +520,10 @@ async fn launch_leased(
     let attempt_id = record::start_attempt(pool, item.id, None).await?;
 
     let raw_token = new_raw_token();
+    // Token TTL is the wall-clock cap (+grace), NOT the short lease TTL: a live worker
+    // must stay authenticated for the whole run, or it 401s mid-flight and churns. The
+    // lease (short) still drives fast reclaim of a *dead* worker; revocation on reclaim
+    // is what kills a superseded token, not this TTL. See [`token_ttl_secs`].
     record::mint_task_token(
         pool,
         &record::hash_token(&raw_token),
@@ -499,7 +531,7 @@ async fn launch_leased(
         item.repo_id,
         item.kind,
         Some(attempt_id),
-        task_ttl_secs(),
+        token_ttl_secs(),
     )
     .await?;
 
@@ -565,6 +597,31 @@ mod tests {
             config_sha: "cfgsha123".to_string(),
             resume: None,
         }
+    }
+
+    // The crash-resume churn bug: a SHORT lease TTL must never shorten the task token.
+    // The token is sized from the wall-clock cap (+grace), so it always outlives a full
+    // capped run — a live worker stays authenticated and keeps heart-beating instead of
+    // 401ing mid-flight and being wrongly reclaimed. (The shared positive-secs parser is
+    // unit-tested in `factory_record`.)
+    #[test]
+    fn token_ttl_outlives_a_short_lease_and_tracks_the_wall_clock_cap() {
+        let short_lease = record::parse_positive_secs(Some("120"), DEFAULT_LEASE_TTL_SECS);
+        let token = token_ttl_from_cap(record::DEFAULT_WALL_CLOCK_CAP_SECS);
+        assert!(
+            token > short_lease,
+            "token TTL {token} must exceed a short lease TTL {short_lease}"
+        );
+        assert!(
+            token >= record::DEFAULT_WALL_CLOCK_CAP_SECS,
+            "token TTL {token} must cover a full wall-clock-cap run"
+        );
+        // The token tracks the CAP, not the lease: changing the cap moves the token TTL.
+        assert_eq!(token_ttl_from_cap(600.0), 600.0 + TOKEN_TTL_GRACE_SECS);
+        assert_eq!(
+            token_ttl_from_cap(record::DEFAULT_WALL_CLOCK_CAP_SECS),
+            record::DEFAULT_WALL_CLOCK_CAP_SECS + TOKEN_TTL_GRACE_SECS
+        );
     }
 
     #[test]

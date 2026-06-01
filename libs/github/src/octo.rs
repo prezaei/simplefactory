@@ -56,7 +56,7 @@ impl OctocrabGitHub {
     /// Parse the App private key (PEM) into a `jsonwebtoken::EncodingKey`.
     fn encoding_key(&self) -> anyhow::Result<jsonwebtoken::EncodingKey> {
         jsonwebtoken::EncodingKey::from_rsa_pem(self.private_key_pem.as_bytes())
-            .map_err(|e| anyhow::anyhow!("invalid GITHUB_APP_PRIVATE_KEY: {e}"))
+            .map_err(|e| anyhow::anyhow!("invalid GITHUB_APP_PRIVATE_KEY: {e:?}"))
     }
 
     /// Build the App JWT client (authenticates as the GitHub App itself).
@@ -64,7 +64,7 @@ impl OctocrabGitHub {
         octocrab::Octocrab::builder()
             .app(octocrab::models::AppId(self.app_id), self.encoding_key()?)
             .build()
-            .map_err(|e| anyhow::anyhow!("building GitHub App client: {e}"))
+            .map_err(|e| anyhow::anyhow!("building GitHub App client: {e:?}"))
     }
 
     /// Build an installation-scoped client (authenticates as the installation).
@@ -74,7 +74,7 @@ impl OctocrabGitHub {
         let (client, _token) = app
             .installation_and_token(octocrab::models::InstallationId(installation_id))
             .await
-            .map_err(|e| anyhow::anyhow!("minting installation client: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("minting installation client: {e:?}"))?;
         Ok(client)
     }
 }
@@ -178,6 +178,50 @@ fn map_status_state(state: &str) -> CheckConclusion {
     }
 }
 
+/// GitHub's exact message for an App-permission denial (403). Matched specifically so a
+/// 403 from a *rate limit* (primary or secondary/abuse) — which IS transient and carries
+/// a different message ("API rate limit exceeded", "exceeded a secondary rate limit") —
+/// is NOT misread as a permanent permission gap. A rate-limit 403 must propagate (retry
+/// next tick), not degrade a green CR to an escalation.
+const PERMISSION_DENIED_MESSAGE: &str = "Resource not accessible by integration";
+
+/// The HTTP status + message of a structured GitHub API error, or `None` for a
+/// transport/parse/auth error that carries no HTTP status. The ONE place that
+/// destructures octocrab's `#[non_exhaustive]` `Error::GitHub` shape, so status-based
+/// classification (404 not-found in `get_file`, 403 permission here) lives in a single
+/// accessor instead of being re-spelled at each call site.
+fn github_status_and_message(e: &octocrab::Error) -> Option<(u16, &str)> {
+    match e {
+        octocrab::Error::GitHub { source, .. } => {
+            Some((source.status_code.as_u16(), source.message.as_str()))
+        }
+        _ => None,
+    }
+}
+
+/// True when an octocrab error is a GitHub **403 App-permission denial** — the App lacks
+/// a permission for this read (e.g. `Commit statuses: read`). DISTINCT from a transient
+/// error (incl. a rate-limit 403): a permission 403 won't fix itself on retry, so the
+/// caller must DEGRADE rather than loop on it forever. Matches on the 403 status AND the
+/// specific permission message (see [`PERMISSION_DENIED_MESSAGE`]) so rate-limit 403s
+/// still propagate.
+fn is_permission_denied(e: &octocrab::Error) -> bool {
+    matches!(
+        github_status_and_message(e),
+        Some((403, msg)) if msg.contains(PERMISSION_DENIED_MESSAGE)
+    )
+}
+
+/// The legacy combined-commit-status contribution to the check rollup (FIX B). Pure so
+/// the empty-vs-non-empty policy is unit-tested without real GitHub: a status with ≥1
+/// context folds its server-computed rollup `state`; a status with ZERO contexts
+/// contributes nothing — GitHub reports `pending` for a SHA with no statuses, so the
+/// empty case must stay green (FIX 2). (A permission-denied gating read is handled by the
+/// caller, which folds a single NOT-green contribution; see `check_status`.)
+fn combined_status_contribution(status: &CombinedStatus) -> Option<CheckConclusion> {
+    (status.total_count > 0).then(|| map_status_state(&status.state))
+}
+
 #[async_trait::async_trait]
 impl GitHubClient for OctocrabGitHub {
     async fn installation_token(&self, installation_id: i64) -> anyhow::Result<String> {
@@ -187,7 +231,7 @@ impl GitHubClient for OctocrabGitHub {
         let (_client, token) = app
             .installation_and_token(octocrab::models::InstallationId(installation_id))
             .await
-            .map_err(|e| anyhow::anyhow!("minting installation token: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("minting installation token: {e:?}"))?;
         Ok(token.expose_secret().to_owned())
     }
 
@@ -199,7 +243,7 @@ impl GitHubClient for OctocrabGitHub {
             .issues(&repo.owner, &repo.name)
             .get(id_u64(number)?)
             .await
-            .map_err(|e| anyhow::anyhow!("reading issue #{number}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("reading issue #{number}: {e:?}"))?;
         Ok(IssueView {
             number: issue.number as i64,
             title: issue.title,
@@ -220,7 +264,7 @@ impl GitHubClient for OctocrabGitHub {
             .pulls(&repo.owner, &repo.name)
             .get(number_u64)
             .await
-            .map_err(|e| anyhow::anyhow!("reading change request #{number}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("reading change request #{number}: {e:?}"))?;
         let head_sha = pr.head.sha.clone();
 
         // FIX 5: populate the changed-file list for real. The coordinator's
@@ -232,11 +276,11 @@ impl GitHubClient for OctocrabGitHub {
             .pulls(&repo.owner, &repo.name)
             .list_files(number_u64)
             .await
-            .map_err(|e| anyhow::anyhow!("listing files for change request #{number}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("listing files for change request #{number}: {e:?}"))?;
         let files: Vec<String> = client
             .all_pages(first)
             .await
-            .map_err(|e| anyhow::anyhow!("paginating files for change request #{number}: {e}"))?
+            .map_err(|e| anyhow::anyhow!("paginating files for change request #{number}: {e:?}"))?
             .into_iter()
             .map(|entry| entry.filename)
             .collect();
@@ -301,7 +345,7 @@ impl GitHubClient for OctocrabGitHub {
             .head(format!("{}:{}", repo.owner, req.head_branch))
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("listing change requests: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("listing change requests: {e:?}"))?;
         if let Some(it) = existing.items.into_iter().next() {
             tracing::info!(number = it.number, "reusing existing change request");
             return Ok(PrView {
@@ -315,7 +359,7 @@ impl GitHubClient for OctocrabGitHub {
             .body(&req.body)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("creating change request: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("creating change request: {e:?}"))?;
         tracing::info!(number = pr.number, "created change request");
         Ok(PrView {
             number: pr.number as i64,
@@ -342,7 +386,7 @@ impl GitHubClient for OctocrabGitHub {
             .issues(&repo.owner, &repo.name)
             .create_comment(id_u64(number)?, body)
             .await
-            .map_err(|e| anyhow::anyhow!("posting comment on #{number}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("posting comment on #{number}: {e:?}"))?;
         Ok(comment.id.0 as i64)
     }
 
@@ -358,7 +402,7 @@ impl GitHubClient for OctocrabGitHub {
             .issues(&repo.owner, &repo.name)
             .update_comment(octocrab::models::CommentId(id_u64(comment_id)?), body)
             .await
-            .map_err(|e| anyhow::anyhow!("updating comment {comment_id}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("updating comment {comment_id}: {e:?}"))?;
         Ok(())
     }
 
@@ -374,7 +418,7 @@ impl GitHubClient for OctocrabGitHub {
             .issues(&repo.owner, &repo.name)
             .add_assignees(id_u64(issue_number)?, &[assignee])
             .await
-            .map_err(|e| anyhow::anyhow!("assigning issue #{issue_number} to {assignee}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("assigning issue #{issue_number} to {assignee}: {e:?}"))?;
         Ok(())
     }
 
@@ -399,7 +443,7 @@ impl GitHubClient for OctocrabGitHub {
             .pulls(&repo.owner, &repo.name)
             .get(number_u64)
             .await
-            .map_err(|e| anyhow::anyhow!("reading change request #{number} for review: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("reading change request #{number} for review: {e:?}"))?;
         let head_sha = pr.head.sha.clone();
         use octocrab::models::pulls::ReviewAction;
         let event = match verdict {
@@ -438,7 +482,7 @@ impl GitHubClient for OctocrabGitHub {
                         anyhow::anyhow!("submitting review on #{number} (comment fallback): {e2}")
                     })?
             }
-            Err(e) => return Err(anyhow::anyhow!("submitting review on #{number}: {e}")),
+            Err(e) => return Err(anyhow::anyhow!("submitting review on #{number}: {e:?}")),
         };
         Ok(review.id.0 as i64)
     }
@@ -455,7 +499,7 @@ impl GitHubClient for OctocrabGitHub {
                     .pulls(&repo.owner, &repo.name)
                     .get(id_u64(n)?)
                     .await
-                    .map_err(|e| anyhow::anyhow!("reading change request #{n} head sha: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("reading change request #{n} head sha: {e:?}"))?;
                 pr.head.sha
             }
         };
@@ -471,16 +515,40 @@ impl GitHubClient for OctocrabGitHub {
         // fetching successive pages until we have collected `total_count` runs. Rolling
         // up over only the first page could read a red check on page 2 as green.
         let mut checks: Vec<(String, CheckConclusion)> = Vec::new();
+        // Set when EITHER gating read (check-runs or combined status) is rejected with a
+        // permission 403. Folded into the rollup as a single NOT-green contribution at the
+        // end so a missing read can't false-green a CR — and the coordinator escalates it
+        // to a human instead of the reaction hard-failing on every tick forever.
+        let mut permission_denied = false;
         let mut page: u32 = 1;
         loop {
-            let runs = client
+            let runs = match client
                 .checks(&repo.owner, &repo.name)
                 .list_check_runs_for_git_ref(octocrab::params::repos::Commitish(sha.clone()))
                 .per_page(100u8)
                 .page(page)
                 .send()
                 .await
-                .map_err(|e| anyhow::anyhow!("listing check runs for {sha} (page {page}): {e}"))?;
+            {
+                Ok(runs) => runs,
+                // Degrade a permission 403 (App missing `Checks: read`) like the combined
+                // status below — NOT-green + escalate, never an infinite tick loop.
+                Err(e) if is_permission_denied(&e) => {
+                    tracing::warn!(
+                        owner = %repo.owner, name = %repo.name, %sha, error = ?e,
+                        "check runs unreadable (403 — App missing 'Checks: read'); treating as \
+                         NOT-green so the CR is escalated for a human. Grant the permission to \
+                         restore automatic green-gating."
+                    );
+                    permission_denied = true;
+                    break;
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "listing check runs for {sha} (page {page}): {e:?}"
+                    ))
+                }
+            };
             let total = runs.total_count;
             // Map each check run's conclusion to a `CheckConclusion`. A run with no
             // conclusion yet (queued/in_progress) is `Pending`; an unknown conclusion
@@ -508,19 +576,42 @@ impl GitHubClient for OctocrabGitHub {
         // the SERVER-computed top-level `state` (a single authoritative rollup over EVERY
         // status context) rather than paging the `statuses` array — so a failing status on
         // a later page can never be missed (the false-green a first-page-only read had).
-        let route = format!("/repos/{}/{}/commits/{}/status", repo.owner, repo.name, sha);
-        let status: CombinedStatus = client
-            .get(&route, None::<&()>)
-            .await
-            .map_err(|e| anyhow::anyhow!("reading combined commit status for {sha}: {e}"))?;
-        // Only fold the combined status when there is ≥1 status context. GitHub reports
-        // `state = "pending"` for a SHA with ZERO statuses, so without this guard a
-        // no-status repo would roll up Pending forever — the empty case must stay green.
-        if status.total_count > 0 {
-            checks.push((
-                "combined-status".to_owned(),
-                map_status_state(&status.state),
-            ));
+        // Skip the combined-status read entirely if the check-runs read was already
+        // permission-denied (it would almost certainly 403 too): the fold below degrades.
+        if !permission_denied {
+            let route = format!("/repos/{}/{}/commits/{}/status", repo.owner, repo.name, sha);
+            let status_result: Result<CombinedStatus, octocrab::Error> =
+                client.get(&route, None::<&()>).await;
+            match status_result {
+                Ok(status) => {
+                    if let Some(conclusion) = combined_status_contribution(&status) {
+                        checks.push(("combined-status".to_owned(), conclusion));
+                    }
+                }
+                // Degrade a PERMISSION 403 (App missing `Commit statuses: read`) — same as
+                // the check-runs read above. A non-permission error (transient/5xx) still
+                // propagates so the next tick retries.
+                Err(e) if is_permission_denied(&e) => {
+                    tracing::warn!(
+                        owner = %repo.owner, name = %repo.name, %sha, error = ?e,
+                        "combined commit status unreadable (403 — App missing 'Commit statuses: read'); \
+                         treating as NOT-green so the CR is escalated for a human. Grant the \
+                         permission to restore automatic green-gating."
+                    );
+                    permission_denied = true;
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "reading combined commit status for {sha}: {e:?}"
+                    ))
+                }
+            }
+        }
+        // A permission denial on EITHER gating read → fold ONE NOT-green contribution so
+        // the rollup can't false-green and the coordinator escalates the CR to a human
+        // (vs. the read hard-failing the whole reaction on every tick forever).
+        if permission_denied {
+            checks.push(("gating-unreadable".to_owned(), CheckConclusion::Failure));
         }
 
         // FIX 2 + FIX 6 + FIX B: roll up through the SHARED rollup over the UNION of
@@ -554,11 +645,11 @@ impl GitHubClient for OctocrabGitHub {
                 Some(item) => Ok(item.decoded_content()),
                 None => Ok(None),
             },
-            Err(octocrab::Error::GitHub { source, .. }) if source.status_code.as_u16() == 404 => {
+            Err(e) if matches!(github_status_and_message(&e), Some((404, _))) => {
                 tracing::info!(path, git_ref, "file not found");
                 Ok(None)
             }
-            Err(e) => Err(anyhow::anyhow!("fetching file {path}@{git_ref}: {e}")),
+            Err(e) => Err(anyhow::anyhow!("fetching file {path}@{git_ref}: {e:?}")),
         }
     }
 }
@@ -566,6 +657,49 @@ impl GitHubClient for OctocrabGitHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- combined_status_contribution: legacy-commit-status fold ----
+
+    #[test]
+    fn combined_status_folds_state_only_when_contexts_exist() {
+        let success = CombinedStatus {
+            state: "success".to_owned(),
+            total_count: 2,
+        };
+        assert_eq!(
+            combined_status_contribution(&success),
+            Some(CheckConclusion::Success)
+        );
+        let failing = CombinedStatus {
+            state: "failure".to_owned(),
+            total_count: 1,
+        };
+        assert_eq!(
+            combined_status_contribution(&failing),
+            Some(CheckConclusion::Failure)
+        );
+        // ZERO contexts → contribute nothing so the empty case stays green (FIX 2):
+        // GitHub reports `pending` for a SHA with no statuses.
+        let empty = CombinedStatus {
+            state: "pending".to_owned(),
+            total_count: 0,
+        };
+        assert_eq!(combined_status_contribution(&empty), None);
+    }
+
+    // The permission-denied degradation (folded inline in `check_status`) contributes a
+    // `Failure`, which must roll up NOT-green so the coordinator escalates the CR to a
+    // human rather than false-greening it or looping forever on the unreadable gate.
+    #[test]
+    fn permission_denied_contribution_rolls_up_not_green() {
+        let overall = CheckSummary::rollup(vec![(
+            "gating-unreadable".to_owned(),
+            CheckConclusion::Failure,
+        )])
+        .overall;
+        assert_eq!(overall, CheckConclusion::Failure);
+        assert_ne!(overall, CheckConclusion::Success);
+    }
 
     // ---- map_conclusion: GitHub Checks API `conclusion` → CheckConclusion ----
     //

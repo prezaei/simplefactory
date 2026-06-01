@@ -20,6 +20,58 @@ use uuid::Uuid;
 /// Connection pool handle used across Factory services.
 pub type Pool = sqlx::postgres::PgPool;
 
+/// Default absolute per-attempt wall-clock cap (seconds): a run going longer than this is
+/// reclaimed even while heart-beating (a stuck-but-alive worker). 30 min — the platform
+/// default in the technical spec (overridable via `FACTORY_WALL_CLOCK_CAP_SECS`). SHARED
+/// so the coordinator (the sweeper that enforces the cap) and the dispatcher (which sizes
+/// the task-token TTL to outlive it) can never drift to different values.
+pub const DEFAULT_WALL_CLOCK_CAP_SECS: f64 = 30.0 * 60.0;
+
+/// Parse a positive-seconds env value, falling back to `default` when unset, unparseable,
+/// non-positive, or non-finite (`inf`/`NaN` would otherwise yield an unbounded TTL/cap).
+/// Pure (takes the raw value) so TTL/cap policy is unit-testable without mutating
+/// process-global env state (tests run in parallel — AGENTS.md "no global mutable state").
+/// SHARED across services so the trim/validate rules can't diverge per crate.
+pub fn parse_positive_secs(raw: Option<&str>, default: f64) -> f64 {
+    parse_positive_secs_reported(raw, default).0
+}
+
+/// Like [`parse_positive_secs`] but also reports whether a PRESENT value was REJECTED as
+/// invalid (so it fell back to `default`). Returns `(value, fell_back_from_invalid)`. A
+/// caller uses the flag to `warn!` that a malformed config value was ignored — per the
+/// telemetry invariant, a config fallback is a decision an operator must be able to
+/// diagnose from logs. An unset/empty value is NOT "invalid" (silent default, flag false).
+pub fn parse_positive_secs_reported(raw: Option<&str>, default: f64) -> (f64, bool) {
+    match raw.map(str::trim) {
+        None | Some("") => (default, false),
+        Some(v) => match v.parse::<f64>() {
+            Ok(n) if n > 0.0 && n.is_finite() => (n, false),
+            _ => (default, true),
+        },
+    }
+}
+
+/// Resolve a positive-seconds value from env var `var`, via [`parse_positive_secs_reported`].
+/// When a PRESENT value is malformed (and the `default` is used), `warn!` with the var name
+/// AND the rejected raw value — per the telemetry invariant, an operator must be able to
+/// diagnose the ignored misconfig from logs alone. An unset/empty var falls back silently.
+/// The single place env-backed TTL/cap config is resolved across services (dispatcher
+/// lease + token, coordinator wall-clock cap, tools heartbeat), so the read/validate/log
+/// behavior can't diverge per crate.
+pub fn resolve_positive_secs_env(var: &str, default: f64) -> f64 {
+    let raw = std::env::var(var).ok();
+    let (value, invalid) = parse_positive_secs_reported(raw.as_deref(), default);
+    if invalid {
+        tracing::warn!(
+            env = var,
+            rejected = raw.as_deref().unwrap_or(""),
+            default,
+            "ignored invalid env value; using default"
+        );
+    }
+    value
+}
+
 /// Result type for record-book operations.
 pub type Result<T> = std::result::Result<T, RecordError>;
 
@@ -1760,6 +1812,52 @@ mod tests {
             assert_eq!(k.as_str().parse::<Kind>().unwrap(), k);
         }
         assert!("nope".parse::<Kind>().is_err());
+    }
+
+    #[test]
+    fn parse_positive_secs_validates_and_falls_back() {
+        assert_eq!(parse_positive_secs(None, 900.0), 900.0);
+        assert_eq!(parse_positive_secs(Some("   "), 900.0), 900.0);
+        assert_eq!(parse_positive_secs(Some("nope"), 900.0), 900.0);
+        assert_eq!(parse_positive_secs(Some("0"), 900.0), 900.0);
+        assert_eq!(parse_positive_secs(Some("-5"), 900.0), 900.0);
+        // Non-finite must NOT pass the `> 0.0` filter (inf would yield an unbounded TTL).
+        assert_eq!(parse_positive_secs(Some("inf"), 900.0), 900.0);
+        assert_eq!(parse_positive_secs(Some("NaN"), 900.0), 900.0);
+        // Surrounding whitespace is trimmed (shared rule so crates can't diverge).
+        assert_eq!(parse_positive_secs(Some(" 120 "), 900.0), 120.0);
+    }
+
+    #[test]
+    fn parse_positive_secs_reported_flags_only_present_invalid_values() {
+        // Unset/empty → silent default (NOT flagged as invalid).
+        assert_eq!(parse_positive_secs_reported(None, 900.0), (900.0, false));
+        assert_eq!(
+            parse_positive_secs_reported(Some("  "), 900.0),
+            (900.0, false)
+        );
+        // Present but malformed/non-positive/non-finite → default + flagged (operator warn).
+        assert_eq!(
+            parse_positive_secs_reported(Some("nope"), 900.0),
+            (900.0, true)
+        );
+        assert_eq!(
+            parse_positive_secs_reported(Some("0"), 900.0),
+            (900.0, true)
+        );
+        assert_eq!(
+            parse_positive_secs_reported(Some("-5"), 900.0),
+            (900.0, true)
+        );
+        assert_eq!(
+            parse_positive_secs_reported(Some("inf"), 900.0),
+            (900.0, true)
+        );
+        // Valid → value + not flagged.
+        assert_eq!(
+            parse_positive_secs_reported(Some(" 120 "), 900.0),
+            (120.0, false)
+        );
     }
 
     #[test]

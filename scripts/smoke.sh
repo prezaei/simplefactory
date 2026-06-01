@@ -55,7 +55,25 @@ wait_for() {
 }
 
 work_items_json() { curl -fsS "$DASHBOARD_URL/api/repos/$OWNER/$NAME/work-items" 2>/dev/null || echo '[]'; }
-pr_for_issue()    { gh pr list -R "$REPO" --state all --search "$1" --json url -q '.[0].url' 2>/dev/null || true; }
+# Prints "seen" iff a work item exists for issue #$1. A function so the jq filter runs in
+# normal shell context — NOT embedded in a double-quoted string handed to wait_for's
+# `eval`, where the jq program's own `"issue#"` literal would close the shell quote and
+# expose `$n` to `set -u` ("unbound variable"). The subject is built here and passed as a
+# jq --arg, so the filter contains no `"`.
+has_issue_work_item() {
+  work_items_json | jq -e --arg s "issue#$1" '[.[]|select(.subject_ref==$s)]|length>0' \
+    >/dev/null && echo seen
+}
+# The CR a fresh issue produces. Match the coder's deterministic head branch
+# (`factory/issue-N`) FIRST — a free-text `--search "$1"` only matches if the CR body
+# happens to mention the number, so it silently misses CRs (and produced a false crash
+# FAIL). Fall back to the text search for any non-standard branch naming.
+pr_for_issue() {
+  local url
+  url="$(gh pr list -R "$REPO" --state all --head "factory/issue-$1" --json url -q '.[0].url' 2>/dev/null)"
+  [ -z "$url" ] && url="$(gh pr list -R "$REPO" --state all --search "$1" --json url -q '.[0].url' 2>/dev/null)"
+  printf '%s' "$url"
+}
 pr_head()         { gh pr view "$1" -R "$REPO" --json headRefOid -q .headRefOid 2>/dev/null || true; }
 
 open_labelled_issue() {
@@ -85,8 +103,7 @@ scenario_happy() {
   issue="$(open_labelled_issue "[smoke] add a hello function" \
     "Factory smoke. Add a small documented \`hello()\` function and a test for it.")"
   ok "opened + labelled issue #$issue"
-  if ! wait_for "a work item for the issue" \
-      "work_items_json | jq -e --arg n '$issue' '[.[]|select(.subject_ref==("issue#"+$n))]|length>0' >/dev/null && echo seen" >/dev/null; then
+  if ! wait_for "a work item for the issue" "has_issue_work_item $issue" >/dev/null; then
     set_result happy FAIL; die "no work item enqueued for #$issue (webhook delivered? config loaded?)"
   fi
   ok "manager picked up the issue"
@@ -168,8 +185,7 @@ scenario_config() {
   # The reload is observable: a freshly labelled issue still enqueues a work item.
   local issue
   issue="$(open_labelled_issue "[smoke] config reload probe" "Probe that config reloaded; no action needed.")"
-  if wait_for "a work item after the config reload" \
-      "work_items_json | jq -e --arg n '$issue' '[.[]|select(.subject_ref==("issue#"+$n))]|length>0' >/dev/null && echo seen" >/dev/null; then
+  if wait_for "a work item after the config reload" "has_issue_work_item $issue" >/dev/null; then
     ok "config reloaded and still drives intake"
     set_result config PASS
   else

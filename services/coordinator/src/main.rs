@@ -18,11 +18,6 @@ const COORDINATE_TICK: Duration = Duration::from_secs(5);
 /// How often the lease sweeper scans for expired leases to reclaim (P5).
 const SWEEPER_TICK: Duration = Duration::from_secs(30);
 
-/// Default absolute per-attempt wall-clock cap (seconds): a run going longer than this
-/// is reclaimed even while heart-beating (a stuck-but-alive worker). 30 min — the
-/// platform default in the technical spec (overridable via `FACTORY_WALL_CLOCK_CAP_SECS`).
-const DEFAULT_WALL_CLOCK_CAP_SECS: f64 = 30.0 * 60.0;
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     factory_telemetry::init("coordinator");
@@ -46,19 +41,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // The wall-clock cap is configurable so an operator can tighten/loosen the bound
-    // without a rebuild; a malformed value falls back to the default rather than
-    // disabling the bound.
-    let wall_clock_cap_secs = match std::env::var("FACTORY_WALL_CLOCK_CAP_SECS") {
-        Ok(v) => v
-            .parse::<f64>()
-            .ok()
-            .filter(|n| *n > 0.0)
-            .unwrap_or_else(|| {
-                tracing::warn!(value = %v, default = DEFAULT_WALL_CLOCK_CAP_SECS, "invalid FACTORY_WALL_CLOCK_CAP_SECS; using default");
-                DEFAULT_WALL_CLOCK_CAP_SECS
-            }),
-        Err(_) => DEFAULT_WALL_CLOCK_CAP_SECS,
-    };
+    // without a rebuild. Uses the SHARED resolver from `factory_record` so the cap the
+    // sweeper enforces here can never drift from the cap the dispatcher sizes the
+    // task-token TTL against, and a malformed value is logged (var + rejected value)
+    // rather than silently ignored. The effective value is also logged below.
+    let wall_clock_cap_secs = factory_record::resolve_positive_secs_env(
+        "FACTORY_WALL_CLOCK_CAP_SECS",
+        factory_record::DEFAULT_WALL_CLOCK_CAP_SECS,
+    );
 
     tracing::info!(
         tick_secs = COORDINATE_TICK.as_secs(),
