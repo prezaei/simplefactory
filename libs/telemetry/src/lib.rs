@@ -2,7 +2,7 @@
 //!
 //! P0 provides structured `tracing` with an env-driven filter (JSON in prod,
 //! pretty locally). The OpenTelemetry → Azure Monitor exporter described in the
-//! technical spec is wired in P7; the [`init`] seam stays stable so services
+//! technical spec is wired in P8; the [`init`] seam stays stable so services
 //! don't change when it lands.
 #![forbid(unsafe_code)]
 
