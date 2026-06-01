@@ -28,7 +28,8 @@
 | **P4.5 Per-role worker lifecycle** | Manager-triage + Reviewer-verdict workers (not Coder-shaped) | a manager/reviewer work item runs its role via Claude and produces **no** change request; only the coder opens a CR |
 | **P5 Resilience** | Crash-resume, sweeper, bounds, config pinning | Kill a worker mid-run → it resumes the same session; all bounds tested |
 | **P6 Dashboard** | Live read-only view | SSE stream reflects state within seconds |
-| **P7 Azure productionization** | Deploy to dev + prod | Bicep-provisioned dev env runs the full loop on Azure |
+| **P7 Local live smoke** | One real end-to-end run locally (real GitHub App + `claude` + Docker + Azurite) | A labelled issue in a throwaway repo drives the full loop locally → real CR + merge-handoff |
+| **P8 Azure productionization** | Deploy to dev + prod | Bicep-provisioned dev env runs the full loop on Azure |
 
 ---
 
@@ -96,7 +97,7 @@
 - `services/tools` (the worker's only channel): Axum server, **per-task bearer-token auth** (sha-256-hashed tokens, scoped to one work item/repo/role, TTL), the full tool surface (`get_task`, `read_issue`, `read_change_request`, `open_or_update_change_request`, `post_comment`, `submit_review`, `get_check_status`, `append_transcript`, `record_outcome`, `heartbeat`, `escalate`), **every call → `events` audit** (single choke point), and idempotency for CR / comment / review / escalate (`dedupe_key`); tokens revoked on task completion. *(Done; 16 REST + 10 MCP integration tests.)* A real **MCP JSON-RPC 2.0 server at `POST /mcp`** (`initialize` / `tools/list` / `tools/call`) sits over the same audited tool dispatch — what a live Claude Code connects to. *(Done; tested.)*
 - `services/dispatcher`: `dispatch_once` walks configured repos, leases under per-worker + global caps, mints a per-task token, starts an attempt, and launches a worker via a `WorkerLauncher` seam (`FakeLauncher` tested; `DockerLauncher` = deploy seam, secrets via env). *(Done; 3 integration tests incl. cap binding + token scoping.)*
 - `services/worker` harness: `run_task` orchestrates get_task → shallow clone → Claude Code → push branch → `open_or_update_change_request` (idempotent) → `record_outcome`, all over `ToolsClient` / `Workspace` / `ClaudeRunner` seams (fakes tested; `HttpTools`/`GitCli`/`ClaudeCli` = deploy seams). *(Done; pure tests: full sequence, idempotent re-run, failure path.)*
-- `libs/blob`: `TranscriptStore` trait + `InMemoryTranscripts` (tested) + `FsTranscripts` (local parity). *(Done.)* Azure Blob / Azurite is the P7 swap.
+- `libs/blob`: `TranscriptStore` trait + `InMemoryTranscripts` (tested) + `FsTranscripts` (local parity). *(Done.)* The real **Azure Blob** backend is the P8 swap; Azurite emulates it locally (and is exercised live in P7).
 
 **Tests:** worker harness drives the fakes through a clone→edit→CR sequence; idempotent CR (re-run updates same CR); Tools token scoping (an invalid token is rejected; a token acts only on its own task); dispatcher caps bind; config-on-push apply/ignore/reject. *(All implemented and green against Postgres.)*
 The real subprocess seams are implemented too: `GitCli` (shallow clone + `--force-with-lease` push, token-in-URL), `ClaudeCli` (runs `claude` headless with the Factory MCP server at `{tools_url}/mcp` + bearer), `DockerLauncher` (`docker run` with secrets via env) — each with pure-helper unit tests (URL/arg/MCP-config construction); only their actual subprocess execution needs git/claude/docker present.
@@ -162,7 +163,20 @@ The real subprocess seams are implemented too: `GitCli` (shallow clone + `--forc
 **Tests:** API projection correctness; SSE pushes a state change within the freshness budget; read-only (no mutating endpoints).
 **Exit:** open the dashboard, label an issue, watch the run progress live. **Depends on:** P4 (P5 optional but preferred).
 
-## P7 — Azure productionization
+## P7 — Local live smoke (one real end-to-end run)
+
+**Goal:** prove the real **deploy seams actually work** — end-to-end, locally, against a throwaway test repo — *before* adding Azure infrastructure. Every external integration the earlier phases built behind a trait and faked in CI (`OctocrabGitHub`, `ClaudeRunner`=`ClaudeCli`, `Workspace`=`GitCli`, `WorkerLauncher`=`DockerLauncher`, Blob via Azurite) gets its first real exercise here. This deliberately **separates seam-correctness from infra-correctness**: if P8's first cloud run fails, the seams are already known-good, so the failure is Azure plumbing — not git auth, `claude --resume`, docker launch, or the octocrab calls.
+
+**Tasks**
+- **Runbook** (`docs/runbooks/local-live-smoke.md`): register a GitHub App on a throwaway repo (App id + private key PEM + webhook secret), install it on the repo; install + authenticate the `claude` CLI (`ANTHROPIC_API_KEY` / `claude login`); `docker-compose up` (Postgres + Azurite); start `intake`/`dispatcher`/`coordinator`/`tools` with the real-credential env (`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `FACTORY_*`).
+- **Inbound webhooks** to `localhost`: `gh webhook forward` (simplest, no public URL) or smee/ngrok pointing the App webhook at `localhost:8080/webhooks/github` (the intake service).
+- **Live wiring** (a compose `live` profile / env): the worker uses the REAL `ClaudeCli` + `GitCli` + `DockerLauncher`, and Blob points at **Azurite** (so transcripts/checkpoints round-trip through a real object store, not `FsTranscripts`/`FsCheckpoints`).
+- **`scripts/smoke.sh`**: drive ONE labelled issue → **manager triage → coder CR → reviewer verdict → merge-handoff**, then capture the run's transcript + the resulting real CR as the artifact.
+
+**Tests:** this is a **scripted manual smoke**, not a CI test (it needs real credentials + the `claude` binary + Docker, exactly the things CI can't have). The artifact is the captured transcript + CR URL proving the loop ran for real once.
+**Exit:** a labelled issue in a throwaway test repo runs the full loop **locally, end-to-end** — real GitHub App, real `claude`, real Docker worker, Azurite Blob — producing a real change request and a merge-handoff. **Depends on:** P4 (the full loop); ideally P4.5/P5/P6 for a production-honest run. It is the first real validation of the deploy seams P3+ built behind traits, so it is the natural predecessor to P8.
+
+## P8 — Azure productionization
 
 **Goal:** the same system, on Azure, in dev then prod.
 
@@ -174,7 +188,7 @@ The real subprocess seams are implemented too: `GitCli` (shallow clone + `--forc
 - CD: GitHub Actions → ACR → Container Apps; the single-runner migration step before rollout.
 
 **Tests:** smoke-test the full loop in dev Azure; deploy/rollback (redeploy prior revision) drill; expand/contract migration applied with old+new replicas coexisting.
-**Exit:** a labelled issue in a real connected repo runs end-to-end on Azure dev. **Depends on:** P4 (the full loop the smoke test exercises); ideally P5–P6 for a production-honest deploy. (A thin P3-only slice can be deployed earlier to validate the Azure plumbing, but that is not the full-loop exit above.)
+**Exit:** a labelled issue in a real connected repo runs end-to-end on Azure dev. **Depends on:** P7 (the seams are proven locally first, so a failure here is infra, not integration); P4 for the full loop; ideally P5–P6 for a production-honest deploy. (A thin P3-only slice can be deployed earlier to validate the Azure plumbing, but that is not the full-loop exit above.)
 
 ---
 
@@ -189,8 +203,8 @@ The real subprocess seams are implemented too: `GitCli` (shallow clone + `--forc
 
 - **Why vertical-slice at P3:** the highest integration risks (GitHub App auth, headless Claude Code, the MCP boundary, job launch) are proven before we invest in coordinator/resilience/dashboard.
 - **Why record book before everything (P1):** it's the contract every service shares; getting leasing/caps/idempotency right early avoids reworking all callers.
-- **Top risks:** (1) driving Claude Code headless + session resume semantics — de-risk with a spike in P3; (2) Container Apps Jobs cold-start vs the "minutes" pickup target — measure in P7; (3) the no-HA Postgres SPOF — accepted, revisit if dev stability demands HA.
-- **Parallelizable:** `dashboard/` (P6) can start after P1's schema stabilizes; `infra/` Bicep (P7) can be drafted alongside P3+.
+- **Top risks:** (1) driving Claude Code headless + session resume semantics — de-risk with a spike in P3; (2) Container Apps Jobs cold-start vs the "minutes" pickup target — measure in P8; (3) the no-HA Postgres SPOF — accepted, revisit if dev stability demands HA.
+- **Parallelizable:** `dashboard/` (P6) can start after P1's schema stabilizes; `infra/` Bicep (P8) can be drafted alongside P3+.
 
 ## Definition of done (per phase)
 
