@@ -104,6 +104,10 @@
   function connect(owner, name) {
     if (es) { es.close(); es = null; }
     setConn(false);
+    // Clear the previous repo's rendered snapshot so stale data isn't shown as the new
+    // selection's live view until the first frame (or never, on a 404).
+    renderSummary(null);
+    renderItems(null, false);
     const url = `/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/stream`;
     es = new EventSource(url);
     es.onopen = () => setConn(true);
