@@ -427,7 +427,10 @@ async fn build_snapshot(
 ) -> Result<Snapshot, ReadError> {
     let summary = query_summary(pool, repo_id, owner, name).await?;
     let work_items = query_work_items(pool, repo_id, WORK_ITEMS_LIMIT).await?;
-    let work_items_truncated = work_items.len() as i64 >= WORK_ITEMS_LIMIT;
+    // Truncated iff the repo actually has MORE work items than the page shows — use the
+    // (unbounded) summary total, so a repo with exactly WORK_ITEMS_LIMIT items isn't
+    // falsely flagged as truncated.
+    let work_items_truncated = summary.total > work_items.len() as i64;
     Ok(Snapshot {
         summary,
         work_items,

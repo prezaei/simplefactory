@@ -50,17 +50,25 @@
     el.className = 'status ' + (live ? 'live' : 'down');
   }
 
+  // HTML-escape any dynamic value before it goes into innerHTML. Worker names,
+  // subjects, and repo owner/name come from repo-controlled data; without escaping a
+  // crafted value containing markup would execute in the dashboard (stored XSS).
+  function escapeHtml(v) {
+    return String(v == null ? '' : v).replace(/[&<>"']/g, c =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
   function renderSummary(s) {
     const root = document.getElementById('summary');
     if (!s) { root.innerHTML = ''; return; }
     const pills = (s.by_state || [])
-      .map(b => `<span class="pill">${b.state}: <b>${b.count}</b></span>`)
+      .map(b => `<span class="pill">${escapeHtml(b.state)}: <b>${escapeHtml(b.count)}</b></span>`)
       .join('');
     const esc = s.open_escalations > 0
-      ? `<span class="pill esc">open escalations: <b>${s.open_escalations}</b></span>`
+      ? `<span class="pill esc">open escalations: <b>${escapeHtml(s.open_escalations)}</b></span>`
       : `<span class="pill">open escalations: <b>0</b></span>`;
     root.innerHTML =
-      `<p class="sub">${s.owner}/${s.name} — total ${s.total}</p>` +
+      `<p class="sub">${escapeHtml(s.owner)}/${escapeHtml(s.name)} — total ${escapeHtml(s.total)}</p>` +
       `<div class="pills">${pills || '<span class="empty">no work items</span>'}${esc}</div>`;
   }
 
@@ -75,13 +83,13 @@
       : '';
     const rows = items.map(w => `
       <tr>
-        <td>${w.kind}</td>
-        <td>${w.worker_name}</td>
-        <td>${w.state}</td>
-        <td class="mono">${w.subject_ref}</td>
-        <td>${w.attempt_count}</td>
-        <td>${w.loop_count}</td>
-        <td class="mono">${new Date(w.updated_at).toLocaleString()}</td>
+        <td>${escapeHtml(w.kind)}</td>
+        <td>${escapeHtml(w.worker_name)}</td>
+        <td>${escapeHtml(w.state)}</td>
+        <td class="mono">${escapeHtml(w.subject_ref)}</td>
+        <td>${escapeHtml(w.attempt_count)}</td>
+        <td>${escapeHtml(w.loop_count)}</td>
+        <td class="mono">${escapeHtml(new Date(w.updated_at).toLocaleString())}</td>
       </tr>`).join('');
     root.innerHTML = `
       <table>

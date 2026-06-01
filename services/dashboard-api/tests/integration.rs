@@ -319,6 +319,13 @@ async fn sse_stream_reflects_state_change_within_budget() {
             .map(|w| w["state"].as_str().unwrap_or("").to_owned())
     };
     assert_eq!(state_of(&snap).as_deref(), Some("queued"));
+    // A small repo (one item, well under the page cap) is NOT flagged truncated —
+    // guards the off-by-one where exactly-at-limit (or under) wrongly reported true.
+    assert_eq!(
+        snap["work_items_truncated"],
+        Value::Bool(false),
+        "a non-truncated repo must not be flagged truncated"
+    );
 
     // Seed a state change AFTER connecting.
     record::set_state(&pool, item, State::Succeeded)
