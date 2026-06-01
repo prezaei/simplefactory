@@ -478,6 +478,50 @@ async fn config_on_push_applies_when_config_file_changed() {
 }
 
 #[tokio::test]
+async fn config_on_push_fetches_with_the_stored_installation_id() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    // The repo is connected with a real installation id...
+    let owner = "acme";
+    let name = unique("intake-pushinst");
+    record::upsert_repo(&pool, owner, &name, 4242)
+        .await
+        .unwrap();
+    let head_sha = format!("head-{}", Uuid::now_v7());
+    let yaml = "version: 1\nsettings:\n  label: factory\nworkers:\n  - name: manager\n    role: manager\n    on: [issue_labeled]\n";
+    let gh = FakeGitHub::new().with_file(&head_sha, ".factory/config.yml", yaml);
+    // ...but the inbound (repository) webhook's RepoRef carries installation_id 0
+    // (a repo webhook payload has no `installation` object).
+    let repo_ref = RepoRef {
+        owner: owner.into(),
+        name: name.clone(),
+        installation_id: 0,
+    };
+
+    apply_config_from_push(
+        &pool,
+        &gh,
+        &repo_ref,
+        &head_sha,
+        &[".factory/config.yml".into()],
+    )
+    .await
+    .unwrap();
+
+    // get_file must have been called with the STORED installation id (4242), not the
+    // webhook's 0 — otherwise minting an installation token would fail in production.
+    assert!(
+        gh.calls()
+            .iter()
+            .any(|c| c == "get_file .factory/config.yml inst=4242"),
+        "expected get_file with stored inst=4242, got: {:?}",
+        gh.calls()
+    );
+}
+
+#[tokio::test]
 async fn config_on_push_ignores_unrelated_push() {
     let Some(pool) = pool_or_skip().await else {
         return;

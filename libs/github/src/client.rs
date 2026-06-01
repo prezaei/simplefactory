@@ -483,17 +483,16 @@ impl GitHubClient for FakeGitHub {
 
     async fn get_file(
         &self,
-        _repo: &RepoRef,
+        repo: &RepoRef,
         path: &str,
         git_ref: &str,
     ) -> anyhow::Result<Option<String>> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .files
-            .get(&(git_ref.to_owned(), path.to_owned()))
-            .cloned())
+        let mut s = self.state.lock().unwrap();
+        // Record the installation_id so tests can assert callers pass the AUTHORITATIVE
+        // (stored) installation, not e.g. a 0 from a repo-webhook RepoRef.
+        s.pub_calls
+            .push(format!("get_file {path} inst={}", repo.installation_id));
+        Ok(s.files.get(&(git_ref.to_owned(), path.to_owned())).cloned())
     }
 }
 
