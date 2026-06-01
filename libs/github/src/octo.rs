@@ -49,7 +49,7 @@ impl OctocrabGitHub {
             .map_err(|_| anyhow::anyhow!("GITHUB_APP_PRIVATE_KEY (PEM) is required"))?;
         Ok(Self {
             app_id,
-            private_key_pem,
+            private_key_pem: normalize_pem(&private_key_pem),
         })
     }
 
@@ -77,6 +77,15 @@ impl OctocrabGitHub {
             .map_err(|e| anyhow::anyhow!("minting installation client: {e}"))?;
         Ok(client)
     }
+}
+
+/// Normalize a PEM read from the environment. A multi-line PEM can't live on one
+/// `env_file`/`KEY=VALUE` line, so the documented format (and how secret stores like
+/// Key Vault often surface it) is a single line with literal `\n` escapes. Turn those
+/// back into real newlines so `jsonwebtoken::from_rsa_pem` can parse it; a PEM that
+/// already has real newlines is unchanged (it contains no literal backslash-n).
+fn normalize_pem(raw: &str) -> String {
+    raw.replace("\\n", "\n")
 }
 
 /// Guard the `installation_id` before casting it to the `u64` octocrab expects. A
@@ -611,5 +620,25 @@ mod tests {
         assert_eq!(id_u64(0).unwrap(), 0u64);
         assert_eq!(id_u64(42).unwrap(), 42u64);
         assert_eq!(id_u64(i64::MAX).unwrap(), i64::MAX as u64);
+    }
+
+    // ---- normalize_pem: \n-escaped env value → real PEM ----
+
+    #[test]
+    fn normalize_pem_unescapes_backslash_n() {
+        let escaped =
+            "-----BEGIN RSA PRIVATE KEY-----\\nMIIabc\\nMIIdef\\n-----END RSA PRIVATE KEY-----\\n";
+        let out = normalize_pem(escaped);
+        assert_eq!(
+            out,
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\nMIIdef\n-----END RSA PRIVATE KEY-----\n"
+        );
+        assert!(!out.contains("\\n"), "no literal backslash-n remains");
+    }
+
+    #[test]
+    fn normalize_pem_leaves_real_newline_pem_unchanged() {
+        let real = "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----\n";
+        assert_eq!(normalize_pem(real), real);
     }
 }
