@@ -462,13 +462,20 @@ fn claude_args(
     } else {
         ("--session-id", session_id)
     };
+    // `--mcp-config <configs...>` is VARIADIC (claude: "Load MCP servers from JSON
+    // files or strings, space-separated"). If it sits immediately before the positional
+    // prompt it greedily swallows the prompt as a second "config"; the prompt isn't
+    // valid JSON, so claude tries to open() it as a file and dies with ENAMETOOLONG.
+    // So terminate the variadic with a flag (`--strict-mcp-config`, which also pins us
+    // to ONLY our MCP server) and keep the prompt strictly last.
     vec![
         "--print".to_string(),
         "--dangerously-skip-permissions".to_string(),
-        session_flag.to_string(),
-        session_value.to_string(),
         "--mcp-config".to_string(),
         mcp_config_path.display().to_string(),
+        "--strict-mcp-config".to_string(),
+        session_flag.to_string(),
+        session_value.to_string(),
         prompt.to_string(),
     ]
 }
@@ -827,14 +834,38 @@ mod tests {
         let args = claude_args(path, "Fix the bug", "ses-123", false);
         assert_eq!(args[0], "--print");
         assert_eq!(args[1], "--dangerously-skip-permissions");
-        // A fresh run pins the session id with --session-id.
-        assert_eq!(args[2], "--session-id");
-        assert_eq!(args[3], "ses-123");
-        assert_eq!(args[4], "--mcp-config");
+        assert_eq!(args[2], "--mcp-config");
         // The config is referenced BY PATH, not as inline JSON.
-        assert_eq!(args[5], "/work/.factory-mcp.json");
+        assert_eq!(args[3], "/work/.factory-mcp.json");
+        // A fresh run pins the session id with --session-id.
+        assert!(args.iter().any(|a| a == "--session-id" || a == "ses-123"));
+        assert_eq!(args.iter().position(|a| a == "--session-id"), Some(5));
+        assert_eq!(args[6], "ses-123");
         // The prompt is the final positional argument.
         assert_eq!(args.last().unwrap(), "Fix the bug");
+    }
+
+    #[test]
+    fn claude_args_terminate_variadic_mcp_config_before_the_prompt() {
+        // Regression: `--mcp-config` is variadic; if the prompt immediately follows the
+        // config PATH, claude swallows the prompt as a second config and dies with
+        // ENAMETOOLONG. The arg right after the config path must be a flag, NOT the
+        // prompt, and the prompt must stay last.
+        let path = Path::new("/work/.factory-mcp.json");
+        let args = claude_args(path, "Fix the bug", "ses-123", false);
+        let cfg = args.iter().position(|a| a == "--mcp-config").unwrap();
+        assert_eq!(
+            args[cfg + 1],
+            "/work/.factory-mcp.json",
+            "path follows --mcp-config"
+        );
+        assert!(
+            args[cfg + 2].starts_with("--"),
+            "a flag (not the prompt) must terminate the variadic --mcp-config, got: {}",
+            args[cfg + 2]
+        );
+        assert_eq!(args.last().unwrap(), "Fix the bug", "prompt stays last");
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"));
     }
 
     #[test]
@@ -842,9 +873,10 @@ mod tests {
         let path = Path::new("/work/.factory-mcp.json");
         let args = claude_args(path, "Continue", "ses-abc", true);
         // A crash-resume continues the same session with --resume <id>.
-        assert_eq!(args[2], "--resume");
-        assert_eq!(args[3], "ses-abc");
+        let r = args.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(args[r + 1], "ses-abc");
         assert!(!args.iter().any(|a| a == "--session-id"));
+        assert_eq!(args.last().unwrap(), "Continue");
     }
 
     #[test]
