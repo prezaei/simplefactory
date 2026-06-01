@@ -135,6 +135,48 @@ async fn work_items_unknown_repo_is_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn work_items_are_newest_first_and_capped() {
+    // The endpoint contract is "newest-first, bounded (200)". Seed MORE than the cap and
+    // assert both: exactly 200 rows return, the newest (last-enqueued) is first, and the
+    // oldest is truncated out.
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let (owner, name) = unique_repo();
+    let repo_id = record::upsert_repo(&pool, &owner, &name, 1).await.unwrap();
+
+    // Enqueue order is ascending UUIDv7 id; with equal `updated_at` the secondary sort
+    // (id DESC) makes the last-enqueued the newest, deterministically.
+    let mut ids = Vec::new();
+    for i in 0..205 {
+        ids.push(enqueue_item(&pool, repo_id, Kind::Coder, &format!("issue#{i}")).await);
+    }
+
+    let (status, body) = call(
+        DashboardState::new(pool.clone()),
+        get(&format!("/api/repos/{owner}/{name}/work-items")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items: Vec<Value> = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(items.len(), 200, "capped at the page limit (200)");
+    assert_eq!(
+        items[0]["id"],
+        Value::String(ids.last().unwrap().to_string()),
+        "newest (last-enqueued) is first"
+    );
+    let oldest = ids[0].to_string();
+    assert!(
+        items
+            .iter()
+            .all(|w| w["id"] != Value::String(oldest.clone())),
+        "the oldest item is beyond the cap and excluded"
+    );
+}
+
 // ---- (b) summary counts ---------------------------------------------------
 
 #[tokio::test]
