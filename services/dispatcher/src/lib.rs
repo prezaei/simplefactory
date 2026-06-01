@@ -28,32 +28,16 @@ use uuid::Uuid;
 /// interval so a live worker keeps renewing it).
 const DEFAULT_TASK_TTL_SECS: f64 = 900.0;
 
-/// Default absolute wall-clock cap for a single attempt, in seconds. MIRRORS the
-/// coordinator's `DEFAULT_WALL_CLOCK_CAP_SECS` (30 min) — the longest a heart-beating
-/// worker can run before the sweeper's wall-clock backstop reclaims it. The task token
-/// must stay valid for at least this long (see [`token_ttl_secs`]).
-const DEFAULT_WALL_CLOCK_CAP_SECS: f64 = 30.0 * 60.0;
-
 /// Grace added on top of the wall-clock cap when sizing the task-token TTL, so a worker
 /// running right up to the cap can still authenticate its terminal `record_outcome`
 /// (and final checkpoint) before the token expires.
 const TOKEN_TTL_GRACE_SECS: f64 = 5.0 * 60.0;
 
-/// Parse a positive-seconds env value, falling back to `default` when unset,
-/// unparseable, or non-positive. Pure (takes the raw value) so the TTL policy is
-/// unit-testable without mutating process-global environment state (tests run in
-/// parallel — see AGENTS.md "no global mutable state").
-fn parse_positive_secs(raw: Option<&str>, default: f64) -> f64 {
-    raw.and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|n| *n > 0.0)
-        .unwrap_or(default)
-}
-
 /// The effective per-task **lease** TTL: `FACTORY_LEASE_TTL_SECS` if set to a positive
 /// number, else [`DEFAULT_TASK_TTL_SECS`]. Governs how fast a *dead* worker's lease is
 /// reclaimed — deliberately short for crash-resume smokes.
 fn task_ttl_secs() -> f64 {
-    parse_positive_secs(
+    record::parse_positive_secs(
         std::env::var("FACTORY_LEASE_TTL_SECS").ok().as_deref(),
         DEFAULT_TASK_TTL_SECS,
     )
@@ -68,17 +52,19 @@ fn token_ttl_from_cap(cap: f64) -> f64 {
 ///
 /// The lease governs how fast a *dead* worker is reclaimed, but a *live* worker's token
 /// must stay valid for the WHOLE run, which can last up to the absolute wall-clock cap
-/// (`FACTORY_WALL_CLOCK_CAP_SECS`, mirrored from the coordinator). Sizing the token from
-/// the short lease TTL silently 401s a healthy long run mid-flight: it can no longer
-/// heartbeat, so its lease lapses and it is wrongly reclaimed and re-dispatched — an
-/// infinite churn (observed live with `FACTORY_LEASE_TTL_SECS=120`: real coder runs take
-/// minutes, far past a 120s token). Reclaim security does NOT rely on token expiry — the
-/// sweeper REVOKES a reclaimed attempt's token, killing it immediately regardless of this
-/// (generous) TTL — so the token TTL is simply the cap a legitimate run can reach.
+/// (`FACTORY_WALL_CLOCK_CAP_SECS`). It reads the SAME env var + shared
+/// [`record::DEFAULT_WALL_CLOCK_CAP_SECS`] + shared [`record::parse_positive_secs`] the
+/// coordinator's sweeper uses, so the token can never be sized for a different cap than
+/// the one actually enforced. Sizing the token from the short lease TTL instead silently
+/// 401s a healthy long run mid-flight: it can no longer heartbeat, so its lease lapses
+/// and it is wrongly reclaimed and re-dispatched — an infinite churn (observed live with
+/// `FACTORY_LEASE_TTL_SECS=120`: real coder runs take minutes, far past a 120s token).
+/// Reclaim security does NOT rely on token expiry — the sweeper REVOKES a reclaimed
+/// attempt's token, killing it immediately regardless of this (generous) TTL.
 fn token_ttl_secs() -> f64 {
-    token_ttl_from_cap(parse_positive_secs(
+    token_ttl_from_cap(record::parse_positive_secs(
         std::env::var("FACTORY_WALL_CLOCK_CAP_SECS").ok().as_deref(),
-        DEFAULT_WALL_CLOCK_CAP_SECS,
+        record::DEFAULT_WALL_CLOCK_CAP_SECS,
     ))
 }
 
@@ -615,37 +601,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_positive_secs_falls_back_on_unset_garbage_and_nonpositive() {
-        assert_eq!(parse_positive_secs(None, 900.0), 900.0);
-        assert_eq!(parse_positive_secs(Some("   "), 900.0), 900.0);
-        assert_eq!(parse_positive_secs(Some("nope"), 900.0), 900.0);
-        assert_eq!(parse_positive_secs(Some("0"), 900.0), 900.0);
-        assert_eq!(parse_positive_secs(Some("-5"), 900.0), 900.0);
-        assert_eq!(parse_positive_secs(Some(" 120 "), 900.0), 120.0);
-    }
-
     // The crash-resume churn bug: a SHORT lease TTL must never shorten the task token.
     // The token is sized from the wall-clock cap (+grace), so it always outlives a full
     // capped run — a live worker stays authenticated and keeps heart-beating instead of
-    // 401ing mid-flight and being wrongly reclaimed.
+    // 401ing mid-flight and being wrongly reclaimed. (The shared positive-secs parser is
+    // unit-tested in `factory_record`.)
     #[test]
     fn token_ttl_outlives_a_short_lease_and_tracks_the_wall_clock_cap() {
-        let short_lease = parse_positive_secs(Some("120"), DEFAULT_TASK_TTL_SECS);
-        let token = token_ttl_from_cap(DEFAULT_WALL_CLOCK_CAP_SECS);
+        let short_lease = record::parse_positive_secs(Some("120"), DEFAULT_TASK_TTL_SECS);
+        let token = token_ttl_from_cap(record::DEFAULT_WALL_CLOCK_CAP_SECS);
         assert!(
             token > short_lease,
             "token TTL {token} must exceed a short lease TTL {short_lease}"
         );
         assert!(
-            token >= DEFAULT_WALL_CLOCK_CAP_SECS,
-            "token TTL {token} must cover a full wall-clock-cap run ({DEFAULT_WALL_CLOCK_CAP_SECS}s)"
+            token >= record::DEFAULT_WALL_CLOCK_CAP_SECS,
+            "token TTL {token} must cover a full wall-clock-cap run"
         );
         // The token tracks the CAP, not the lease: changing the cap moves the token TTL.
         assert_eq!(token_ttl_from_cap(600.0), 600.0 + TOKEN_TTL_GRACE_SECS);
         assert_eq!(
-            token_ttl_from_cap(DEFAULT_WALL_CLOCK_CAP_SECS),
-            DEFAULT_WALL_CLOCK_CAP_SECS + TOKEN_TTL_GRACE_SECS
+            token_ttl_from_cap(record::DEFAULT_WALL_CLOCK_CAP_SECS),
+            record::DEFAULT_WALL_CLOCK_CAP_SECS + TOKEN_TTL_GRACE_SECS
         );
     }
 

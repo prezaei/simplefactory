@@ -20,6 +20,24 @@ use uuid::Uuid;
 /// Connection pool handle used across Factory services.
 pub type Pool = sqlx::postgres::PgPool;
 
+/// Default absolute per-attempt wall-clock cap (seconds): a run going longer than this is
+/// reclaimed even while heart-beating (a stuck-but-alive worker). 30 min — the platform
+/// default in the technical spec (overridable via `FACTORY_WALL_CLOCK_CAP_SECS`). SHARED
+/// so the coordinator (the sweeper that enforces the cap) and the dispatcher (which sizes
+/// the task-token TTL to outlive it) can never drift to different values.
+pub const DEFAULT_WALL_CLOCK_CAP_SECS: f64 = 30.0 * 60.0;
+
+/// Parse a positive-seconds env value, falling back to `default` when unset, unparseable,
+/// non-positive, or non-finite (`inf`/`NaN` would otherwise yield an unbounded TTL/cap).
+/// Pure (takes the raw value) so TTL/cap policy is unit-testable without mutating
+/// process-global env state (tests run in parallel — AGENTS.md "no global mutable state").
+/// SHARED across services so the trim/validate rules can't diverge per crate.
+pub fn parse_positive_secs(raw: Option<&str>, default: f64) -> f64 {
+    raw.and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|n| *n > 0.0 && n.is_finite())
+        .unwrap_or(default)
+}
+
 /// Result type for record-book operations.
 pub type Result<T> = std::result::Result<T, RecordError>;
 
@@ -1760,6 +1778,20 @@ mod tests {
             assert_eq!(k.as_str().parse::<Kind>().unwrap(), k);
         }
         assert!("nope".parse::<Kind>().is_err());
+    }
+
+    #[test]
+    fn parse_positive_secs_validates_and_falls_back() {
+        assert_eq!(parse_positive_secs(None, 900.0), 900.0);
+        assert_eq!(parse_positive_secs(Some("   "), 900.0), 900.0);
+        assert_eq!(parse_positive_secs(Some("nope"), 900.0), 900.0);
+        assert_eq!(parse_positive_secs(Some("0"), 900.0), 900.0);
+        assert_eq!(parse_positive_secs(Some("-5"), 900.0), 900.0);
+        // Non-finite must NOT pass the `> 0.0` filter (inf would yield an unbounded TTL).
+        assert_eq!(parse_positive_secs(Some("inf"), 900.0), 900.0);
+        assert_eq!(parse_positive_secs(Some("NaN"), 900.0), 900.0);
+        // Surrounding whitespace is trimmed (shared rule so crates can't diverge).
+        assert_eq!(parse_positive_secs(Some(" 120 "), 900.0), 120.0);
     }
 
     #[test]
