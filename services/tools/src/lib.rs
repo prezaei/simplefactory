@@ -817,13 +817,29 @@ async fn escalate_won(
     // Map the reason to the work-item state: needs-human-input is resumable (blocked,
     // re-queued on a human reply via requeue_blocked); the rest are terminal.
     //
-    // NOTE: escalate deliberately does NOT revoke the task token or finish the attempt
-    // here — it must stay safely RETRYABLE (a lost HTTP response → the worker's client
-    // retries → the claim-based idempotency makes it a no-op success). Revoking the
-    // token would 401 that retry. The bounded token TTL plus the P5 lease sweeper (which
-    // reclaims orphaned attempts and revokes their tokens) handle end-of-task cleanup.
+    // NOTE: escalate deliberately does NOT revoke the task token — it must stay safely
+    // RETRYABLE (a lost HTTP response → the worker's client retries → the claim-based
+    // idempotency makes it a no-op success); revoking the token would 401 that retry. The
+    // bounded token TTL plus the P5 lease sweeper handle token cleanup.
     let target_state = escalation_target_state(reason);
     let state_changed = record::set_state(&state.pool, auth.work_item_id, target_state).await?;
+
+    // Finish THIS attempt so it is no longer `running`. A blocked-on-human attempt left
+    // running would, after the human reply re-queues the item and a fresh attempt starts,
+    // still satisfy the wall-clock-cap predicate (any running attempt past the cap) and
+    // make the sweeper immediately reclaim the new, healthy run — counting blocked-on-human
+    // time against it, which the spec forbids. finish_attempt is idempotent (guards
+    // status='running'), so escalate stays retryable; the checkpoint the attempt saved
+    // before blocking is still discoverable for resume (last_checkpoint_for_item ignores
+    // attempt status). Blocked target → `blocked`; terminal escalation → `failed`.
+    if let Some(attempt_id) = auth.attempt_id {
+        let attempt_status = if target_state == record::State::Blocked {
+            record::AttemptStatus::Blocked
+        } else {
+            record::AttemptStatus::Failed
+        };
+        record::finish_attempt(&state.pool, attempt_id, attempt_status, Some(context)).await?;
+    }
 
     Ok(json!({
         "escalation_id": escalation_id.to_string(),

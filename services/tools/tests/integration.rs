@@ -1369,6 +1369,18 @@ async fn escalate_blocked_input_is_resumable_and_terminal_reasons_escalate() {
         .unwrap();
     assert_eq!(item.state, State::Blocked, "blocked_input parks at blocked");
 
+    // The attempt is FINISHED as `blocked`, not left running — so after the re-dispatch
+    // its stale started_at can't trip the wall-clock cap on the resumed run.
+    let attempt_status: String = sqlx::query_scalar("SELECT status FROM attempts WHERE id = $1")
+        .bind(fx.auth.attempt_id.unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        attempt_status, "blocked",
+        "the blocked attempt is finished, not left running"
+    );
+
     // A human reply re-queues exactly this blocked item.
     let requeued = record::requeue_blocked(&pool, item.repo_id, "issue#304")
         .await
