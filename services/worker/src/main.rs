@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use factory_worker::{ClaudeRunner, HarnessConfig, HttpTools, RunResult, Workspace};
+use factory_worker::{
+    ClaudeRunner, HarnessConfig, HttpTools, ReviewVerdict, RunOutcome, Workspace,
+};
 
 /// Real git CLI driver. Shallow-clones the PLAIN repo URL and pushes with
 /// `--force-with-lease` for idempotent re-runs. The install token is NEVER placed
@@ -158,11 +160,19 @@ impl ClaudeRunner for ClaudeCli {
     async fn run(
         &self,
         workdir: &Path,
+        role: &str,
         prompt: &str,
         tools_url: &str,
         token: &str,
-    ) -> anyhow::Result<RunResult> {
-        tracing::info!(workdir = %workdir.display(), tools_url, "ClaudeCli: running claude headless");
+    ) -> anyhow::Result<RunOutcome> {
+        tracing::info!(workdir = %workdir.display(), role, tools_url, "ClaudeCli: running claude headless");
+        // Ensure the working directory exists before we `current_dir(workdir)` the
+        // `claude` process. The Coder path creates it via `git clone`, but the Manager
+        // and Reviewer roles skip cloning (no repo needed — they read the issue/CR over
+        // MCP), so for them nothing has created `workdir` yet and the spawn would fail
+        // with "No such file or directory". `create_dir_all` is idempotent, so it is a
+        // no-op for the already-cloned Coder tree.
+        tokio::fs::create_dir_all(workdir).await?;
         // Register the Factory Tools service as a Streamable-HTTP MCP server so
         // Claude reaches Factory (open CRs, etc.) through the authenticated
         // endpoint. The config carries the token (an Authorization header), so it is
@@ -183,24 +193,26 @@ impl ClaudeRunner for ClaudeCli {
         // failure path. If cleanup ran only after a successful write+run, a write that
         // failed (e.g. a planted file at the path) would leave the scratch dir (and any
         // partial token file) on disk. cleanup_scratch runs on every exit path here.
-        let result = run_claude_with_config(&scratch_dir, workdir, prompt, tools_url, token).await;
+        let result =
+            run_claude_with_config(&scratch_dir, workdir, role, prompt, tools_url, token).await;
         cleanup_scratch(&scratch_dir).await;
         result
     }
 }
 
 /// Write the MCP config into `scratch_dir` and run `claude` against it, returning the
-/// parsed [`RunResult`]. Split out from [`ClaudeRunner::run`] so the scratch-dir
+/// parsed [`RunOutcome`]. Split out from [`ClaudeRunner::run`] so the scratch-dir
 /// cleanup in the caller wraps EVERY exit path of this function — both the
 /// config-write failure and the claude-run failure — guaranteeing the token-bearing
 /// config never lingers on disk regardless of where this fails.
 async fn run_claude_with_config(
     scratch_dir: &Path,
     workdir: &Path,
+    role: &str,
     prompt: &str,
     tools_url: &str,
     token: &str,
-) -> anyhow::Result<RunResult> {
+) -> anyhow::Result<RunOutcome> {
     let config_path = scratch_dir.join(MCP_CONFIG_FILENAME);
     write_mcp_config_file(&config_path, tools_url, token).await?;
 
@@ -222,8 +234,134 @@ async fn run_claude_with_config(
     } else {
         stdout
     };
-    tracing::info!("ClaudeCli: run completed");
-    Ok(RunResult { summary })
+    tracing::info!(role, "ClaudeCli: run completed");
+    // Shape the textual output into the role's structured outcome. The decision
+    // signals (manager actionable?, reviewer verdict) are parsed from a trailing
+    // marker line Claude is prompted to emit; absent a marker, conservative defaults
+    // apply (manager → actionable, reviewer → comment). Richer parsing is a deploy
+    // refinement; this seam runs only in live deployment (the harness logic is
+    // covered by the fake-driven tests in lib.rs).
+    Ok(outcome_for_role(role, summary))
+}
+
+/// Map a role + Claude's textual summary to a [`RunOutcome`]. Pure (no I/O) so it is
+/// unit-tested. Unknown roles map to `Code` defensively — the harness's run-seam match
+/// rejects any non-coder/manager/reviewer role before this is reached for a real run,
+/// so this default is never exercised for an unsupported role in practice.
+fn outcome_for_role(role: &str, summary: String) -> RunOutcome {
+    match role {
+        "manager" => {
+            let actionable = parse_manager_actionable(&summary);
+            // Strip the control marker so it never leaks into the user-facing triage
+            // comment (run_manager posts `summary` as the issue comment). A terse
+            // marker-only response leaves an empty body, which GitHub rejects — fall
+            // back to a decision-derived note so the comment is always non-empty.
+            let body = strip_marker_lines(&summary, "ACTIONABLE:");
+            let body = non_empty_or(body, || {
+                if actionable {
+                    "Triaged: actionable — assigning a coder.".to_string()
+                } else {
+                    "Triaged: not actionable — escalating for a human decision.".to_string()
+                }
+            });
+            RunOutcome::Triage {
+                actionable,
+                summary: body,
+            }
+        }
+        "reviewer" => {
+            let verdict = parse_reviewer_verdict(&summary);
+            // Strip the control marker; fall back to a verdict-derived body if the
+            // response was marker-only (GitHub rejects an empty review body).
+            let body = strip_marker_lines(&summary, "VERDICT:");
+            let body = non_empty_or(body, || format!("Review verdict: {}.", verdict.as_str()));
+            RunOutcome::Review {
+                verdict,
+                summary: body,
+            }
+        }
+        _ => RunOutcome::Code { summary },
+    }
+}
+
+/// Return `s` if it has non-whitespace content, else the lazily-computed fallback.
+/// Guards the user-facing comment/review body against an empty (marker-only) summary.
+fn non_empty_or(s: String, fallback: impl FnOnce() -> String) -> String {
+    if s.trim().is_empty() {
+        fallback()
+    } else {
+        s
+    }
+}
+
+/// Remove any line whose trimmed text starts with `prefix` (case-insensitive) — the
+/// internal control marker (`ACTIONABLE:` / `VERDICT:`) — from the user-facing summary,
+/// trimming surrounding blank lines. The marker is a parsing contract, not content, so
+/// it must not appear in the posted comment / review body.
+fn strip_marker_lines(summary: &str, prefix: &str) -> String {
+    summary
+        .lines()
+        .filter(|line| {
+            line.trim()
+                .get(..prefix.len())
+                .map(|head| !head.eq_ignore_ascii_case(prefix))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// Parse the manager's triage decision from a trailing `ACTIONABLE: yes|no` marker.
+/// Defaults to actionable when no clear "no" marker is present (fail toward doing the
+/// work rather than silently dropping an issue). Matches the FIRST token of the marker
+/// value so a natural elaboration (`ACTIONABLE: no — out of scope`) still reads as
+/// non-actionable rather than being missed by an exact-string compare.
+fn parse_manager_actionable(summary: &str) -> bool {
+    let not_actionable = last_marker(summary, "ACTIONABLE:")
+        .and_then(|v| marker_first_token(&v))
+        .map(|t| matches!(t.as_str(), "no" | "false" | "not" | "not_actionable"))
+        .unwrap_or(false);
+    !not_actionable
+}
+
+/// Parse the reviewer's verdict from a trailing `VERDICT: approve|request_changes|comment`
+/// marker. Defaults to `comment` (the non-destructive verdict) when absent/unrecognized.
+/// Matches the FIRST token so trailing rationale after the verdict is tolerated.
+fn parse_reviewer_verdict(summary: &str) -> ReviewVerdict {
+    match last_marker(summary, "VERDICT:")
+        .and_then(|v| marker_first_token(&v))
+        .as_deref()
+    {
+        Some("approve") => ReviewVerdict::Approve,
+        Some("request_changes") => ReviewVerdict::RequestChanges,
+        _ => ReviewVerdict::Comment,
+    }
+}
+
+/// The first whitespace- or punctuation-delimited token of a marker value, lowercased.
+/// e.g. `"no — out of scope"` → `"no"`, `"request_changes (add tests)"` →
+/// `"request_changes"`. Returns `None` for an empty value.
+fn marker_first_token(value: &str) -> Option<String> {
+    value
+        .split(|c: char| c.is_whitespace() || (c.is_ascii_punctuation() && c != '_'))
+        .find(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
+}
+
+/// If the FINAL non-empty line starts with `prefix` (case-insensitive), return its
+/// trimmed, lowercased value; otherwise `None`. The prompt requires the control marker
+/// to be the last line, so only that line is consulted — a marker-looking line quoted
+/// earlier in Claude's output (e.g. echoing issue text) cannot drive the decision.
+fn last_marker(text: &str, prefix: &str) -> Option<String> {
+    let last = text.lines().rev().map(str::trim).find(|l| !l.is_empty())?;
+    let head = last.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        Some(last[prefix.len()..].trim().to_ascii_lowercase())
+    } else {
+        None
+    }
 }
 
 /// Best-effort delete the entire MCP scratch directory (and its token-bearing config)
@@ -424,6 +562,7 @@ mod tests {
         let result = run_claude_with_config(
             &scratch_dir,
             Path::new("/tmp"),
+            "coder",
             "prompt",
             "https://tools.factory.test",
             TOKEN,
@@ -640,5 +779,192 @@ mod tests {
         assert!(!is_url_safe_token("has:colon"));
         assert!(!is_url_safe_token("has/slash"));
         assert!(!is_url_safe_token("has space"));
+    }
+
+    #[test]
+    fn outcome_for_role_shapes_by_role() {
+        // Coder → Code.
+        assert!(matches!(
+            outcome_for_role("coder", "did the work".into()),
+            RunOutcome::Code { .. }
+        ));
+        // Manager → Triage; default actionable when no marker.
+        assert!(matches!(
+            outcome_for_role("manager", "in scope".into()),
+            RunOutcome::Triage {
+                actionable: true,
+                ..
+            }
+        ));
+        // Reviewer → Review; default comment when no marker.
+        assert!(matches!(
+            outcome_for_role("reviewer", "looks ok".into()),
+            RunOutcome::Review {
+                verdict: ReviewVerdict::Comment,
+                ..
+            }
+        ));
+        // The control marker is parsed for the decision but STRIPPED from the
+        // user-facing summary (it must not appear in the posted comment / review body).
+        let RunOutcome::Triage {
+            actionable,
+            summary,
+        } = outcome_for_role("manager", "Out of scope.\nACTIONABLE: no".into())
+        else {
+            panic!("manager → Triage");
+        };
+        assert!(!actionable);
+        assert_eq!(
+            summary, "Out of scope.",
+            "marker stripped from triage summary"
+        );
+        let RunOutcome::Review { verdict, summary } =
+            outcome_for_role("reviewer", "Looks good.\nVERDICT: approve".into())
+        else {
+            panic!("reviewer → Review");
+        };
+        assert_eq!(verdict, ReviewVerdict::Approve);
+        assert_eq!(
+            summary, "Looks good.",
+            "marker stripped from review summary"
+        );
+        // A marker-ONLY response strips to empty → must fall back to a non-empty,
+        // decision-derived body (GitHub rejects an empty comment/review body).
+        let RunOutcome::Triage { summary, .. } =
+            outcome_for_role("manager", "ACTIONABLE: yes".into())
+        else {
+            panic!("manager → Triage");
+        };
+        assert!(
+            !summary.trim().is_empty(),
+            "marker-only manager response falls back to a non-empty body"
+        );
+        let RunOutcome::Review { summary, .. } =
+            outcome_for_role("reviewer", "VERDICT: approve".into())
+        else {
+            panic!("reviewer → Review");
+        };
+        assert!(
+            !summary.trim().is_empty(),
+            "marker-only reviewer response falls back to a non-empty body"
+        );
+        // Unknown role defaults to Code (never reached for a real run — the harness
+        // run-seam rejects unsupported roles before this).
+        assert!(matches!(
+            outcome_for_role("tester", "x".into()),
+            RunOutcome::Code { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_manager_actionable_reads_trailing_marker() {
+        assert!(parse_manager_actionable("triaged\nACTIONABLE: yes"));
+        assert!(parse_manager_actionable("triaged")); // default: actionable
+        assert!(!parse_manager_actionable("out of scope\nACTIONABLE: no"));
+        assert!(!parse_manager_actionable("ACTIONABLE: not_actionable"));
+        // Case-insensitive on the marker; the LAST marker wins.
+        assert!(!parse_manager_actionable("actionable: yes\nactionable: no"));
+        // Elaboration after the decision token still reads correctly (first token wins).
+        assert!(!parse_manager_actionable(
+            "ACTIONABLE: no — out of scope, needs product"
+        ));
+        assert!(!parse_manager_actionable(
+            "ACTIONABLE: not actionable; please clarify"
+        ));
+        assert!(parse_manager_actionable(
+            "ACTIONABLE: yes, assigning a coder"
+        ));
+        // A marker quoted EARLIER (not the final line) is ignored → conservative
+        // default (actionable). This stops echoed issue text from driving the decision.
+        assert!(parse_manager_actionable(
+            "The issue says 'ACTIONABLE: no'\nProceeding with the fix."
+        ));
+    }
+
+    #[test]
+    fn parse_reviewer_verdict_reads_trailing_marker() {
+        assert_eq!(
+            parse_reviewer_verdict("looks great\nVERDICT: approve"),
+            ReviewVerdict::Approve
+        );
+        assert_eq!(
+            parse_reviewer_verdict("needs work\nVERDICT: request_changes"),
+            ReviewVerdict::RequestChanges
+        );
+        assert_eq!(
+            parse_reviewer_verdict("just a note\nVERDICT: comment"),
+            ReviewVerdict::Comment
+        );
+        // Absent/unrecognized → conservative `comment`.
+        assert_eq!(parse_reviewer_verdict("no marker"), ReviewVerdict::Comment);
+        assert_eq!(
+            parse_reviewer_verdict("VERDICT: lgtm"),
+            ReviewVerdict::Comment
+        );
+        // Trailing rationale after the verdict token is tolerated (first token wins).
+        assert_eq!(
+            parse_reviewer_verdict("VERDICT: request_changes (add tests)"),
+            ReviewVerdict::RequestChanges
+        );
+        assert_eq!(
+            parse_reviewer_verdict("VERDICT: approve — ship it"),
+            ReviewVerdict::Approve
+        );
+    }
+
+    #[test]
+    fn strip_marker_lines_removes_the_control_marker_only() {
+        assert_eq!(
+            strip_marker_lines("Triaged it.\nACTIONABLE: no", "ACTIONABLE:"),
+            "Triaged it."
+        );
+        // Case-insensitive on the marker; only marker lines are removed.
+        assert_eq!(
+            strip_marker_lines("line one\nverdict: approve\nline two", "VERDICT:"),
+            "line one\nline two"
+        );
+        // No marker → unchanged (trimmed).
+        assert_eq!(
+            strip_marker_lines("just prose\n", "ACTIONABLE:"),
+            "just prose"
+        );
+        // A marker-only summary collapses to empty.
+        assert_eq!(strip_marker_lines("VERDICT: comment", "VERDICT:"), "");
+    }
+
+    #[test]
+    fn marker_first_token_splits_on_space_and_punctuation() {
+        assert_eq!(marker_first_token("no — out of scope"), Some("no".into()));
+        assert_eq!(
+            marker_first_token("request_changes (add tests)"),
+            Some("request_changes".into()) // underscores are kept
+        );
+        assert_eq!(marker_first_token("approve"), Some("approve".into()));
+        assert_eq!(marker_first_token("   "), None);
+        assert_eq!(marker_first_token(""), None);
+    }
+
+    #[test]
+    fn last_marker_only_reads_the_final_nonempty_line() {
+        // The marker must be the FINAL non-empty line.
+        assert_eq!(last_marker("kEy: Val", "KEY:"), Some("val".to_string()));
+        assert_eq!(
+            last_marker("a\nKEY: first\nKEY: second", "KEY:"),
+            Some("second".to_string()),
+            "the last line wins"
+        );
+        // Trailing blank lines are ignored; the last NON-EMPTY line is the marker.
+        assert_eq!(
+            last_marker("KEY: val\n\n  ", "KEY:"),
+            Some("val".to_string())
+        );
+        // A marker quoted EARLIER does NOT count when the final line isn't a marker —
+        // this is the contract that stops echoed issue/CR text from driving the decision.
+        assert_eq!(last_marker("KEY: no\nsome closing prose", "KEY:"), None);
+        assert_eq!(last_marker("nothing here", "KEY:"), None);
+        // A short final line (shorter than the prefix) is None, not a panic.
+        assert_eq!(last_marker("hi", "KEY:"), None);
+        // Multibyte content doesn't panic the prefix slice.
+        assert_eq!(last_marker("héllo", "KEY:"), None);
     }
 }

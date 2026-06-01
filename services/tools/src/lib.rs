@@ -784,6 +784,12 @@ async fn escalate_won(
 
     // Map the reason to the work-item state: needs-human-input is resumable (blocked,
     // re-queued on a human reply via requeue_blocked); the rest are terminal.
+    //
+    // NOTE: escalate deliberately does NOT revoke the task token or finish the attempt
+    // here — it must stay safely RETRYABLE (a lost HTTP response → the worker's client
+    // retries → the claim-based idempotency makes it a no-op success). Revoking the
+    // token would 401 that retry. The bounded token TTL plus the P5 lease sweeper (which
+    // reclaims orphaned attempts and revokes their tokens) handle end-of-task cleanup.
     let target_state = escalation_target_state(reason);
     let state_changed = record::set_state(&state.pool, auth.work_item_id, target_state).await?;
 
@@ -818,18 +824,48 @@ const IDEMPOTENCY_COMPLETE_ATTEMPTS: u32 = 3;
 /// are layered on top of this by [`compose_prompt`].
 fn role_default_prompt(role: record::Kind) -> &'static str {
     match role {
+        // Role BASE prose (overridable). The Manager/Reviewer machine-readable output
+        // contract (read-only + trailing marker) is NOT here — it's appended as a
+        // non-overridable suffix by `compose_prompt` (see `role_output_contract`), so
+        // repo/worker instructions layered after the role default can't bury it.
         record::Kind::Manager => {
-            "You are a manager. Triage the subject, decide the work, and delegate to coders."
+            "You are a manager. Read the issue and triage it: decide whether it is an \
+             actionable software task Factory should code."
         }
         record::Kind::Coder => {
             "You are a coder. Implement the task with tests, then open a change request."
         }
         record::Kind::Reviewer => {
-            "You are a reviewer. Review the change request and submit a verdict."
+            "You are a reviewer. Review the change request's diff and checks."
         }
         record::Kind::Tester => {
             "You are a tester. Exercise the change and report whether the checks pass."
         }
+    }
+}
+
+/// The machine-readable OUTPUT CONTRACT for a role, appended by [`compose_prompt`]
+/// AFTER the (overridable) repo-wide and per-worker instruction layers so it is always
+/// the LAST thing Claude sees and cannot be buried by custom config. The worker parses
+/// the trailing marker to decide the terminal action, so this must stay last and is
+/// only defined for the roles whose terminal action the harness drives from a marker
+/// (Manager, Reviewer). Coder/Tester have no marker contract.
+fn role_output_contract(role: record::Kind) -> Option<&'static str> {
+    match role {
+        record::Kind::Manager => Some(
+            "IMPORTANT — output contract: do NOT post a comment, escalate, or call any \
+             state-changing tool; only read and analyze (the Factory worker performs the \
+             terminal action from your verdict). Your response MUST end with a final line \
+             that is exactly `ACTIONABLE: yes` (in scope — a coder will be assigned) or \
+             `ACTIONABLE: no` (out of scope / needs a human decision — it will be escalated).",
+        ),
+        record::Kind::Reviewer => Some(
+            "IMPORTANT — output contract: do NOT call `submit_review` or any state-changing \
+             tool; only read and analyze (the Factory worker submits the verdict from your \
+             marker). Your response MUST end with a final line that is exactly \
+             `VERDICT: approve`, `VERDICT: request_changes`, or `VERDICT: comment`.",
+        ),
+        record::Kind::Coder | record::Kind::Tester => None,
     }
 }
 
@@ -864,7 +900,13 @@ fn compose_prompt(auth: &TaskAuth, item: &record::WorkItem, repo_config: Option<
             .and_then(|w| w.instructions.as_deref())
     });
 
-    factory_config::resolve_prompt(role_default, repo_wide, worker)
+    let layered = factory_config::resolve_prompt(role_default, repo_wide, worker);
+    // Append the role's output contract LAST (non-overridable), so repo/worker
+    // instructions can't bury the marker requirement the worker parses.
+    match role_output_contract(item.kind) {
+        Some(contract) => format!("{layered}\n\n{contract}"),
+        None => layered,
+    }
 }
 
 /// The transcript object URI for a task. Derived solely from the work item id so a
@@ -1310,6 +1352,32 @@ mod tests {
             assert_eq!(Tool::parse(t.as_str()), Some(t), "roundtrip {}", t.as_str());
         }
         assert_eq!(Tool::parse("nope"), None);
+    }
+
+    #[test]
+    fn role_output_contract_holds_the_marker_and_role_default_does_not() {
+        // The marker/output contract must live in the NON-overridable suffix
+        // (role_output_contract), NOT in the overridable role-default prose — so
+        // repo/worker instructions layered after the default can't bury the marker the
+        // worker parses.
+        let mgr = role_output_contract(record::Kind::Manager).expect("manager contract");
+        assert!(
+            mgr.contains("ACTIONABLE:"),
+            "manager contract has the marker"
+        );
+        assert!(
+            mgr.contains("do NOT") || mgr.contains("only read"),
+            "manager contract forbids terminal tools"
+        );
+        let rev = role_output_contract(record::Kind::Reviewer).expect("reviewer contract");
+        assert!(rev.contains("VERDICT:"), "reviewer contract has the marker");
+        // Coder/Tester have no marker contract.
+        assert!(role_output_contract(record::Kind::Coder).is_none());
+        assert!(role_output_contract(record::Kind::Tester).is_none());
+        // The (overridable) role-default prose must NOT carry the marker — otherwise a
+        // later instruction layer could be the last thing Claude sees (the bug fixed).
+        assert!(!role_default_prompt(record::Kind::Manager).contains("ACTIONABLE:"));
+        assert!(!role_default_prompt(record::Kind::Reviewer).contains("VERDICT:"));
     }
 
     #[test]
