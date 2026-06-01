@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Factory — Live View</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 1.5rem; }
+  h1 { font-size: 1.2rem; margin: 0 0 0.25rem; }
+  .sub { opacity: 0.7; margin: 0 0 1rem; }
+  form { margin: 0 0 1rem; display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+  input { padding: 0.35rem 0.5rem; font: inherit; }
+  button { padding: 0.35rem 0.8rem; font: inherit; cursor: pointer; }
+  .status { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.8rem; }
+  .live { background: #1a7f37; color: #fff; }
+  .down { background: #b35900; color: #fff; }
+  .pills { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.5rem 0 1rem; }
+  .pill { padding: 0.25rem 0.6rem; border-radius: 6px; background: rgba(127,127,127,0.15); }
+  .pill b { font-variant-numeric: tabular-nums; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid rgba(127,127,127,0.25); }
+  th { font-weight: 600; opacity: 0.8; }
+  td.mono { font-family: ui-monospace, monospace; font-size: 0.85rem; }
+  .esc { color: #cf222e; font-weight: 600; }
+  .empty { opacity: 0.6; padding: 1rem 0; }
+</style>
+</head>
+<body>
+  <h1>Factory — Live View</h1>
+  <p class="sub">Read-only projection of the record book. Updates within seconds via SSE.</p>
+
+  <form id="repo-form">
+    <label>owner <input id="owner" value="acme" /></label>
+    <label>name <input id="name" placeholder="repo name" /></label>
+    <button type="submit">Connect</button>
+    <span id="conn" class="status down">disconnected</span>
+  </form>
+
+  <div id="summary"></div>
+  <h2 style="font-size:1rem;">Work items</h2>
+  <div id="items"></div>
+
+<script>
+  let es = null;
+
+  function setConn(live) {
+    const el = document.getElementById('conn');
+    el.textContent = live ? 'live' : 'disconnected';
+    el.className = 'status ' + (live ? 'live' : 'down');
+  }
+
+  function renderSummary(s) {
+    const root = document.getElementById('summary');
+    if (!s) { root.innerHTML = ''; return; }
+    const pills = (s.by_state || [])
+      .map(b => `<span class="pill">${b.state}: <b>${b.count}</b></span>`)
+      .join('');
+    const esc = s.open_escalations > 0
+      ? `<span class="pill esc">open escalations: <b>${s.open_escalations}</b></span>`
+      : `<span class="pill">open escalations: <b>0</b></span>`;
+    root.innerHTML =
+      `<p class="sub">${s.owner}/${s.name} — total ${s.total}</p>` +
+      `<div class="pills">${pills || '<span class="empty">no work items</span>'}${esc}</div>`;
+  }
+
+  function renderItems(items) {
+    const root = document.getElementById('items');
+    if (!items || items.length === 0) {
+      root.innerHTML = '<p class="empty">No work items yet.</p>';
+      return;
+    }
+    const rows = items.map(w => `
+      <tr>
+        <td>${w.kind}</td>
+        <td>${w.worker_name}</td>
+        <td>${w.state}</td>
+        <td class="mono">${w.subject_ref}</td>
+        <td>${w.attempt_count}</td>
+        <td>${w.loop_count}</td>
+        <td class="mono">${new Date(w.updated_at).toLocaleString()}</td>
+      </tr>`).join('');
+    root.innerHTML = `
+      <table>
+        <thead><tr>
+          <th>kind</th><th>worker</th><th>state</th><th>subject</th>
+          <th>attempts</th><th>loops</th><th>updated</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  function connect(owner, name) {
+    if (es) { es.close(); es = null; }
+    setConn(false);
+    const url = `/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/stream`;
+    es = new EventSource(url);
+    es.onopen = () => setConn(true);
+    es.onerror = () => setConn(false);
+    es.onmessage = (ev) => {
+      try {
+        const snap = JSON.parse(ev.data);
+        renderSummary(snap.summary);
+        renderItems(snap.work_items);
+        setConn(true);
+      } catch (e) { /* skip malformed frame */ }
+    };
+  }
+
+  document.getElementById('repo-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const owner = document.getElementById('owner').value.trim();
+    const name = document.getElementById('name').value.trim();
+    if (owner && name) connect(owner, name);
+  });
+</script>
+</body>
+</html>

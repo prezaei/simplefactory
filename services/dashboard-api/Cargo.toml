@@ -5,10 +5,45 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lib]
+name = "factory_dashboard_api"
+path = "src/lib.rs"
+
 [[bin]]
 name = "factory-dashboard-api"
 path = "src/main.rs"
 
 [dependencies]
+# factory-record is used ONLY for its connect/migrate/Pool type + enums (no new
+# pub fns are added to it). All P6 read queries live in THIS crate (lib.rs) so the
+# dashboard owns its read-only projections and cannot collide with other branches.
+factory-record.workspace = true
 factory-telemetry.workspace = true
+axum.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+sqlx.workspace = true
+# serde feature (additive over the workspace uuid) is needed to serialize Uuid in
+# the JSON projections.
+uuid = { workspace = true, features = ["serde"] }
+# serde feature is additive over the workspace chrono; needed to serialize
+# DateTime<Utc> in the JSON projections.
+chrono = { workspace = true, features = ["serde"] }
+# SSE: the live stream is built with `futures::stream` (a periodic-snapshot
+# poller); both already resolve in the workspace lockfile via Axum/Tokio.
+futures = "0.3"
+
+[dev-dependencies]
+factory-record.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tower.workspace = true
+sqlx.workspace = true
+futures = "0.3"
+# Streaming the SSE body frame-by-frame in the freshness test.
+http-body-util = "0.1"
