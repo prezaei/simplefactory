@@ -16,7 +16,9 @@
 #   FACTORY_SMOKE_REPO=owner/name ./scripts/smoke.sh happy crash     # a subset
 set -uo pipefail
 
-REPO="${FACTORY_SMOKE_REPO:-prezaei/factory-smoke}"
+# Require the target repo explicitly — never default to a real repo, so the script
+# can't accidentally drive issues/labels/PRs against an unexpected repository.
+REPO="${FACTORY_SMOKE_REPO:?set FACTORY_SMOKE_REPO=owner/name (the throwaway repo)}"
 LABEL="${FACTORY_SMOKE_LABEL:-factory}"
 DASHBOARD_URL="${DASHBOARD_URL:-http://localhost:8082}"
 TOOLS_URL="${TOOLS_HEALTH_URL:-http://localhost:8081}"

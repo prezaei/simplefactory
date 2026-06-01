@@ -164,14 +164,22 @@ fn is_blob_not_found(err: &AzureError) -> bool {
     }
 }
 
-/// True when an error is a create-lost-the-race (the blob already exists): a
-/// conditional create (`If-None-Match: *`) returns 409/412 when another writer
-/// created it first. Tolerated so a concurrent first-append can't error spuriously.
+/// True when a create lost the race because the target ALREADY EXISTS: an explicit
+/// `ContainerAlreadyExists`/`BlobAlreadyExists` 409, or a `412 PreconditionFailed`
+/// from a conditional create (`If-None-Match: *`). Deliberately narrow: a bare 409
+/// with a different code (e.g. `ContainerBeingDeleted`) is a REAL error and must NOT
+/// be swallowed as "already exists" (which would make a broken connect look healthy).
 fn is_already_exists(err: &AzureError) -> bool {
-    matches!(
-        err.as_http_error().map(|h| h.status()),
-        Some(StatusCode::Conflict | StatusCode::PreconditionFailed)
-    )
+    match err.as_http_error() {
+        Some(h) if h.status() == StatusCode::PreconditionFailed => true,
+        Some(h) if h.status() == StatusCode::Conflict => {
+            matches!(
+                h.error_code(),
+                Some("ContainerAlreadyExists") | Some("BlobAlreadyExists")
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Azure Blob–backed [`CheckpointStore`]: each `uri` is a block blob, latest-wins.
@@ -366,6 +374,7 @@ mod tests {
     fn azurite_conn() -> Option<String> {
         std::env::var("FACTORY_BLOB_CONNECTION_STRING")
             .ok()
+            .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     }
 
