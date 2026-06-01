@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use factory_worker::{
-    ClaudeRunner, HarnessConfig, HttpTools, ReviewVerdict, RunOutcome, Workspace,
+    ClaudeRunner, HarnessConfig, HttpTools, ResumeInfo, ReviewVerdict, RunOutcome, Workspace,
 };
 
 /// Real git CLI driver. Shallow-clones the PLAIN repo URL and pushes with
@@ -164,8 +164,10 @@ impl ClaudeRunner for ClaudeCli {
         prompt: &str,
         tools_url: &str,
         token: &str,
+        session_id: &str,
+        resume: bool,
     ) -> anyhow::Result<RunOutcome> {
-        tracing::info!(workdir = %workdir.display(), role, tools_url, "ClaudeCli: running claude headless");
+        tracing::info!(workdir = %workdir.display(), role, tools_url, session_id, resume, "ClaudeCli: running claude headless");
         // Ensure the working directory exists before we `current_dir(workdir)` the
         // `claude` process. The Coder path creates it via `git clone`, but the Manager
         // and Reviewer roles skip cloning (no repo needed — they read the issue/CR over
@@ -193,8 +195,17 @@ impl ClaudeRunner for ClaudeCli {
         // failure path. If cleanup ran only after a successful write+run, a write that
         // failed (e.g. a planted file at the path) would leave the scratch dir (and any
         // partial token file) on disk. cleanup_scratch runs on every exit path here.
-        let result =
-            run_claude_with_config(&scratch_dir, workdir, role, prompt, tools_url, token).await;
+        let result = run_claude_with_config(
+            &scratch_dir,
+            workdir,
+            role,
+            prompt,
+            tools_url,
+            token,
+            session_id,
+            resume,
+        )
+        .await;
         cleanup_scratch(&scratch_dir).await;
         result
     }
@@ -205,6 +216,7 @@ impl ClaudeRunner for ClaudeCli {
 /// cleanup in the caller wraps EVERY exit path of this function — both the
 /// config-write failure and the claude-run failure — guaranteeing the token-bearing
 /// config never lingers on disk regardless of where this fails.
+#[allow(clippy::too_many_arguments)]
 async fn run_claude_with_config(
     scratch_dir: &Path,
     workdir: &Path,
@@ -212,11 +224,13 @@ async fn run_claude_with_config(
     prompt: &str,
     tools_url: &str,
     token: &str,
+    session_id: &str,
+    resume: bool,
 ) -> anyhow::Result<RunOutcome> {
     let config_path = scratch_dir.join(MCP_CONFIG_FILENAME);
     write_mcp_config_file(&config_path, tools_url, token).await?;
 
-    let args = claude_args(&config_path, prompt);
+    let args = claude_args(&config_path, prompt, session_id, resume);
     let output = tokio::process::Command::new("claude")
         .current_dir(workdir)
         .args(&args)
@@ -435,10 +449,24 @@ fn mcp_config_json(tools_url: &str, token: &str) -> String {
 ///
 /// The config is passed as a file path (not inline JSON), so the token it contains
 /// never appears in argv (and thus never in `ps`/`/proc/<pid>/cmdline`).
-fn claude_args(mcp_config_path: &Path, prompt: &str) -> Vec<String> {
+fn claude_args(
+    mcp_config_path: &Path,
+    prompt: &str,
+    session_id: &str,
+    resume: bool,
+) -> Vec<String> {
+    // The worker owns the session id: a fresh run pins it with `--session-id` so the
+    // checkpoint loop can record it; a crash-resume continues it with `--resume`.
+    let (session_flag, session_value) = if resume {
+        ("--resume", session_id)
+    } else {
+        ("--session-id", session_id)
+    };
     vec![
         "--print".to_string(),
         "--dangerously-skip-permissions".to_string(),
+        session_flag.to_string(),
+        session_value.to_string(),
         "--mcp-config".to_string(),
         mcp_config_path.display().to_string(),
         prompt.to_string(),
@@ -450,17 +478,73 @@ fn env_var(key: &str) -> anyhow::Result<String> {
     std::env::var(key).map_err(|_| anyhow::anyhow!("missing required env var: {key}"))
 }
 
+/// Default seconds between liveness heartbeats during a run (well inside the 15-min
+/// lease so a single missed beat never lapses it).
+const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 60;
+/// Default seconds between worktree/session checkpoints during a run.
+const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 300;
+
+/// Parse an optional positive-int env var, falling back to `default` when unset or
+/// unparseable (a malformed override must not silently disable the loop).
+fn env_secs(key: &str, default: u64) -> u64 {
+    match std::env::var(key) {
+        Ok(v) => v.parse::<u64>().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+            tracing::warn!(key, value = %v, default, "invalid interval env var; using default");
+            default
+        }),
+        Err(_) => default,
+    }
+}
+
 fn load_config() -> anyhow::Result<HarnessConfig> {
     let workdir = match std::env::var("FACTORY_WORKDIR") {
         Ok(d) => PathBuf::from(d),
         Err(_) => std::env::temp_dir().join(format!("factory-worker-{}", uuid::Uuid::new_v4())),
     };
+    // Resume info is present (both vars) only when the dispatcher re-dispatched a
+    // crashed attempt with a recoverable checkpoint; otherwise this is a fresh run.
+    let resume = match (
+        std::env::var("FACTORY_RESUME_SESSION_ID").ok(),
+        std::env::var("FACTORY_RESUME_CHECKPOINT_URI").ok(),
+    ) {
+        (Some(session_id), Some(checkpoint_uri))
+            if !session_id.is_empty() && !checkpoint_uri.is_empty() =>
+        {
+            tracing::info!(
+                session_id,
+                checkpoint_uri,
+                "worker: launch is a crash-resume"
+            );
+            Some(ResumeInfo {
+                session_id,
+                checkpoint_uri,
+            })
+        }
+        _ => None,
+    };
+    // Checkpoints persist to the local filesystem for parity; the Azure Blob swap is P7.
+    let checkpoint_root = std::env::var("FACTORY_CHECKPOINT_ROOT").unwrap_or_else(|_| {
+        std::env::temp_dir()
+            .join("factory-checkpoints")
+            .display()
+            .to_string()
+    });
     Ok(HarnessConfig {
         repo_url: env_var("FACTORY_REPO_URL")?,
         install_token: env_var("FACTORY_INSTALL_TOKEN")?,
         tools_url: env_var("FACTORY_TOOLS_URL")?,
         task_token: env_var("FACTORY_TASK_TOKEN")?,
         workdir,
+        heartbeat_interval_secs: env_secs(
+            "FACTORY_HEARTBEAT_INTERVAL_SECS",
+            DEFAULT_HEARTBEAT_INTERVAL_SECS,
+        ),
+        checkpoint_interval_secs: env_secs(
+            "FACTORY_CHECKPOINT_INTERVAL_SECS",
+            DEFAULT_CHECKPOINT_INTERVAL_SECS,
+        ),
+        resume,
+        checkpoint_store: std::sync::Arc::new(factory_blob::FsCheckpoints::new(checkpoint_root)),
     })
 }
 
@@ -566,6 +650,8 @@ mod tests {
             "prompt",
             "https://tools.factory.test",
             TOKEN,
+            "ses-test",
+            false,
         )
         .await;
         cleanup_scratch(&scratch_dir).await;
@@ -722,14 +808,27 @@ mod tests {
     #[test]
     fn claude_args_are_headless_with_config_path_and_prompt() {
         let path = Path::new("/work/.factory-mcp.json");
-        let args = claude_args(path, "Fix the bug");
+        let args = claude_args(path, "Fix the bug", "ses-123", false);
         assert_eq!(args[0], "--print");
         assert_eq!(args[1], "--dangerously-skip-permissions");
-        assert_eq!(args[2], "--mcp-config");
+        // A fresh run pins the session id with --session-id.
+        assert_eq!(args[2], "--session-id");
+        assert_eq!(args[3], "ses-123");
+        assert_eq!(args[4], "--mcp-config");
         // The config is referenced BY PATH, not as inline JSON.
-        assert_eq!(args[3], "/work/.factory-mcp.json");
+        assert_eq!(args[5], "/work/.factory-mcp.json");
         // The prompt is the final positional argument.
         assert_eq!(args.last().unwrap(), "Fix the bug");
+    }
+
+    #[test]
+    fn claude_args_resume_uses_resume_flag() {
+        let path = Path::new("/work/.factory-mcp.json");
+        let args = claude_args(path, "Continue", "ses-abc", true);
+        // A crash-resume continues the same session with --resume <id>.
+        assert_eq!(args[2], "--resume");
+        assert_eq!(args[3], "ses-abc");
+        assert!(!args.iter().any(|a| a == "--session-id"));
     }
 
     #[test]
@@ -737,7 +836,7 @@ mod tests {
         // The args reference the config file path; the token (which lives only inside
         // that file) must not appear anywhere in argv.
         let path = Path::new("/work/.factory-mcp.json");
-        let args = claude_args(path, "Fix the bug");
+        let args = claude_args(path, "Fix the bug", "ses-123", false);
         for (i, a) in args.iter().enumerate() {
             assert!(!a.contains(TOKEN), "arg {i} leaked the token: {a}");
         }

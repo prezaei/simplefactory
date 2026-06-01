@@ -3306,21 +3306,274 @@ mod acceptance {
     }
 
     // P5 — resilience
-    #[test]
-    #[ignore = "P5: implement needs-human-input blocked→resume"]
-    fn needs_human_input_blocks_then_resumes_same_session_on_reply() {
-        todo!("P5: worker hits high-stakes ambiguity → blocked + question on issue; a human reply resumes the SAME session")
+
+    /// The default resume budget the dispatcher applies (`DEFAULT_RESUME_CAP`); a
+    /// re-dispatch resumes while a checkpoint exists and this budget is not exhausted.
+    const RESUME_CAP: u32 = 3;
+
+    /// Lease an enqueued item and open its attempt — what the dispatcher does at launch.
+    /// Returns the attempt id. The lease has plenty of headroom so the test owns it.
+    async fn lease_and_attempt(pool: &record::Pool, repo: Uuid) -> Uuid {
+        let leased = record::lease_next(
+            pool,
+            &record::LeaseRequest {
+                repo_id: repo,
+                worker_name: "bug-fixer".into(),
+                lease_owner: unique("e2e-p5-job"),
+                ttl_secs: 900.0,
+                per_worker_cap: 10,
+                global_cap: 10,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the enqueued item leases");
+        record::start_attempt(pool, leased.id, None).await.unwrap()
     }
 
-    #[test]
-    #[ignore = "P5: implement checkpoint + claude --resume"]
-    fn crash_resume_continues_the_same_session() {
-        todo!("P5: kill a worker mid-run → the next dispatch resumes its same Claude Code session from checkpoint")
+    /// The resume launch the dispatcher would build for `work_item_id` right now — the
+    /// exact logic `launch_leased` runs (`last_checkpoint_for_item` → `decide_resume`).
+    /// Driving these directly (rather than a second global `dispatch_once`, which a
+    /// concurrent acceptance test could win) keeps the assertion deterministic; the
+    /// `dispatch_once` → resume wiring is covered by the dispatcher integration tests.
+    async fn resume_decision(
+        pool: &record::Pool,
+        work_item_id: Uuid,
+    ) -> Option<factory_dispatcher::ResumeLaunch> {
+        let prior = record::last_checkpoint_for_item(pool, work_item_id)
+            .await
+            .unwrap();
+        factory_dispatcher::decide_resume(prior.as_ref(), RESUME_CAP)
     }
 
-    #[test]
-    #[ignore = "P5: implement full retention (record purge + Blob lifecycle)"]
-    fn retention_aging_removes_only_terminal_records() {
-        todo!("P5: terminal records past the retention window are purged; active work is untouched (record purge exists in P1; Blob lifecycle in P5)")
+    /// A human reply on an issue revives a blocked item, resuming the SAME Claude
+    /// session: the worker checkpointed before blocking, so the next dispatch resumes
+    /// that session (the worker then runs `claude --resume`).
+    #[tokio::test]
+    async fn needs_human_input_blocks_then_resumes_same_session_on_reply() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        };
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-p5-block"), 1)
+            .await
+            .unwrap();
+        let work_item_id = match record::enqueue(&pool, &coder_item(repo, "issue#1"))
+            .await
+            .unwrap()
+        {
+            record::EnqueueOutcome::Inserted(id) => id,
+            other => panic!("expected insert, got {other:?}"),
+        };
+        let attempt_id = lease_and_attempt(&pool, repo).await;
+
+        // The worker (authorized for this attempt) checkpoints, then hits high-stakes
+        // ambiguity and blocks with a question on the issue (resumable `blocked_input`).
+        let auth = record::TaskAuth {
+            work_item_id,
+            repo_id: repo,
+            role: record::Kind::Coder,
+            attempt_id: Some(attempt_id),
+        };
+        let gh = std::sync::Arc::new(factory_github::FakeGitHub::new().with_issue(
+            factory_github::IssueView {
+                number: 1,
+                title: "Ambiguous ask".into(),
+                body: "which way?".into(),
+                comments: vec![],
+            },
+        ));
+        let state = std::sync::Arc::new(tools_state(&pool, gh));
+        factory_tools::save_checkpoint(
+            &state,
+            &auth,
+            "ses-block",
+            "checkpoints/ses-block.snapshot",
+        )
+        .await
+        .unwrap();
+        factory_tools::escalate(
+            &state,
+            &auth,
+            "blocked_input",
+            "Which API should I use?",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            record::work_item_by_id(&pool, work_item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            record::State::Blocked,
+            "the item is parked awaiting a human"
+        );
+
+        // A human replies on the issue → intake revives the blocked item.
+        let revived = record::requeue_blocked(&pool, repo, "issue#1")
+            .await
+            .unwrap();
+        assert_eq!(revived, 1, "the blocked item was requeued");
+        assert_eq!(
+            record::work_item_by_id(&pool, work_item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            record::State::Queued,
+            "the revived item is queued for re-dispatch"
+        );
+
+        // The re-dispatch RESUMES the same session from the pre-block checkpoint.
+        assert_eq!(
+            resume_decision(&pool, work_item_id).await,
+            Some(factory_dispatcher::ResumeLaunch {
+                session_id: "ses-block".into(),
+                checkpoint_uri: "checkpoints/ses-block.snapshot".into(),
+            }),
+            "resumes the SAME session the worker checkpointed before blocking"
+        );
+    }
+
+    /// Kill a worker mid-run → the next dispatch resumes its same Claude session from the
+    /// checkpoint it saved (checkpoint → lease reclaim → resume-aware re-dispatch). The
+    /// worker's consumption of the resume launch is covered by the worker crate's
+    /// `run_task_resume_continues_the_same_session`.
+    #[tokio::test]
+    async fn crash_resume_continues_the_same_session() {
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-p5-crash"), 1)
+            .await
+            .unwrap();
+        let work_item_id = match record::enqueue(&pool, &coder_item(repo, "issue#2"))
+            .await
+            .unwrap()
+        {
+            record::EnqueueOutcome::Inserted(id) => id,
+            other => panic!("expected insert, got {other:?}"),
+        };
+        let attempt_id = lease_and_attempt(&pool, repo).await;
+        record::set_state(&pool, work_item_id, record::State::Running)
+            .await
+            .unwrap();
+
+        // The attempt checkpoints its session, then the worker crashes.
+        let auth = record::TaskAuth {
+            work_item_id,
+            repo_id: repo,
+            role: record::Kind::Coder,
+            attempt_id: Some(attempt_id),
+        };
+        let gh = std::sync::Arc::new(factory_github::FakeGitHub::new());
+        let state = std::sync::Arc::new(tools_state(&pool, gh));
+        factory_tools::save_checkpoint(
+            &state,
+            &auth,
+            "ses-crash",
+            "checkpoints/ses-crash.snapshot",
+        )
+        .await
+        .unwrap();
+
+        // The lease sweeper reclaims the crashed run: attempt finished `reclaimed`, item
+        // back to `queued` (a fresh checkpoint preserved on the attempt).
+        let leased = record::work_item_by_id(&pool, work_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        record::reclaim_running_attempt(&pool, work_item_id)
+            .await
+            .unwrap();
+        assert!(
+            record::reclaim_claim(
+                &pool,
+                work_item_id,
+                leased.lease_expires_at,
+                record::State::Queued
+            )
+            .await
+            .unwrap(),
+            "the crashed lease was reclaimed"
+        );
+
+        // The next dispatch resumes the crashed session from its checkpoint.
+        assert_eq!(
+            resume_decision(&pool, work_item_id).await,
+            Some(factory_dispatcher::ResumeLaunch {
+                session_id: "ses-crash".into(),
+                checkpoint_uri: "checkpoints/ses-crash.snapshot".into(),
+            }),
+            "the re-dispatch resumes the same session"
+        );
+    }
+
+    /// Terminal records past the retention window are purged; active work and
+    /// recently-terminal work are untouched. (Record-purge half of retention; the Blob
+    /// lifecycle is P7.)
+    #[tokio::test]
+    async fn retention_aging_removes_only_terminal_records() {
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = record::upsert_repo(&pool, "acme", &unique("e2e-retention"), 1)
+            .await
+            .unwrap();
+        let insert = |subject: &'static str| {
+            let pool = pool.clone();
+            async move {
+                match record::enqueue(&pool, &coder_item(repo, subject))
+                    .await
+                    .unwrap()
+                {
+                    record::EnqueueOutcome::Inserted(id) => id,
+                    other => panic!("expected insert, got {other:?}"),
+                }
+            }
+        };
+        let old_done = insert("issue#1").await;
+        let recent_done = insert("issue#2").await;
+        let active = insert("issue#3").await;
+        record::set_state(&pool, old_done, record::State::Succeeded)
+            .await
+            .unwrap();
+        record::set_state(&pool, recent_done, record::State::Failed)
+            .await
+            .unwrap();
+        // Backdate only the old terminal item past the retention window.
+        sqlx::query("UPDATE work_items SET updated_at = now() - interval '40 days' WHERE id = $1")
+            .bind(old_done)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+        let purged = record::purge_terminal(&pool, cutoff).await.unwrap();
+        assert!(purged >= 1, "at least our aged terminal item was purged");
+
+        assert!(
+            record::work_item_by_id(&pool, old_done)
+                .await
+                .unwrap()
+                .is_none(),
+            "the aged terminal record is purged"
+        );
+        assert!(
+            record::work_item_by_id(&pool, recent_done)
+                .await
+                .unwrap()
+                .is_some(),
+            "a recently-terminal record is kept"
+        );
+        assert!(
+            record::work_item_by_id(&pool, active)
+                .await
+                .unwrap()
+                .is_some(),
+            "active work is never purged"
+        );
     }
 }

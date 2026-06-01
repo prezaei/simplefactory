@@ -179,6 +179,163 @@ pub async fn coordinator_tick(pool: &record::Pool, gh: &dyn GitHubClient) -> any
     Ok(reacted)
 }
 
+/// The outcome of reclaiming one expired-lease item.
+enum ReclaimResult {
+    /// Requeued for a fresh attempt (under the retry cap).
+    Requeued,
+    /// Escalated `retries_exhausted` (at/over the retry cap) — terminal.
+    Escalated,
+    /// Lost the claim race (another sweeper reclaimed it, a heartbeat extended the
+    /// lease, or it raced to terminal) — nothing to do.
+    Skipped,
+}
+
+/// One lease-sweeper pass: reclaim every work item whose lease expired (or whose run
+/// exceeded the wall-clock cap). For each, finish the lapsed attempt as `reclaimed`,
+/// revoke its tokens, and either requeue it (under the retry cap) or escalate
+/// `retries_exhausted` (at/over the cap, terminal). Returns `(reclaimed, escalated)`
+/// where `reclaimed` counts every item acted on and `escalated` the escalated subset.
+///
+/// Per-item error isolation (like [`coordinator_tick`]): a failure on one item is
+/// logged and the sweep continues. Repo config is cached per pass for the retry cap +
+/// escalation assignee; an item whose repo has no usable config is still reclaimed at
+/// the platform-default cap (its escalation, if any, records the row + terminalizes the
+/// item but posts no GitHub comment — there is no repo identity to post to).
+pub async fn sweeper_tick(
+    pool: &record::Pool,
+    gh: &dyn GitHubClient,
+    wall_clock_cap_secs: f64,
+) -> anyhow::Result<(usize, usize)> {
+    let items = record::fetch_expired_lease_items(pool, wall_clock_cap_secs).await?;
+    tracing::info!(
+        count = items.len(),
+        wall_clock_cap_secs,
+        "sweeper tick: scanning expired leases"
+    );
+
+    let mut repo_cache: HashMap<Uuid, Option<Arc<(RepoIdent, Config)>>> = HashMap::new();
+    let mut reclaimed = 0usize;
+    let mut escalated = 0usize;
+    for item in items {
+        let repo = match repo_cache.get(&item.repo_id) {
+            Some(cached) => cached.clone(),
+            None => match load_repo_and_config(pool, item.repo_id).await {
+                Ok(loaded) => {
+                    let loaded = loaded.map(Arc::new);
+                    repo_cache.insert(item.repo_id, loaded.clone());
+                    loaded
+                }
+                Err(e) => {
+                    tracing::error!(work_item = %item.id, repo_id = %item.repo_id, error = %e, "loading repo config failed; skipping reclaim");
+                    continue;
+                }
+            },
+        };
+        match reclaim_item(pool, gh, &item, repo).await {
+            Ok(ReclaimResult::Requeued) => reclaimed += 1,
+            Ok(ReclaimResult::Escalated) => {
+                reclaimed += 1;
+                escalated += 1;
+            }
+            Ok(ReclaimResult::Skipped) => {
+                tracing::info!(work_item = %item.id, "expired item already reclaimed/extended by another path; skipped");
+            }
+            Err(e) => {
+                tracing::error!(work_item = %item.id, error = %e, "reclaiming expired item failed");
+            }
+        }
+    }
+    tracing::info!(reclaimed, escalated, "sweeper tick complete");
+    Ok((reclaimed, escalated))
+}
+
+/// Reclaim one expired-lease item atomically: claim it (optimistic on the observed
+/// lease expiry, serialized per issue with the coordinator's reaction), finish its
+/// running attempt, revoke its tokens, and requeue-or-escalate by the retry cap. The
+/// claim's expiry guard + `state IN ('leased','running')` make this exactly-once: a
+/// racing sweeper, a heartbeat that extended the lease, or a re-lease all lose the claim.
+async fn reclaim_item(
+    pool: &record::Pool,
+    gh: &dyn GitHubClient,
+    item: &WorkItem,
+    repo_and_config: Option<Arc<(RepoIdent, Config)>>,
+) -> anyhow::Result<ReclaimResult> {
+    // The retry cap (and, for an escalation, the assignee + repo identity) come from the
+    // repo config. With no usable config, reclaim at the platform-default cap; an
+    // escalation still terminalizes the item but can post no GitHub comment.
+    let retry_cap = i64::from(
+        repo_and_config
+            .as_ref()
+            .map(|rc| effective_retry_cap(&rc.1))
+            .unwrap_or(DEFAULT_RETRY_CAP),
+    );
+    // The CR (if any) for escalation targeting, loaded ONCE before the tx (C4).
+    let cr = load_cr_for_item(pool, item).await?;
+    let escalating = i64::from(item.attempt_count) >= retry_cap;
+    let to_state = if escalating {
+        State::Escalated
+    } else {
+        State::Queued
+    };
+
+    let lock_key = issue_lock_key(item, cr.as_ref());
+    let mut tx = pool.begin().await?;
+    record::issue_advisory_lock(&mut tx, item.repo_id, lock_key).await?;
+
+    // Claim the lease optimistically on its observed expiry — exactly one caller wins.
+    if !record::reclaim_claim(&mut *tx, item.id, item.lease_expires_at, to_state).await? {
+        tx.rollback().await?;
+        return Ok(ReclaimResult::Skipped);
+    }
+    // We own the reclaim: finish the lapsed attempt and revoke its tokens.
+    record::reclaim_running_attempt(&mut *tx, item.id).await?;
+    let revoked = record::revoke_task_tokens(&mut *tx, item.id).await?;
+    tracing::info!(work_item = %item.id, attempt_count = item.attempt_count, retry_cap, escalating, revoked, "reclaimed expired lease");
+
+    let result = if escalating {
+        let (comment_target, assign_issue) = escalation_target(item, cr.as_ref());
+        let post = escalate(
+            &mut tx,
+            item,
+            Escalation {
+                comment_target,
+                assign_issue,
+                reason: "retries_exhausted",
+                context: format!("lease reclaimed after {} attempts", item.attempt_count),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        match repo_and_config {
+            Some(rc) => {
+                let (ident, config) = rc.as_ref();
+                let repo = RepoRef::new(
+                    ident.owner.clone(),
+                    ident.name.clone(),
+                    ident.installation_id,
+                );
+                run_post_commit(
+                    gh,
+                    &repo,
+                    item,
+                    config.settings.escalation_assignee.as_deref(),
+                    post,
+                )
+                .await?;
+            }
+            None => {
+                tracing::warn!(work_item = %item.id, "reclaim escalated retries_exhausted but repo has no config; recorded escalation without a GitHub comment");
+            }
+        }
+        ReclaimResult::Escalated
+    } else {
+        tx.commit().await?;
+        tracing::info!(work_item = %item.id, next_attempt = item.attempt_count + 1, "reclaimed lease requeued for retry");
+        ReclaimResult::Requeued
+    };
+    Ok(result)
+}
+
 /// Decide and apply the next step for one terminal item. Returns whether THIS
 /// caller won the react claim (and therefore applied the decision).
 ///

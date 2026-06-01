@@ -385,21 +385,105 @@ pub async fn set_state(pool: &Pool, id: Uuid, state: State) -> Result<bool> {
     Ok(updated)
 }
 
-/// Reclaim work items whose lease has expired: return them to `queued`, clear
-/// the lease, and count the lapsed attempt. Covers both `leased` (never started)
-/// and `running` (started then the worker crashed/hung) — both hold a cap slot,
-/// so both must be reclaimable. Returns the number reclaimed.
-pub async fn reclaim_expired(pool: &Pool) -> Result<u64> {
-    let result = sqlx::query(
-        "UPDATE work_items
-            SET state = 'queued', lease_owner = NULL, lease_expires_at = NULL,
-                attempt_count = attempt_count + 1, updated_at = now()
-          WHERE state IN ('leased', 'running') AND lease_expires_at < now()",
+/// Find work items the lease sweeper should reclaim: those `leased`/`running`
+/// whose lease has expired OR whose running attempt has exceeded the absolute
+/// wall-clock cap `wall_clock_cap_secs` (a stuck-but-alive worker that keeps
+/// heart-beating extends its lease forever, so the cap is the backstop). Both
+/// `leased` (never started) and `running` (started then crashed/hung) hold a cap
+/// slot, so both are reclaimable. Returns the matching work items (the per-item
+/// reclaim — finish attempt, revoke tokens, requeue-or-escalate — is the
+/// coordinator's sweeper, which re-validates each one atomically via
+/// [`reclaim_claim`] so this read need not be in a transaction).
+pub async fn fetch_expired_lease_items(
+    pool: &Pool,
+    wall_clock_cap_secs: f64,
+) -> Result<Vec<WorkItem>> {
+    let rows = sqlx::query(
+        "SELECT w.id, w.repo_id, w.kind, w.worker_name, w.trigger, w.subject_ref,
+                w.correlation_id, w.state, w.attempt_count, w.loop_count, w.config_sha,
+                w.lease_owner, w.lease_expires_at, w.updated_at
+           FROM work_items w
+          WHERE w.state IN ('leased', 'running')
+            AND (
+              w.lease_expires_at < now()
+              OR EXISTS (
+                SELECT 1 FROM attempts a
+                 WHERE a.work_item_id = w.id AND a.status = 'running'
+                   AND a.started_at < now() - make_interval(secs => $1)
+              )
+            )
+          ORDER BY w.lease_expires_at",
     )
-    .execute(pool)
+    .bind(wall_clock_cap_secs)
+    .fetch_all(pool)
+    .await?;
+    let items: Vec<WorkItem> = rows.into_iter().map(map_work_item).collect::<Result<_>>()?;
+    tracing::info!(
+        expired = items.len(),
+        wall_clock_cap_secs,
+        "fetched expired-lease items for sweep"
+    );
+    Ok(items)
+}
+
+/// Atomically claim an expired-lease item for reclaim, moving it to `to_state`
+/// (`Queued` to requeue, `Escalated` to terminalize), bumping `attempt_count`, and
+/// clearing the lease. Returns `true` only for the caller that wins.
+///
+/// `expected_expiry` is the `lease_expires_at` observed by [`fetch_expired_lease_items`]:
+/// the guard `lease_expires_at IS NOT DISTINCT FROM expected` makes this optimistic —
+/// if a heartbeat extended the lease, or another sweeper replica already reclaimed and
+/// the dispatcher re-leased it (new expiry), the value differs and the claim no-ops
+/// (`false`). That, plus the `state IN ('leased','running')` guard (a terminal item is
+/// never resurrected — see [`set_state`]), gives exactly-once reclaim without a row lock.
+/// Executor-generic so the sweeper binds it, the attempt-finish, and the token-revoke
+/// into one transaction.
+pub async fn reclaim_claim(
+    executor: impl sqlx::PgExecutor<'_>,
+    work_item_id: Uuid,
+    expected_expiry: Option<DateTime<Utc>>,
+    to_state: State,
+) -> Result<bool> {
+    let row = sqlx::query(
+        "UPDATE work_items
+            SET state = $3,
+                attempt_count = attempt_count + 1,
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                available_at = CASE WHEN $3 = 'queued' THEN now() ELSE available_at END,
+                reacted = CASE WHEN $3 = 'queued' THEN false ELSE reacted END,
+                updated_at = now()
+          WHERE id = $1
+            AND state IN ('leased', 'running')
+            AND lease_expires_at IS NOT DISTINCT FROM $2
+         RETURNING id",
+    )
+    .bind(work_item_id)
+    .bind(expected_expiry)
+    .bind(to_state.as_str())
+    .fetch_optional(executor)
+    .await?;
+    let claimed = row.is_some();
+    tracing::info!(work_item = %work_item_id, to_state = to_state.as_str(), claimed, "reclaim claim");
+    Ok(claimed)
+}
+
+/// Mark a work item's still-`running` attempt as `reclaimed` (the lease lapsed
+/// before it finished). Returns the number of attempt rows updated (0 or 1).
+/// Executor-generic so it runs inside the sweeper's reclaim transaction.
+pub async fn reclaim_running_attempt(
+    executor: impl sqlx::PgExecutor<'_>,
+    work_item_id: Uuid,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "UPDATE attempts SET status = 'reclaimed', ended_at = now()
+          WHERE work_item_id = $1 AND status = 'running'",
+    )
+    .bind(work_item_id)
+    .execute(executor)
     .await?;
     let n = result.rows_affected();
-    tracing::info!(reclaimed = n, "reclaim sweep");
+    tracing::info!(%work_item_id, reclaimed_attempts = n, "reclaimed running attempt");
     Ok(n)
 }
 
@@ -813,12 +897,15 @@ pub async fn resolve_task_token(pool: &Pool, token_hash: &str) -> Result<Option<
 
 /// Revoke every token for a work item (task ended or lease reclaimed). Returns the
 /// number revoked.
-pub async fn revoke_task_tokens(pool: &Pool, work_item_id: Uuid) -> Result<u64> {
+pub async fn revoke_task_tokens(
+    executor: impl sqlx::PgExecutor<'_>,
+    work_item_id: Uuid,
+) -> Result<u64> {
     let result = sqlx::query(
         "UPDATE task_tokens SET revoked = true WHERE work_item_id = $1 AND NOT revoked",
     )
     .bind(work_item_id)
-    .execute(pool)
+    .execute(executor)
     .await?;
     let n = result.rows_affected();
     tracing::info!(%work_item_id, revoked = n, "revoked task tokens");
@@ -867,6 +954,82 @@ pub async fn finish_attempt(
     let updated = row.is_some();
     tracing::info!(attempt = %attempt_id, status = status.as_str(), updated, "finish attempt");
     Ok(updated)
+}
+
+/// A resumable checkpoint recovered for a work item: the Claude session to resume
+/// and the Blob URI of its worktree snapshot, plus how many of this item's attempts
+/// have carried a session (the resume budget — see [`last_checkpoint_for_item`]).
+#[derive(Debug, Clone)]
+pub struct CheckpointInfo {
+    pub session_id: String,
+    pub checkpoint_uri: String,
+    /// Number of attempts for this work item that recorded a session id — i.e. how many
+    /// times the session has already been carried/resumed. The dispatcher bounds resumes
+    /// against this (`resume_count >= cap` → start a fresh attempt instead).
+    pub resume_count: u64,
+}
+
+/// Persist the Claude session id + worktree checkpoint URI onto an attempt (the
+/// worker reports these via the Tools `save_checkpoint` call as the run progresses).
+/// Last write wins (a later checkpoint supersedes an earlier one). Returns whether a
+/// row was updated.
+pub async fn save_attempt_checkpoint(
+    pool: &Pool,
+    attempt_id: Uuid,
+    session_id: &str,
+    checkpoint_uri: &str,
+) -> Result<bool> {
+    let row = sqlx::query(
+        "UPDATE attempts SET session_id = $2, checkpoint_uri = $3 WHERE id = $1 RETURNING id",
+    )
+    .bind(attempt_id)
+    .bind(session_id)
+    .bind(checkpoint_uri)
+    .fetch_optional(pool)
+    .await?;
+    let updated = row.is_some();
+    tracing::info!(attempt = %attempt_id, session_id, updated, "saved attempt checkpoint");
+    Ok(updated)
+}
+
+/// The most recent resumable checkpoint for a work item (its latest attempt that
+/// recorded both a `session_id` and a `checkpoint_uri`), with the resume budget. `None`
+/// when no attempt has checkpointed — the dispatcher then launches a fresh attempt.
+pub async fn last_checkpoint_for_item(
+    pool: &Pool,
+    work_item_id: Uuid,
+) -> Result<Option<CheckpointInfo>> {
+    let row = sqlx::query(
+        "SELECT a.session_id, a.checkpoint_uri,
+                (SELECT count(*) FROM attempts a2
+                  WHERE a2.work_item_id = $1 AND a2.session_id IS NOT NULL) AS resume_count
+           FROM attempts a
+          WHERE a.work_item_id = $1
+            AND a.session_id IS NOT NULL
+            AND a.checkpoint_uri IS NOT NULL
+          ORDER BY a.started_at DESC
+          LIMIT 1",
+    )
+    .bind(work_item_id)
+    .fetch_optional(pool)
+    .await?;
+    let info = match row {
+        Some(r) => {
+            let resume_count: i64 = r.try_get("resume_count")?;
+            let info = CheckpointInfo {
+                session_id: r.try_get("session_id")?,
+                checkpoint_uri: r.try_get("checkpoint_uri")?,
+                resume_count: resume_count.max(0) as u64,
+            };
+            tracing::info!(%work_item_id, session_id = %info.session_id, resume_count = info.resume_count, "found resumable checkpoint");
+            Some(info)
+        }
+        None => {
+            tracing::info!(%work_item_id, "no resumable checkpoint");
+            None
+        }
+    };
+    Ok(info)
 }
 
 /// A change request tracked in the record book.

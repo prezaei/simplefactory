@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 factory-telemetry.workspace = true
+factory-blob.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 base64 = "0.22"
@@ -26,10 +27,9 @@ uuid.workspace = true
 tokio = { workspace = true, features = ["process", "fs", "io-util"] }
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 factory-tools.workspace = true
 factory-record.workspace = true
 factory-github.workspace = true
-factory-blob.workspace = true
 factory-config.workspace = true
 axum.workspace = true

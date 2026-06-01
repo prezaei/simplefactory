@@ -19,6 +19,41 @@ async fn pool_or_skip() -> Option<record::Pool> {
     Some(pool)
 }
 
+/// A wall-clock cap so large only *lease expiry* ever triggers, but still safely
+/// inside Postgres's timestamp range (`now() - cap` must not underflow): ~100 years.
+const NEVER_WALL_CLOCK: f64 = 3.15e9;
+
+/// `fetch_expired_lease_items` and `sweep_expired` are GLOBAL (they scan/mutate every
+/// repo's expired leases in the shared DB). Tests that *observe* the global expired set
+/// — asserting their own expired items are still fetchable, or that a specific
+/// `reclaim_claim` wins — must not have a parallel test's sweep reclaim those items out
+/// from under them. They (and every sweep) serialize on this guard; the per-item reclaim
+/// tests that only assert their own item's final state don't need it (their assertions
+/// hold whichever sweep wins).
+static EXPIRED_LEASE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Record-level lease sweep used by the reclaim tests: requeue every expired-lease
+/// item (the coordinator's `sweeper_tick` layers the retry-cap escalate decision on
+/// top of these same primitives). [`NEVER_WALL_CLOCK`] means only *lease expiry*
+/// triggers here, matching the old global `reclaim_expired` one-shot these tests
+/// were written against. Holds [`EXPIRED_LEASE_SERIAL`] so it can't reclaim a
+/// concurrent observing test's items mid-assertion.
+async fn sweep_expired(pool: &record::Pool) {
+    let _guard = EXPIRED_LEASE_SERIAL.lock().await;
+    let items = record::fetch_expired_lease_items(pool, NEVER_WALL_CLOCK)
+        .await
+        .unwrap();
+    for item in items {
+        record::reclaim_running_attempt(pool, item.id)
+            .await
+            .unwrap();
+        record::revoke_task_tokens(pool, item.id).await.unwrap();
+        record::reclaim_claim(pool, item.id, item.lease_expires_at, State::Queued)
+            .await
+            .unwrap();
+    }
+}
+
 fn coder_item(repo: Uuid, subject: &str) -> NewWorkItem {
     NewWorkItem {
         repo_id: repo,
@@ -168,10 +203,10 @@ async fn reclaim_returns_expired_lease_to_queue() {
     let leased = record::lease_next(&pool, &req).await.unwrap().unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // reclaim_expired is global (the sweeper sweeps all repos), and parallel
-    // reclaim tests can sweep each other's expired items — so don't assert its
-    // return count; assert OUR item is back in the queue below.
-    record::reclaim_expired(&pool).await.unwrap();
+    // The sweep is global (it sweeps all repos), and parallel reclaim tests can
+    // sweep each other's expired items — so don't assert a swept count; assert OUR
+    // item is back in the queue below.
+    sweep_expired(&pool).await;
 
     // It's leasable again, and the lapsed attempt was counted.
     let released = record::lease_next(&pool, &lease_req(repo, 10, 10))
@@ -372,7 +407,7 @@ async fn reclaim_also_recovers_expired_running_items() {
 
     // Global sweep (count not asserted — parallel reclaim tests share it); the
     // re-lease below proves our running item was recovered.
-    record::reclaim_expired(&pool).await.unwrap();
+    sweep_expired(&pool).await;
     let released = record::lease_next(&pool, &lease_req(repo, 10, 10))
         .await
         .unwrap()
@@ -558,7 +593,7 @@ async fn blocked_item_is_not_reclaimed_and_can_be_requeued() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Sweeper does not touch blocked items -> still not leasable.
-    record::reclaim_expired(&pool).await.unwrap();
+    sweep_expired(&pool).await;
     assert!(record::lease_next(&pool, &lease_req(repo, 10, 10))
         .await
         .unwrap()
@@ -594,7 +629,7 @@ async fn valid_lease_is_not_reclaimed() {
         .unwrap()
         .unwrap();
 
-    record::reclaim_expired(&pool).await.unwrap();
+    sweep_expired(&pool).await;
 
     // Still leased (not requeued): nothing is leasable, and the owner can heartbeat.
     assert!(record::lease_next(&pool, &lease_req(repo, 10, 10))
@@ -1216,4 +1251,318 @@ async fn upsert_cr_rework_path_repoints_and_reopens_non_terminal_cr() {
         Some(item_b),
         "rework coder remains the owner"
     );
+}
+
+// ===========================================================================
+// P5: lease sweeper + crash-resume checkpoint primitives.
+// ===========================================================================
+
+#[tokio::test]
+async fn fetch_expired_includes_leased_and_running_excludes_valid() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    // Hold the global expired-lease guard so no parallel sweep reclaims our items
+    // before we assert they are fetchable.
+    let _serial = EXPIRED_LEASE_SERIAL.lock().await;
+    let repo = record::upsert_repo(&pool, "acme", &unique("fetch-expired"), 1)
+        .await
+        .unwrap();
+    // An expired LEASED item, a still-RUNNING item with an expired lease, and a
+    // VALID (future-expiry) leased item.
+    record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap();
+    record::enqueue(&pool, &coder_item(repo, "issue#2"))
+        .await
+        .unwrap();
+    record::enqueue(&pool, &coder_item(repo, "issue#3"))
+        .await
+        .unwrap();
+    let mut expired_req = lease_req(repo, 10, 10);
+    expired_req.ttl_secs = 0.0;
+    let leased = record::lease_next(&pool, &expired_req)
+        .await
+        .unwrap()
+        .unwrap();
+    let running = record::lease_next(&pool, &expired_req)
+        .await
+        .unwrap()
+        .unwrap();
+    record::set_state(&pool, running.id, State::Running)
+        .await
+        .unwrap();
+    let valid = record::lease_next(&pool, &lease_req(repo, 10, 10)) // ttl 60s, future
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let ids: std::collections::HashSet<Uuid> =
+        record::fetch_expired_lease_items(&pool, NEVER_WALL_CLOCK)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+    assert!(ids.contains(&leased.id), "expired leased item is swept");
+    assert!(ids.contains(&running.id), "expired running item is swept");
+    assert!(
+        !ids.contains(&valid.id),
+        "a live (future-expiry) lease is NOT swept"
+    );
+}
+
+#[tokio::test]
+async fn fetch_expired_wall_clock_catches_old_running_attempt() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _serial = EXPIRED_LEASE_SERIAL.lock().await;
+    let repo = record::upsert_repo(&pool, "acme", &unique("wall-clock"), 1)
+        .await
+        .unwrap();
+    record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap();
+    // A VALID lease (ttl 60s, future) — lease-expiry alone would never sweep it.
+    let leased = record::lease_next(&pool, &lease_req(repo, 10, 10))
+        .await
+        .unwrap()
+        .unwrap();
+    record::set_state(&pool, leased.id, State::Running)
+        .await
+        .unwrap();
+    let attempt = record::start_attempt(&pool, leased.id, None).await.unwrap();
+    // Backdate the running attempt so it has been going for an hour.
+    sqlx::query("UPDATE attempts SET started_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(attempt)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Under a huge wall-clock cap the still-valid lease is NOT swept...
+    let big: std::collections::HashSet<Uuid> =
+        record::fetch_expired_lease_items(&pool, NEVER_WALL_CLOCK)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+    assert!(
+        !big.contains(&leased.id),
+        "valid lease under a huge wall-clock cap is not swept"
+    );
+    // ...but a 60s cap catches the hour-old running attempt despite the live lease.
+    let capped: std::collections::HashSet<Uuid> = record::fetch_expired_lease_items(&pool, 60.0)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert!(
+        capped.contains(&leased.id),
+        "wall-clock cap reclaims a stuck-but-alive run"
+    );
+}
+
+#[tokio::test]
+async fn reclaim_claim_is_optimistic_and_exactly_once() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _serial = EXPIRED_LEASE_SERIAL.lock().await;
+    let repo = record::upsert_repo(&pool, "acme", &unique("reclaim-claim"), 1)
+        .await
+        .unwrap();
+    record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap();
+    let mut req = lease_req(repo, 10, 10);
+    req.ttl_secs = 0.0;
+    let leased = record::lease_next(&pool, &req).await.unwrap().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // A claim with the WRONG expected expiry no-ops (optimistic-concurrency guard).
+    assert!(
+        !record::reclaim_claim(&pool, leased.id, Some(Utc::now()), State::Queued)
+            .await
+            .unwrap(),
+        "a stale expected_expiry must not claim"
+    );
+    // The correct observed expiry wins exactly once.
+    assert!(
+        record::reclaim_claim(&pool, leased.id, leased.lease_expires_at, State::Queued)
+            .await
+            .unwrap(),
+        "the observed expiry claims the item"
+    );
+    // A second claim with the same (now stale) expiry loses: the item is queued, no
+    // longer leased/running, so it can't be reclaimed twice.
+    assert!(
+        !record::reclaim_claim(&pool, leased.id, leased.lease_expires_at, State::Queued)
+            .await
+            .unwrap(),
+        "an already-reclaimed item is not reclaimed again"
+    );
+    let after = record::work_item_by_id(&pool, leased.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, State::Queued);
+    assert_eq!(after.attempt_count, 1, "exactly one lapse counted");
+}
+
+#[tokio::test]
+async fn reclaim_running_attempt_marks_running_reclaimed_once() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("reclaim-attempt"), 1)
+        .await
+        .unwrap();
+    record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap();
+    let leased = record::lease_next(&pool, &lease_req(repo, 10, 10))
+        .await
+        .unwrap()
+        .unwrap();
+    let attempt = record::start_attempt(&pool, leased.id, None).await.unwrap();
+
+    assert_eq!(
+        record::reclaim_running_attempt(&pool, leased.id)
+            .await
+            .unwrap(),
+        1,
+        "the running attempt is reclaimed"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM attempts WHERE id = $1")
+        .bind(attempt)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "reclaimed");
+    assert_eq!(
+        record::reclaim_running_attempt(&pool, leased.id)
+            .await
+            .unwrap(),
+        0,
+        "an already-reclaimed attempt is not touched again"
+    );
+}
+
+#[tokio::test]
+async fn save_and_load_checkpoint_roundtrip_and_overwrite() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("checkpoint"), 1)
+        .await
+        .unwrap();
+    record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap();
+    let leased = record::lease_next(&pool, &lease_req(repo, 10, 10))
+        .await
+        .unwrap()
+        .unwrap();
+    let attempt = record::start_attempt(&pool, leased.id, None).await.unwrap();
+
+    assert!(
+        record::save_attempt_checkpoint(&pool, attempt, "ses-1", "cp://1")
+            .await
+            .unwrap()
+    );
+    let info = record::last_checkpoint_for_item(&pool, leased.id)
+        .await
+        .unwrap()
+        .expect("checkpoint present");
+    assert_eq!(info.session_id, "ses-1");
+    assert_eq!(info.checkpoint_uri, "cp://1");
+    assert_eq!(info.resume_count, 1);
+
+    // Last write wins.
+    assert!(
+        record::save_attempt_checkpoint(&pool, attempt, "ses-2", "cp://2")
+            .await
+            .unwrap()
+    );
+    let info = record::last_checkpoint_for_item(&pool, leased.id)
+        .await
+        .unwrap()
+        .expect("checkpoint present");
+    assert_eq!(info.session_id, "ses-2");
+    assert_eq!(info.checkpoint_uri, "cp://2");
+    assert_eq!(info.resume_count, 1, "still one checkpointed attempt");
+}
+
+#[tokio::test]
+async fn last_checkpoint_none_when_no_session() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("no-checkpoint"), 1)
+        .await
+        .unwrap();
+    record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap();
+    let leased = record::lease_next(&pool, &lease_req(repo, 10, 10))
+        .await
+        .unwrap()
+        .unwrap();
+    // An attempt with no checkpoint saved.
+    record::start_attempt(&pool, leased.id, None).await.unwrap();
+    assert!(record::last_checkpoint_for_item(&pool, leased.id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn last_checkpoint_returns_latest_with_resume_count() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = record::upsert_repo(&pool, "acme", &unique("checkpoint-latest"), 1)
+        .await
+        .unwrap();
+    record::enqueue(&pool, &coder_item(repo, "issue#1"))
+        .await
+        .unwrap();
+    let leased = record::lease_next(&pool, &lease_req(repo, 10, 10))
+        .await
+        .unwrap()
+        .unwrap();
+    // Three attempts; only the 2nd and 3rd carry a session id.
+    let a1 = record::start_attempt(&pool, leased.id, None).await.unwrap();
+    let a2 = record::start_attempt(&pool, leased.id, None).await.unwrap();
+    let a3 = record::start_attempt(&pool, leased.id, None).await.unwrap();
+    // Deterministic ordering by started_at (now_v7 ids can tie within a ms).
+    for (id, ago) in [(a1, 3), (a2, 2), (a3, 1)] {
+        sqlx::query(&format!(
+            "UPDATE attempts SET started_at = now() - interval '{ago} minutes' WHERE id = $1"
+        ))
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    record::save_attempt_checkpoint(&pool, a2, "ses-2", "cp://2")
+        .await
+        .unwrap();
+    record::save_attempt_checkpoint(&pool, a3, "ses-3", "cp://3")
+        .await
+        .unwrap();
+
+    let info = record::last_checkpoint_for_item(&pool, leased.id)
+        .await
+        .unwrap()
+        .expect("checkpoint present");
+    assert_eq!(
+        info.session_id, "ses-3",
+        "the most recent session is returned"
+    );
+    assert_eq!(info.resume_count, 2, "two attempts carried a session id");
 }

@@ -398,6 +398,54 @@ async fn heartbeat_extends_the_lease() {
 }
 
 // ===========================================================================
+// save_checkpoint — persists the session + uri on the token's attempt (P5).
+// ===========================================================================
+
+#[tokio::test]
+async fn save_checkpoint_persists_to_the_attempt() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#71", FakeGitHub::new()).await;
+
+    let (status, body) = http_call(
+        fx.state.clone(),
+        &fx.raw_token,
+        "save_checkpoint",
+        json!({ "session_id": "ses-71", "checkpoint_uri": "checkpoints/ses-71.snapshot" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["saved"], json!(true));
+
+    // The pointer is now recoverable for a crash-resume re-dispatch.
+    let info = record::last_checkpoint_for_item(&pool, fx.work_item_id)
+        .await
+        .expect("query")
+        .expect("checkpoint persisted");
+    assert_eq!(info.session_id, "ses-71");
+    assert_eq!(info.checkpoint_uri, "checkpoints/ses-71.snapshot");
+}
+
+#[tokio::test]
+async fn save_checkpoint_without_attempt_errors() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let fx = fixture_with(&pool, "issue#72", FakeGitHub::new()).await;
+    let auth_no_attempt = TaskAuth {
+        attempt_id: None,
+        ..fx.auth.clone()
+    };
+    let err = factory_tools::save_checkpoint(&fx.state, &auth_no_attempt, "s", "u")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no attempt"));
+}
+
+// ===========================================================================
 // 7. escalate — exactly one escalation, idempotent, work item escalated
 // ===========================================================================
 

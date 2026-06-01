@@ -101,6 +101,7 @@ pub enum Tool {
     AppendTranscript,
     RecordOutcome,
     Heartbeat,
+    SaveCheckpoint,
     Escalate,
 }
 
@@ -119,6 +120,7 @@ impl Tool {
             "append_transcript" => Tool::AppendTranscript,
             "record_outcome" => Tool::RecordOutcome,
             "heartbeat" => Tool::Heartbeat,
+            "save_checkpoint" => Tool::SaveCheckpoint,
             "escalate" => Tool::Escalate,
             _ => return None,
         })
@@ -137,6 +139,7 @@ impl Tool {
             Tool::AppendTranscript => "append_transcript",
             Tool::RecordOutcome => "record_outcome",
             Tool::Heartbeat => "heartbeat",
+            Tool::SaveCheckpoint => "save_checkpoint",
             Tool::Escalate => "escalate",
         }
     }
@@ -205,6 +208,15 @@ pub async fn dispatch(state: &ToolsState, auth: &TaskAuth, tool: Tool, args: &Va
             .await
         }
         Tool::Heartbeat => heartbeat(state, auth).await,
+        Tool::SaveCheckpoint => {
+            save_checkpoint(
+                state,
+                auth,
+                arg_str(args, "session_id")?,
+                arg_str(args, "checkpoint_uri")?,
+            )
+            .await
+        }
         Tool::Escalate => {
             escalate(
                 state,
@@ -662,6 +674,26 @@ pub async fn heartbeat(state: &ToolsState, auth: &TaskAuth) -> ToolResult {
         record::heartbeat_task(&state.pool, auth.work_item_id, HEARTBEAT_TTL_SECS).await?;
     tracing::info!(work_item = %auth.work_item_id, extended = expires.is_some(), "heartbeat");
     Ok(json!({ "lease_expires_at": expires }))
+}
+
+/// Persist the Claude session id + worktree checkpoint URI onto this task's attempt
+/// (P5 crash-resume). The attempt id is carried on the token, so a task can only ever
+/// checkpoint its own attempt. A token minted without an attempt id (should not happen
+/// for a worker task) is a bad request rather than a silent no-op.
+pub async fn save_checkpoint(
+    state: &ToolsState,
+    auth: &TaskAuth,
+    session_id: &str,
+    checkpoint_uri: &str,
+) -> ToolResult {
+    let attempt_id = auth
+        .attempt_id
+        .ok_or_else(|| ToolError::BadRequest("token has no attempt to checkpoint".to_string()))?;
+    let saved =
+        record::save_attempt_checkpoint(&state.pool, attempt_id, session_id, checkpoint_uri)
+            .await?;
+    tracing::info!(work_item = %auth.work_item_id, %attempt_id, session_id, saved, "save_checkpoint");
+    Ok(json!({ "saved": saved }))
 }
 
 /// Escalate to a human — the single human channel. The invariant is ONE escalation
@@ -1347,6 +1379,7 @@ mod tests {
             Tool::AppendTranscript,
             Tool::RecordOutcome,
             Tool::Heartbeat,
+            Tool::SaveCheckpoint,
             Tool::Escalate,
         ] {
             assert_eq!(Tool::parse(t.as_str()), Some(t), "roundtrip {}", t.as_str());
