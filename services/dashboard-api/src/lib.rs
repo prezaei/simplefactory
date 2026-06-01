@@ -251,6 +251,7 @@ async fn stream_handler(
         name,
         interval,
         first: true,
+        served: false,
     };
     let stream = futures::stream::unfold(seed, |mut s| async move {
         if s.first {
@@ -265,7 +266,14 @@ async fn stream_handler(
         let event = match build_snapshot(&s.pool, s.repo_id, &s.owner, &s.name).await {
             Ok(snap) => match serde_json::to_string(&snap) {
                 Ok(json) => {
-                    tracing::debug!(owner = %s.owner, name = %s.name, "SSE snapshot pushed");
+                    // First successful push → info (the live-view activity signal);
+                    // subsequent ticks → debug (avoid one info line/sec/client).
+                    if !s.served {
+                        s.served = true;
+                        tracing::info!(owner = %s.owner, name = %s.name, "SSE stream serving frames");
+                    } else {
+                        tracing::debug!(owner = %s.owner, name = %s.name, "SSE snapshot pushed");
+                    }
                     Event::default().data(json)
                 }
                 Err(e) => {
@@ -292,6 +300,10 @@ struct PollState {
     name: String,
     interval: Duration,
     first: bool,
+    /// Whether a snapshot has been successfully pushed yet — the first success logs at
+    /// info (the live-view "serving frames" signal); later ticks log at debug to avoid
+    /// one info line per second per client.
+    served: bool,
 }
 
 // ---- Read queries (all local to this crate; read-only) --------------------
