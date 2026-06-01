@@ -824,23 +824,32 @@ const IDEMPOTENCY_COMPLETE_ATTEMPTS: u32 = 3;
 /// are layered on top of this by [`compose_prompt`].
 fn role_default_prompt(role: record::Kind) -> &'static str {
     match role {
-        // The Manager/Reviewer terminal action is decided by the worker harness from a
+        // The Manager/Reviewer terminal action is decided by the worker HARNESS from a
         // trailing marker line in Claude's output, so the prompt MUST instruct Claude to
         // emit it as the final line (see the worker's `parse_manager_actionable` /
-        // `parse_reviewer_verdict`).
+        // `parse_reviewer_verdict`) AND to NOT perform the terminal action itself: the
+        // MCP tool set still exposes `post_comment`/`submit_review`/`escalate`, and if
+        // Claude called one, the harness would then do it again → a duplicate comment/
+        // review or a wrong escalation. So the prompt constrains Claude to read/analyze
+        // only and leave the terminal action to the harness.
         record::Kind::Manager => {
-            "You are a manager. Read the issue and triage it: decide whether it is an \
-             actionable software task Factory should code. End your response with a final \
-             line `ACTIONABLE: yes` (it is in scope — a coder will be assigned) or \
-             `ACTIONABLE: no` (out of scope / needs a human decision — it will be escalated)."
+            "You are a manager. Read the issue (using the read tools) and triage it: \
+             decide whether it is an actionable software task Factory should code. Do NOT \
+             post a comment, escalate, or call any state-changing tool — only read and \
+             analyze; the Factory worker performs the terminal action from your verdict. \
+             End your response with a final line `ACTIONABLE: yes` (it is in scope — a \
+             coder will be assigned) or `ACTIONABLE: no` (out of scope / needs a human \
+             decision — it will be escalated)."
         }
         record::Kind::Coder => {
             "You are a coder. Implement the task with tests, then open a change request."
         }
         record::Kind::Reviewer => {
-            "You are a reviewer. Review the change request's diff and checks. End your \
-             response with a final line `VERDICT: approve`, `VERDICT: request_changes`, or \
-             `VERDICT: comment`."
+            "You are a reviewer. Review the change request's diff and checks (using the \
+             read tools). Do NOT call `submit_review` or any state-changing tool — only \
+             read and analyze; the Factory worker submits the verdict from your final \
+             marker. End your response with a final line `VERDICT: approve`, \
+             `VERDICT: request_changes`, or `VERDICT: comment`."
         }
         record::Kind::Tester => {
             "You are a tester. Exercise the change and report whether the checks pass."
