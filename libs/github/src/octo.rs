@@ -56,7 +56,7 @@ impl OctocrabGitHub {
     /// Parse the App private key (PEM) into a `jsonwebtoken::EncodingKey`.
     fn encoding_key(&self) -> anyhow::Result<jsonwebtoken::EncodingKey> {
         jsonwebtoken::EncodingKey::from_rsa_pem(self.private_key_pem.as_bytes())
-            .map_err(|e| anyhow::anyhow!("invalid GITHUB_APP_PRIVATE_KEY: {e}"))
+            .map_err(|e| anyhow::anyhow!("invalid GITHUB_APP_PRIVATE_KEY: {e:?}"))
     }
 
     /// Build the App JWT client (authenticates as the GitHub App itself).
@@ -64,7 +64,7 @@ impl OctocrabGitHub {
         octocrab::Octocrab::builder()
             .app(octocrab::models::AppId(self.app_id), self.encoding_key()?)
             .build()
-            .map_err(|e| anyhow::anyhow!("building GitHub App client: {e}"))
+            .map_err(|e| anyhow::anyhow!("building GitHub App client: {e:?}"))
     }
 
     /// Build an installation-scoped client (authenticates as the installation).
@@ -74,7 +74,7 @@ impl OctocrabGitHub {
         let (client, _token) = app
             .installation_and_token(octocrab::models::InstallationId(installation_id))
             .await
-            .map_err(|e| anyhow::anyhow!("minting installation client: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("minting installation client: {e:?}"))?;
         Ok(client)
     }
 }
@@ -187,7 +187,7 @@ impl GitHubClient for OctocrabGitHub {
         let (_client, token) = app
             .installation_and_token(octocrab::models::InstallationId(installation_id))
             .await
-            .map_err(|e| anyhow::anyhow!("minting installation token: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("minting installation token: {e:?}"))?;
         Ok(token.expose_secret().to_owned())
     }
 
@@ -199,7 +199,7 @@ impl GitHubClient for OctocrabGitHub {
             .issues(&repo.owner, &repo.name)
             .get(id_u64(number)?)
             .await
-            .map_err(|e| anyhow::anyhow!("reading issue #{number}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("reading issue #{number}: {e:?}"))?;
         Ok(IssueView {
             number: issue.number as i64,
             title: issue.title,
@@ -220,7 +220,7 @@ impl GitHubClient for OctocrabGitHub {
             .pulls(&repo.owner, &repo.name)
             .get(number_u64)
             .await
-            .map_err(|e| anyhow::anyhow!("reading change request #{number}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("reading change request #{number}: {e:?}"))?;
         let head_sha = pr.head.sha.clone();
 
         // FIX 5: populate the changed-file list for real. The coordinator's
@@ -232,11 +232,11 @@ impl GitHubClient for OctocrabGitHub {
             .pulls(&repo.owner, &repo.name)
             .list_files(number_u64)
             .await
-            .map_err(|e| anyhow::anyhow!("listing files for change request #{number}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("listing files for change request #{number}: {e:?}"))?;
         let files: Vec<String> = client
             .all_pages(first)
             .await
-            .map_err(|e| anyhow::anyhow!("paginating files for change request #{number}: {e}"))?
+            .map_err(|e| anyhow::anyhow!("paginating files for change request #{number}: {e:?}"))?
             .into_iter()
             .map(|entry| entry.filename)
             .collect();
@@ -301,7 +301,7 @@ impl GitHubClient for OctocrabGitHub {
             .head(format!("{}:{}", repo.owner, req.head_branch))
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("listing change requests: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("listing change requests: {e:?}"))?;
         if let Some(it) = existing.items.into_iter().next() {
             tracing::info!(number = it.number, "reusing existing change request");
             return Ok(PrView {
@@ -315,7 +315,7 @@ impl GitHubClient for OctocrabGitHub {
             .body(&req.body)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("creating change request: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("creating change request: {e:?}"))?;
         tracing::info!(number = pr.number, "created change request");
         Ok(PrView {
             number: pr.number as i64,
@@ -342,7 +342,7 @@ impl GitHubClient for OctocrabGitHub {
             .issues(&repo.owner, &repo.name)
             .create_comment(id_u64(number)?, body)
             .await
-            .map_err(|e| anyhow::anyhow!("posting comment on #{number}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("posting comment on #{number}: {e:?}"))?;
         Ok(comment.id.0 as i64)
     }
 
@@ -358,7 +358,7 @@ impl GitHubClient for OctocrabGitHub {
             .issues(&repo.owner, &repo.name)
             .update_comment(octocrab::models::CommentId(id_u64(comment_id)?), body)
             .await
-            .map_err(|e| anyhow::anyhow!("updating comment {comment_id}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("updating comment {comment_id}: {e:?}"))?;
         Ok(())
     }
 
@@ -374,7 +374,7 @@ impl GitHubClient for OctocrabGitHub {
             .issues(&repo.owner, &repo.name)
             .add_assignees(id_u64(issue_number)?, &[assignee])
             .await
-            .map_err(|e| anyhow::anyhow!("assigning issue #{issue_number} to {assignee}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("assigning issue #{issue_number} to {assignee}: {e:?}"))?;
         Ok(())
     }
 
@@ -399,7 +399,7 @@ impl GitHubClient for OctocrabGitHub {
             .pulls(&repo.owner, &repo.name)
             .get(number_u64)
             .await
-            .map_err(|e| anyhow::anyhow!("reading change request #{number} for review: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("reading change request #{number} for review: {e:?}"))?;
         let head_sha = pr.head.sha.clone();
         use octocrab::models::pulls::ReviewAction;
         let event = match verdict {
@@ -438,7 +438,7 @@ impl GitHubClient for OctocrabGitHub {
                         anyhow::anyhow!("submitting review on #{number} (comment fallback): {e2}")
                     })?
             }
-            Err(e) => return Err(anyhow::anyhow!("submitting review on #{number}: {e}")),
+            Err(e) => return Err(anyhow::anyhow!("submitting review on #{number}: {e:?}")),
         };
         Ok(review.id.0 as i64)
     }
@@ -455,7 +455,7 @@ impl GitHubClient for OctocrabGitHub {
                     .pulls(&repo.owner, &repo.name)
                     .get(id_u64(n)?)
                     .await
-                    .map_err(|e| anyhow::anyhow!("reading change request #{n} head sha: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("reading change request #{n} head sha: {e:?}"))?;
                 pr.head.sha
             }
         };
@@ -480,7 +480,9 @@ impl GitHubClient for OctocrabGitHub {
                 .page(page)
                 .send()
                 .await
-                .map_err(|e| anyhow::anyhow!("listing check runs for {sha} (page {page}): {e}"))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("listing check runs for {sha} (page {page}): {e:?}")
+                })?;
             let total = runs.total_count;
             // Map each check run's conclusion to a `CheckConclusion`. A run with no
             // conclusion yet (queued/in_progress) is `Pending`; an unknown conclusion
@@ -512,7 +514,7 @@ impl GitHubClient for OctocrabGitHub {
         let status: CombinedStatus = client
             .get(&route, None::<&()>)
             .await
-            .map_err(|e| anyhow::anyhow!("reading combined commit status for {sha}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("reading combined commit status for {sha}: {e:?}"))?;
         // Only fold the combined status when there is ≥1 status context. GitHub reports
         // `state = "pending"` for a SHA with ZERO statuses, so without this guard a
         // no-status repo would roll up Pending forever — the empty case must stay green.
@@ -558,7 +560,7 @@ impl GitHubClient for OctocrabGitHub {
                 tracing::info!(path, git_ref, "file not found");
                 Ok(None)
             }
-            Err(e) => Err(anyhow::anyhow!("fetching file {path}@{git_ref}: {e}")),
+            Err(e) => Err(anyhow::anyhow!("fetching file {path}@{git_ref}: {e:?}")),
         }
     }
 }
