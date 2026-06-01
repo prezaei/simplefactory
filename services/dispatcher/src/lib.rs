@@ -20,10 +20,23 @@ use record::{Kind, LeaseRequest, Pool};
 use serde_json::json;
 use uuid::Uuid;
 
-/// Per-task lease/token TTL in seconds. The coordinator's lease sweeper (P5) reclaims
-/// leases that expire past this window, marking the attempt reclaimed and revoking the
-/// token, so a crashed worker's slot is freed and the item re-dispatched.
-const TASK_TTL_SECS: f64 = 900.0;
+/// Default per-task lease/token TTL in seconds. The coordinator's lease sweeper (P5)
+/// reclaims leases that expire past this window, marking the attempt reclaimed and
+/// revoking the token, so a crashed worker's slot is freed and the item re-dispatched.
+/// Overridable via `FACTORY_LEASE_TTL_SECS` (e.g. a shorter TTL makes crash-resume
+/// reclaim faster for a smoke; it must stay comfortably above the worker's heartbeat
+/// interval so a live worker keeps renewing it).
+const DEFAULT_TASK_TTL_SECS: f64 = 900.0;
+
+/// The effective per-task lease TTL: `FACTORY_LEASE_TTL_SECS` if set to a positive
+/// number, else [`DEFAULT_TASK_TTL_SECS`].
+fn task_ttl_secs() -> f64 {
+    std::env::var("FACTORY_LEASE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|n| *n > 0.0)
+        .unwrap_or(DEFAULT_TASK_TTL_SECS)
+}
 
 /// Default per-worker concurrency cap when a worker does not set `max_concurrent`.
 const DEFAULT_PER_WORKER_CAP: i64 = 2;
@@ -402,7 +415,7 @@ pub async fn dispatch_once(
                     repo_id,
                     worker_name: worker.name.clone(),
                     lease_owner: lease_owner.to_owned(),
-                    ttl_secs: TASK_TTL_SECS,
+                    ttl_secs: task_ttl_secs(),
                     per_worker_cap,
                     global_cap,
                 };
@@ -486,7 +499,7 @@ async fn launch_leased(
         item.repo_id,
         item.kind,
         Some(attempt_id),
-        TASK_TTL_SECS,
+        task_ttl_secs(),
     )
     .await?;
 
