@@ -22,8 +22,11 @@ pub fn archive_dirs(roots: &[(&str, &Path)]) -> anyhow::Result<Vec<u8>> {
     let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
     let mut included = 0usize;
     for (name, dir) in roots {
-        if !dir.exists() {
-            tracing::info!(root = name, path = %dir.display(), "archive_dirs: root missing, skipped");
+        // Skip a root that's missing OR not a directory: the contract is "directory
+        // roots", and `append_dir_all` errors on a non-dir (e.g. CLAUDE_CONFIG_DIR
+        // misconfigured to a file would otherwise fail the whole checkpoint).
+        if !dir.is_dir() {
+            tracing::info!(root = name, path = %dir.display(), exists = dir.exists(), "archive_dirs: root missing or not a directory, skipped");
             continue;
         }
         // `append_dir_all` stores `dir`'s tree under the `name/` prefix.
@@ -165,6 +168,25 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "a");
         // The absent root extracts to an empty (created) directory.
         assert!(ses_dest.exists());
+        assert_eq!(std::fs::read_dir(&ses_dest).unwrap().count(), 0);
+        for d in [worktree, dest, ses_dest] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn a_root_that_is_a_file_not_a_dir_is_skipped_not_an_error() {
+        // E.g. CLAUDE_CONFIG_DIR misconfigured to point at a file: archive_dirs must
+        // skip it like a missing root, not fail the whole checkpoint.
+        let worktree = tmp("wt-filey");
+        write(&worktree, "a.txt", "a");
+        let a_file = worktree.join("a.txt");
+        let bytes = archive_dirs(&[("worktree", &worktree), ("session", &a_file)]).unwrap();
+        let dest = tmp("wt-filey-dest");
+        let ses_dest = tmp("ses-filey-dest");
+        extract_dirs(&bytes, &[("worktree", &dest), ("session", &ses_dest)]).unwrap();
+        assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "a");
+        // The file-typed root was skipped → its dest is empty.
         assert_eq!(std::fs::read_dir(&ses_dest).unwrap().count(), 0);
         for d in [worktree, dest, ses_dest] {
             let _ = std::fs::remove_dir_all(d);

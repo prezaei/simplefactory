@@ -365,14 +365,15 @@ mod tests {
             .filter(|v| !v.is_empty())
     }
 
-    /// A unique container name per test so the lane is parallel-safe.
+    /// A unique container name per test so the lane is parallel-safe. A process-local
+    /// monotonic counter (plus the PID) guarantees uniqueness even when two tests run
+    /// in the same nanosecond — `SystemTime` resolution is platform-dependent and can
+    /// repeat under parallel execution, which would collide container names.
     fn unique_container(label: &str) -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        format!("itest-{label}-{n}")
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("itest-{label}-{}-{n}", std::process::id())
     }
 
     #[tokio::test]

@@ -218,9 +218,9 @@ impl DockerLauncher {
         }
     }
 
-    /// Attach the host-side runtime wiring (shared checkpoint mount + claude token)
-    /// read from the environment. Without it, workers launch with no shared
-    /// checkpoint volume — fine for a non-resuming run, not for crash-resume.
+    /// Attach the host-side runtime wiring (Azure Blob connection string + claude
+    /// token) read from the environment. Without it, workers launch with no blob
+    /// connection string and fail fast on startup (they require one — no Fs fallback).
     pub fn with_runtime(mut self, runtime: WorkerRuntime) -> Self {
         self.runtime = runtime;
         self

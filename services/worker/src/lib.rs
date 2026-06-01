@@ -393,8 +393,8 @@ fn checkpoint_roots<'a>(
 /// Snapshot the worktree (+ the `claude` session dir, when configured) to the checkpoint
 /// store at `checkpoint_uri` and persist the (session_id, uri) pointer on the attempt.
 /// The tar lives in `libs/blob::archive_dirs` (CI-unit-tested round-trip); the store is the
-/// deploy seam (Fs-on-shared-volume locally, Azure Blob in P8). tar is sync, so it runs on
-/// a blocking thread.
+/// deploy seam — Azure Blob (Azurite locally in P7, real Azure in P8). tar is sync, so it
+/// runs on a blocking thread.
 async fn write_checkpoint(
     tools: &dyn ToolsClient,
     store: &dyn factory_blob::CheckpointStore,
