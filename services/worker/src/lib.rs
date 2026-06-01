@@ -298,12 +298,18 @@ async fn run_manager(
     task: &TaskInfo,
 ) -> anyhow::Result<()> {
     // Validate the subject BEFORE running Claude: a manager's success only makes the
-    // Coordinator assign a Coder for an `issue#N` subject (`decide_manager_succeeded`
-    // no-ops for any other subject, which would strand a reacted item). Config/intake
-    // could enqueue a manager on a non-issue trigger, so fail loudly at the seam —
-    // before spending a Claude run or any side effect — rather than succeed into a
-    // dead end.
-    if !task.subject_ref.starts_with("issue#") {
+    // Coordinator assign a Coder for an `issue#<number>` subject
+    // (`decide_manager_succeeded` no-ops for any other subject, which would strand a
+    // reacted item). Config/intake could enqueue a manager on a non-issue trigger, so
+    // fail loudly at the seam — before spending a Claude run or any side effect —
+    // rather than succeed into a dead end. Parse the full `issue#<number>` form (not a
+    // bare prefix), so a malformed `issue#not-a-number` also fails here.
+    if task
+        .subject_ref
+        .strip_prefix("issue#")
+        .and_then(|n| n.parse::<i64>().ok())
+        .is_none()
+    {
         anyhow::bail!(
             "worker(manager): task subject {:?} is not an issue#<number>; a manager can only triage an issue",
             task.subject_ref
@@ -1161,39 +1167,46 @@ mod tests {
 
     #[tokio::test]
     async fn manager_with_non_issue_subject_fails_loudly_before_running_claude() {
-        // A manager's success only delegates a coder for an `issue#N` subject (the
-        // coordinator no-ops otherwise, stranding a reacted item). A non-issue subject
-        // must fail at the seam BEFORE Claude runs — no comment, no escalate, no success.
-        let tools = FakeTools::seeded_role("manager", "cr#9", "factory/cr-9");
-        let git = FakeGit::default();
-        let claude = FakeClaude::with(RunOutcome::Triage {
-            actionable: true,
-            summary: "should never run".into(),
-        });
-        let cfg = config();
+        // A manager's success only delegates a coder for an `issue#<number>` subject (the
+        // coordinator no-ops otherwise, stranding a reacted item). A non-issue subject —
+        // including a malformed `issue#not-a-number` — must fail at the seam BEFORE Claude
+        // runs: no comment, no escalate, no success.
+        for bad_subject in ["cr#9", "issue#not-a-number", "schedule@nightly"] {
+            let tools = FakeTools::seeded_role("manager", bad_subject, "factory/x");
+            let git = FakeGit::default();
+            let claude = FakeClaude::with(RunOutcome::Triage {
+                actionable: true,
+                summary: "should never run".into(),
+            });
+            let cfg = config();
 
-        let err = run_task(&tools, &git, &claude, &cfg)
-            .await
-            .expect_err("a manager with a non-issue subject must fail loudly");
-        assert!(
-            err.to_string().contains("issue#"),
-            "error explains the bad subject: {err}"
-        );
-        // Claude never ran (validation is before the run), and there are no side effects.
-        assert_eq!(
-            claude.ran.load(Ordering::SeqCst),
-            0,
-            "Claude not run on a bad subject"
-        );
-        assert_eq!(tools.comments.lock().expect("lock").len(), 0, "no comment");
-        assert_eq!(
-            tools.escalations.lock().expect("lock").len(),
-            0,
-            "no escalation"
-        );
-        let outcomes = tools.outcomes.lock().expect("lock");
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].0, "failed");
+            let err = run_task(&tools, &git, &claude, &cfg)
+                .await
+                .expect_err("a manager with a non-issue subject must fail loudly");
+            assert!(
+                err.to_string().contains("issue#"),
+                "{bad_subject}: error explains the bad subject: {err}"
+            );
+            // Claude never ran (validation is before the run); no side effects.
+            assert_eq!(
+                claude.ran.load(Ordering::SeqCst),
+                0,
+                "{bad_subject}: Claude not run"
+            );
+            assert_eq!(
+                tools.comments.lock().expect("lock").len(),
+                0,
+                "{bad_subject}: no comment"
+            );
+            assert_eq!(
+                tools.escalations.lock().expect("lock").len(),
+                0,
+                "{bad_subject}: no escalation"
+            );
+            let outcomes = tools.outcomes.lock().expect("lock");
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].0, "failed");
+        }
     }
 
     #[tokio::test]

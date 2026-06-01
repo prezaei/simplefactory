@@ -253,22 +253,44 @@ fn outcome_for_role(role: &str, summary: String) -> RunOutcome {
         "manager" => {
             let actionable = parse_manager_actionable(&summary);
             // Strip the control marker so it never leaks into the user-facing triage
-            // comment (run_manager posts `summary` as the issue comment).
+            // comment (run_manager posts `summary` as the issue comment). A terse
+            // marker-only response leaves an empty body, which GitHub rejects — fall
+            // back to a decision-derived note so the comment is always non-empty.
+            let body = strip_marker_lines(&summary, "ACTIONABLE:");
+            let body = non_empty_or(body, || {
+                if actionable {
+                    "Triaged: actionable — assigning a coder.".to_string()
+                } else {
+                    "Triaged: not actionable — escalating for a human decision.".to_string()
+                }
+            });
             RunOutcome::Triage {
                 actionable,
-                summary: strip_marker_lines(&summary, "ACTIONABLE:"),
+                summary: body,
             }
         }
         "reviewer" => {
             let verdict = parse_reviewer_verdict(&summary);
-            // Strip the control marker so it never leaks into the user-facing review
-            // body (run_reviewer submits `summary` as the review body).
+            // Strip the control marker; fall back to a verdict-derived body if the
+            // response was marker-only (GitHub rejects an empty review body).
+            let body = strip_marker_lines(&summary, "VERDICT:");
+            let body = non_empty_or(body, || format!("Review verdict: {}.", verdict.as_str()));
             RunOutcome::Review {
                 verdict,
-                summary: strip_marker_lines(&summary, "VERDICT:"),
+                summary: body,
             }
         }
         _ => RunOutcome::Code { summary },
+    }
+}
+
+/// Return `s` if it has non-whitespace content, else the lazily-computed fallback.
+/// Guards the user-facing comment/review body against an empty (marker-only) summary.
+fn non_empty_or(s: String, fallback: impl FnOnce() -> String) -> String {
+    if s.trim().is_empty() {
+        fallback()
+    } else {
+        s
     }
 }
 
@@ -805,6 +827,26 @@ mod tests {
         assert_eq!(
             summary, "Looks good.",
             "marker stripped from review summary"
+        );
+        // A marker-ONLY response strips to empty → must fall back to a non-empty,
+        // decision-derived body (GitHub rejects an empty comment/review body).
+        let RunOutcome::Triage { summary, .. } =
+            outcome_for_role("manager", "ACTIONABLE: yes".into())
+        else {
+            panic!("manager → Triage");
+        };
+        assert!(
+            !summary.trim().is_empty(),
+            "marker-only manager response falls back to a non-empty body"
+        );
+        let RunOutcome::Review { summary, .. } =
+            outcome_for_role("reviewer", "VERDICT: approve".into())
+        else {
+            panic!("reviewer → Review");
+        };
+        assert!(
+            !summary.trim().is_empty(),
+            "marker-only reviewer response falls back to a non-empty body"
         );
         // Unknown role defaults to Code (never reached for a real run — the harness
         // run-seam rejects unsupported roles before this).
