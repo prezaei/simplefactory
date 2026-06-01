@@ -68,8 +68,13 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // One task drives both loops: the reactive coordinator tick and the lease sweeper.
-    // Both need GitHub (the coordinator for handoffs; the sweeper for escalation
-    // comments), so both are skipped together when credentials are absent.
+    // Both are gated on GitHub credentials. The coordinator genuinely needs GitHub for
+    // every decision (handoff comments, approval reads). The sweeper's DB-reclaim itself
+    // needs no GitHub (only its escalation *comment* does, which `reclaim_item` already
+    // degrades gracefully) — but gating it alongside the coordinator is deliberate and
+    // harmless: all Factory services share the one GitHub App, so credential-absent means
+    // the dispatcher can't mint installation tokens either, no workers ever launch, and
+    // there are therefore no live leases to reclaim. The gate never strands real work.
     let mut coordinate = tokio::time::interval(COORDINATE_TICK);
     let mut sweep = tokio::time::interval(SWEEPER_TICK);
     loop {

@@ -311,14 +311,9 @@ async fn reclaim_item(
         match repo_and_config {
             Some(rc) => {
                 let (ident, config) = rc.as_ref();
-                let repo = RepoRef::new(
-                    ident.owner.clone(),
-                    ident.name.clone(),
-                    ident.installation_id,
-                );
                 run_post_commit(
                     gh,
-                    &repo,
+                    &repo_ref(ident),
                     item,
                     config.settings.escalation_assignee.as_deref(),
                     post,
@@ -358,11 +353,7 @@ async fn react_to_item(
         return Ok(false);
     };
     let (repo_ident, config) = repo_and_config.as_ref();
-    let repo = RepoRef::new(
-        repo_ident.owner.clone(),
-        repo_ident.name.clone(),
-        repo_ident.installation_id,
-    );
+    let repo = repo_ref(repo_ident);
 
     // Load the CR ONCE, BEFORE the tx, for every path that needs it (reviewer-succeeded
     // and any failed item whose subject is a CR). Reading it here — not inside the tx —
@@ -1337,6 +1328,17 @@ async fn load_repo_and_config(
             Ok(None)
         }
     }
+}
+
+/// Build the outbound [`RepoRef`] from a repo's record identity. One place so the
+/// positional `RepoRef::new(owner, name, installation_id)` can't be mis-ordered at the
+/// several call sites that need it (react + reclaim post-commits).
+fn repo_ref(ident: &RepoIdent) -> RepoRef {
+    RepoRef::new(
+        ident.owner.clone(),
+        ident.name.clone(),
+        ident.installation_id,
+    )
 }
 
 /// The first worker with the given role, by name.

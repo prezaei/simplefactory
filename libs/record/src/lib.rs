@@ -403,6 +403,9 @@ pub async fn fetch_expired_lease_items(
                 w.correlation_id, w.state, w.attempt_count, w.loop_count, w.config_sha,
                 w.lease_owner, w.lease_expires_at, w.updated_at
            FROM work_items w
+          -- EXPIRED-LEASE PREDICATE: KEEP IN SYNC with reclaim_claim, which re-validates
+          -- this exact condition atomically when claiming. A divergence would let this
+          -- read surface an item reclaim_claim then refuses (or vice versa).
           WHERE w.state IN ('leased', 'running')
             AND (
               w.lease_expires_at < now()
@@ -462,6 +465,7 @@ pub async fn reclaim_claim(
                 updated_at = now()
           WHERE id = $1
             AND state IN ('leased', 'running')
+            -- EXPIRED-LEASE PREDICATE: KEEP IN SYNC with fetch_expired_lease_items.
             AND (
               lease_expires_at < now()
               OR EXISTS (
