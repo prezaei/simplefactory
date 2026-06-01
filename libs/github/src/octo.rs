@@ -84,8 +84,10 @@ impl OctocrabGitHub {
 /// review signal; larger is truncated with a marker.
 const MAX_DIFF_BYTES: usize = 256 * 1024;
 
-/// Truncate `diff` to at most `max` bytes on a UTF-8 char boundary, appending a marker
-/// when truncated. Returns the diff unchanged when within budget.
+/// Cap the diff BODY at `max` bytes (truncating on a UTF-8 char boundary) plus a short
+/// trailing truncation marker — so the returned string is `max` + the marker length, not
+/// strictly `max`. Returns the diff unchanged when the body is within budget. The marker
+/// length is a small constant, so this still bounds the worst case to ~`max`.
 fn cap_diff(diff: String, max: usize) -> String {
     if diff.len() <= max {
         return diff;
