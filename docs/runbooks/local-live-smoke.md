@@ -32,7 +32,10 @@ GitHub → Settings → Developer settings → **GitHub Apps → New GitHub App*
 - **Webhook secret:** generate one; put the same value in `.env.live`
   (`GITHUB_WEBHOOK_SECRET`). Intake rejects any delivery whose HMAC doesn't match.
 - **Repository permissions:** `Issues`, `Pull requests`, `Contents`, `Checks` →
-  **Read & write**.
+  **Read & write**, plus `Commit statuses` → **Read-only** (the coordinator folds the
+  legacy combined commit status into its green-gate; without this read it 403s and the
+  CR is escalated for a human instead of auto-handed-off — see the graceful degradation
+  in `OctocrabGitHub::check_status`).
 - **Subscribe to events:** `Issues`, `Pull request`, `Pull request review`,
   `Issue comment`, `Push`.
 - Create the App, then **Generate a private key** (downloads a `.pem`).

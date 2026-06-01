@@ -178,6 +178,42 @@ fn map_status_state(state: &str) -> CheckConclusion {
     }
 }
 
+/// True when an octocrab error is a GitHub **403 permission denial** — the App lacks a
+/// permission for this read (e.g. `Commit statuses: read` →
+/// "Resource not accessible by integration"). DISTINCT from a transient error: a 403
+/// won't fix itself on retry, so the caller must DEGRADE rather than loop on it forever.
+/// (`Error::GitHub`/`GitHubError` are `#[non_exhaustive]`, so this matches by shape — it
+/// cannot be unit-tested by constructing one; the pure policy lives in
+/// [`combined_status_contribution`].)
+fn is_permission_denied(e: &octocrab::Error) -> bool {
+    matches!(
+        e,
+        octocrab::Error::GitHub { source, .. } if source.status_code.as_u16() == 403
+    )
+}
+
+/// The legacy-combined-commit-status contribution to the check rollup (FIX B). Pure so
+/// the permission-degradation policy is unit-tested without real GitHub:
+/// - `permission_denied` → `Some(Failure)`: the App can't read commit statuses, so we
+///   CANNOT confirm there is no failing status. Contributing `Failure` keeps the CR off
+///   the false-green path (the coordinator escalates it to a human) instead of the read
+///   hard-failing the whole reaction on every tick forever.
+/// - otherwise a status with ≥1 context folds its server-computed rollup `state`.
+/// - a status with ZERO contexts contributes nothing — GitHub reports `pending` for a
+///   SHA with no statuses, so the empty case must stay green (FIX 2).
+fn combined_status_contribution(
+    status: Option<&CombinedStatus>,
+    permission_denied: bool,
+) -> Option<CheckConclusion> {
+    if permission_denied {
+        return Some(CheckConclusion::Failure);
+    }
+    match status {
+        Some(s) if s.total_count > 0 => Some(map_status_state(&s.state)),
+        _ => None,
+    }
+}
+
 #[async_trait::async_trait]
 impl GitHubClient for OctocrabGitHub {
     async fn installation_token(&self, installation_id: i64) -> anyhow::Result<String> {
@@ -511,18 +547,35 @@ impl GitHubClient for OctocrabGitHub {
         // status context) rather than paging the `statuses` array — so a failing status on
         // a later page can never be missed (the false-green a first-page-only read had).
         let route = format!("/repos/{}/{}/commits/{}/status", repo.owner, repo.name, sha);
-        let status: CombinedStatus = client
-            .get(&route, None::<&()>)
-            .await
-            .map_err(|e| anyhow::anyhow!("reading combined commit status for {sha}: {e:?}"))?;
-        // Only fold the combined status when there is ≥1 status context. GitHub reports
-        // `state = "pending"` for a SHA with ZERO statuses, so without this guard a
-        // no-status repo would roll up Pending forever — the empty case must stay green.
-        if status.total_count > 0 {
-            checks.push((
-                "combined-status".to_owned(),
-                map_status_state(&status.state),
-            ));
+        let status_result: Result<CombinedStatus, octocrab::Error> =
+            client.get(&route, None::<&()>).await;
+        // Degrade on a PERMISSION 403 (App missing `Commit statuses: read`): treat the
+        // status as NOT-green so the coordinator escalates the CR to a human, rather than
+        // (a) hard-failing the whole reaction every tick forever, or (b) silently
+        // dropping the legacy-status gate and risking a false green. A non-permission
+        // error (transient/5xx) still propagates so the next tick retries. See
+        // [`combined_status_contribution`].
+        let (status_opt, permission_denied) = match status_result {
+            Ok(s) => (Some(s), false),
+            Err(e) if is_permission_denied(&e) => {
+                tracing::warn!(
+                    owner = %repo.owner, name = %repo.name, %sha,
+                    "combined commit status unreadable (403 — App missing 'Commit statuses: read'); \
+                     treating as NOT-green so the CR is escalated for a human. Grant the \
+                     permission to restore automatic green-gating."
+                );
+                (None, true)
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "reading combined commit status for {sha}: {e:?}"
+                ))
+            }
+        };
+        if let Some(conclusion) =
+            combined_status_contribution(status_opt.as_ref(), permission_denied)
+        {
+            checks.push(("combined-status".to_owned(), conclusion));
         }
 
         // FIX 2 + FIX 6 + FIX B: roll up through the SHARED rollup over the UNION of
@@ -568,6 +621,55 @@ impl GitHubClient for OctocrabGitHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- combined_status_contribution: legacy-commit-status fold + 403 degradation ----
+
+    #[test]
+    fn combined_status_permission_denied_contributes_failure() {
+        // The bug this guards: a 403 reading commit statuses must NOT false-green the CR
+        // and must NOT loop forever — it folds in Failure so the coordinator escalates.
+        assert_eq!(
+            combined_status_contribution(None, true),
+            Some(CheckConclusion::Failure)
+        );
+        // Permission-denied dominates even if a (stale) status happens to be present.
+        let green = CombinedStatus {
+            state: "success".to_owned(),
+            total_count: 3,
+        };
+        assert_eq!(
+            combined_status_contribution(Some(&green), true),
+            Some(CheckConclusion::Failure)
+        );
+    }
+
+    #[test]
+    fn combined_status_folds_state_only_when_contexts_exist() {
+        let success = CombinedStatus {
+            state: "success".to_owned(),
+            total_count: 2,
+        };
+        assert_eq!(
+            combined_status_contribution(Some(&success), false),
+            Some(CheckConclusion::Success)
+        );
+        let failing = CombinedStatus {
+            state: "failure".to_owned(),
+            total_count: 1,
+        };
+        assert_eq!(
+            combined_status_contribution(Some(&failing), false),
+            Some(CheckConclusion::Failure)
+        );
+        // ZERO contexts → contribute nothing so the empty case stays green (FIX 2):
+        // GitHub reports `pending` for a SHA with no statuses.
+        let empty = CombinedStatus {
+            state: "pending".to_owned(),
+            total_count: 0,
+        };
+        assert_eq!(combined_status_contribution(Some(&empty), false), None);
+        assert_eq!(combined_status_contribution(None, false), None);
+    }
 
     // ---- map_conclusion: GitHub Checks API `conclusion` → CheckConclusion ----
     //
