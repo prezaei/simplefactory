@@ -15,6 +15,9 @@ flate2.workspace = true
 azure_core.workspace = true
 azure_storage.workspace = true
 azure_storage_blobs.workspace = true
+# Managed Identity credential (P8) — shared crate (also used by the dispatcher's Container
+# Apps launcher in part 2), so the MSI/IMDS token logic lives in exactly one place.
+factory-azure-auth.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -255,12 +255,36 @@ pub async fn upsert_repo(
     name: &str,
     installation_id: i64,
 ) -> Result<Uuid> {
+    Ok(upsert_repo_status(pool, owner, name, installation_id)
+        .await?
+        .0)
+}
+
+/// As [`upsert_repo`], but also reports whether the repo is **active** after the upsert.
+/// Onboarding only reactivates a `removed` repo (re-install / unsuspend); a deliberately
+/// `suspended` repo is left paused — so the caller (intake onboarding) can audit/count it
+/// honestly as "skipped (suspended)" rather than claiming an onboard that didn't take.
+/// Returns `(repo_id, is_active)`.
+pub async fn upsert_repo_status(
+    pool: &Pool,
+    owner: &str,
+    name: &str,
+    installation_id: i64,
+) -> Result<(Uuid, bool)> {
     let row = sqlx::query(
+        // Re-onboarding (re-install / unsuspend) must REACTIVATE a previously-REMOVED repo,
+        // so the conflict path flips 'removed' → 'active' (and refreshes the installation
+        // id) — otherwise a repo offboarded then re-added stays 'removed' and Factory keeps
+        // ignoring it. But it must NOT clobber a deliberately-'suspended' repo (an operator
+        // paused Factory on it): only 'removed' is reactivated; any other status is kept.
         "INSERT INTO repos (id, installation_id, owner, name, status)
          VALUES ($1, $2, $3, $4, 'active')
          ON CONFLICT (owner, name)
-           DO UPDATE SET installation_id = EXCLUDED.installation_id, updated_at = now()
-         RETURNING id",
+           DO UPDATE SET installation_id = EXCLUDED.installation_id,
+                         status = CASE WHEN repos.status = 'removed' THEN 'active'
+                                       ELSE repos.status END,
+                         updated_at = now()
+         RETURNING id, status",
     )
     .bind(Uuid::now_v7())
     .bind(installation_id)
@@ -268,7 +292,32 @@ pub async fn upsert_repo(
     .bind(name)
     .fetch_one(pool)
     .await?;
-    Ok(row.try_get("id")?)
+    let id: Uuid = row.try_get("id")?;
+    let status: String = row.try_get("status")?;
+    Ok((id, status == "active"))
+}
+
+/// Offboard a repo (App uninstalled / repo removed from the installation): mark it
+/// `removed` so Factory stops acting on it. Only an **active** repo is offboarded —
+/// webhooks toggle active↔removed; a deliberately-`suspended` repo (operator-reserved) is
+/// left untouched. Idempotent — returns `Some(repo_id)` if an active row was removed, else
+/// `None` (absent, already removed, or suspended). `RETURNING id` so the caller can audit
+/// the offboard with the real repo id in ONE statement. Re-onboarding via [`upsert_repo`]
+/// reactivates a removed repo.
+pub async fn deactivate_repo(pool: &Pool, owner: &str, name: &str) -> Result<Option<Uuid>> {
+    let row = sqlx::query(
+        "UPDATE repos SET status = 'removed', updated_at = now()
+          WHERE owner = $1 AND name = $2 AND status = 'active'
+        RETURNING id",
+    )
+    .bind(owner)
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        Some(r) => Some(r.try_get("id")?),
+        None => None,
+    })
 }
 
 /// Enqueue a work item. Idempotent: if an active item for the same

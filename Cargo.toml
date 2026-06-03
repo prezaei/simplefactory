@@ -6,12 +6,14 @@ members = [
     "libs/record",
     "libs/github",
     "libs/blob",
+    "libs/azure-auth",
     "services/intake",
     "services/dispatcher",
     "services/coordinator",
     "services/tools",
     "services/dashboard-api",
     "services/worker",
+    "services/migrate",
     "e2e",
 ]
 
@@ -51,6 +53,9 @@ tower = { version = "0.5", features = ["util"] }
 octocrab = "0.51"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
+# Token expiry timestamps for the Managed Identity credential (already in the tree via
+# azure_core). default-features off keeps it lean; `std` for OffsetDateTime arithmetic.
+time = { version = "0.3", default-features = false, features = ["std"] }
 
 # Worktree/session checkpoint archives (P7 crash-resume): tar + gzip the worktree to Blob.
 tar = "0.4"
@@ -76,6 +81,7 @@ factory-config = { path = "libs/config" }
 factory-record = { path = "libs/record" }
 factory-github = { path = "libs/github" }
 factory-blob = { path = "libs/blob" }
+factory-azure-auth = { path = "libs/azure-auth" }
 factory-intake = { path = "services/intake" }
 factory-tools = { path = "services/tools" }
 factory-dispatcher = { path = "services/dispatcher" }

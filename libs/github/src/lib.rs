@@ -137,8 +137,42 @@ pub enum WebhookEvent {
         head_sha: String,
         touched_paths: Vec<String>,
     },
+    /// The GitHub App was installed/uninstalled, or repos were added/removed from an
+    /// existing installation. Drives repo onboarding/offboarding (P8): `added` repos are
+    /// upserted into the record book with `installation_id` (so no manual seeding), and
+    /// `removed` repos are deactivated. One `installation_id` per delivery; the repos are
+    /// owner/name pairs.
+    Installation {
+        installation_id: i64,
+        added: Vec<RepoCoord>,
+        removed: Vec<RepoCoord>,
+    },
     /// Anything Factory doesn't act on.
     Other,
+}
+
+/// An owner/name repo coordinate carried by an [`WebhookEvent::Installation`]. (Distinct
+/// from [`RepoRef`], which also carries an `installation_id`; the installation id on an
+/// installation webhook is per-delivery, not per-repo.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoCoord {
+    pub owner: String,
+    pub name: String,
+}
+
+impl RepoCoord {
+    /// Parse a GitHub `full_name` (`"owner/name"`). Returns `None` for a malformed value
+    /// (no slash, or an empty owner/name) so a junk entry is skipped rather than onboarded.
+    fn from_full_name(full_name: &str) -> Option<Self> {
+        let (owner, name) = full_name.split_once('/')?;
+        if owner.is_empty() || name.is_empty() {
+            return None;
+        }
+        Some(RepoCoord {
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+        })
+    }
 }
 
 /// Parse a webhook into a typed [`WebhookEvent`]. `event_type` is the
@@ -218,8 +252,48 @@ pub fn parse_event(event_type: &str, payload: &[u8]) -> Result<WebhookEvent, Git
                 touched_paths: touched,
             })
         }
+        // App installed/uninstalled (whole-installation lifecycle). `repositories` lists
+        // the selected repos. We model just two actions: ONBOARD (created/unsuspend) and
+        // OFFBOARD (deleted/suspend). A GitHub `suspend` is deliberately treated as an
+        // offboard (Factory stops acting on the repo, status → 'removed') rather than a
+        // distinct lifecycle state; `unsuspend` re-onboards it (`upsert_repo` reactivates a
+        // 'removed' repo). The schema's separate 'suspended' status is reserved for an
+        // operator manually pausing Factory and is never written by these webhooks — so an
+        // operator 'suspend' is never clobbered by a GitHub suspend/unsuspend round-trip.
+        "installation" => {
+            let p: InstallationPayload = serde_json::from_slice(payload)?;
+            let coords = full_names_to_coords(&p.repositories);
+            let (added, removed) = match p.action.as_str() {
+                "created" | "unsuspend" => (coords, Vec::new()),
+                "deleted" | "suspend" => (Vec::new(), coords),
+                // e.g. "new_permissions_accepted" — no repo membership change.
+                _ => (Vec::new(), Vec::new()),
+            };
+            Ok(WebhookEvent::Installation {
+                installation_id: p.installation.id,
+                added,
+                removed,
+            })
+        }
+        // Repos added to / removed from an existing installation.
+        "installation_repositories" => {
+            let p: InstallationPayload = serde_json::from_slice(payload)?;
+            Ok(WebhookEvent::Installation {
+                installation_id: p.installation.id,
+                added: full_names_to_coords(&p.repositories_added),
+                removed: full_names_to_coords(&p.repositories_removed),
+            })
+        }
         _ => Ok(WebhookEvent::Other),
     }
+}
+
+/// Map GitHub repo entries (`full_name`) to [`RepoCoord`]s, dropping malformed ones.
+fn full_names_to_coords(repos: &[RepoLite]) -> Vec<RepoCoord> {
+    repos
+        .iter()
+        .filter_map(|r| RepoCoord::from_full_name(&r.full_name))
+        .collect()
 }
 
 // ---- Minimal payload shapes (only the fields Factory reads) ----
@@ -255,6 +329,26 @@ struct Owner {
 #[derive(Debug, Deserialize)]
 struct Installation {
     id: i64,
+}
+
+/// `installation` / `installation_repositories` webhook payload (only the fields onboarding
+/// reads). One struct serves both events: `repositories` is populated on `installation`,
+/// `repositories_added`/`repositories_removed` on `installation_repositories`.
+#[derive(Debug, Deserialize)]
+struct InstallationPayload {
+    action: String,
+    installation: Installation,
+    #[serde(default)]
+    repositories: Vec<RepoLite>,
+    #[serde(default)]
+    repositories_added: Vec<RepoLite>,
+    #[serde(default)]
+    repositories_removed: Vec<RepoLite>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepoLite {
+    full_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -491,6 +585,110 @@ mod tests {
         assert_eq!(repo.installation_id, 99);
         assert!(touched_paths.contains(&".factory/config.yml".to_string()));
         assert!(touched_paths.contains(&"src/x.rs".to_string()));
+    }
+
+    #[test]
+    fn parses_installation_created_onboards_selected_repos() {
+        let payload = br#"{
+            "action": "created",
+            "installation": { "id": 137 },
+            "repositories": [
+                { "full_name": "acme/widgets" },
+                { "full_name": "acme/gadgets" }
+            ]
+        }"#;
+        let ev = parse_event("installation", payload).unwrap();
+        let WebhookEvent::Installation {
+            installation_id,
+            added,
+            removed,
+        } = ev
+        else {
+            panic!("expected installation");
+        };
+        assert_eq!(installation_id, 137);
+        assert_eq!(
+            added,
+            vec![
+                RepoCoord {
+                    owner: "acme".into(),
+                    name: "widgets".into()
+                },
+                RepoCoord {
+                    owner: "acme".into(),
+                    name: "gadgets".into()
+                },
+            ]
+        );
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn parses_installation_deleted_offboards_repos() {
+        let payload = br#"{
+            "action": "deleted",
+            "installation": { "id": 5 },
+            "repositories": [ { "full_name": "acme/widgets" } ]
+        }"#;
+        let WebhookEvent::Installation { added, removed, .. } =
+            parse_event("installation", payload).unwrap()
+        else {
+            panic!("expected installation");
+        };
+        assert!(added.is_empty());
+        assert_eq!(
+            removed,
+            vec![RepoCoord {
+                owner: "acme".into(),
+                name: "widgets".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_installation_repositories_added_and_removed() {
+        let payload = br#"{
+            "action": "added",
+            "installation": { "id": 9 },
+            "repositories_added": [ { "full_name": "o/added1" } ],
+            "repositories_removed": [ { "full_name": "o/removed1" }, { "full_name": "bad-no-slash" } ]
+        }"#;
+        let WebhookEvent::Installation {
+            installation_id,
+            added,
+            removed,
+        } = parse_event("installation_repositories", payload).unwrap()
+        else {
+            panic!("expected installation");
+        };
+        assert_eq!(installation_id, 9);
+        assert_eq!(
+            added,
+            vec![RepoCoord {
+                owner: "o".into(),
+                name: "added1".into()
+            }]
+        );
+        // The malformed "bad-no-slash" entry is dropped, not onboarded.
+        assert_eq!(
+            removed,
+            vec![RepoCoord {
+                owner: "o".into(),
+                name: "removed1".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn installation_new_permissions_accepted_changes_no_repos() {
+        let payload = br#"{ "action": "new_permissions_accepted", "installation": { "id": 1 },
+            "repositories": [ { "full_name": "o/r" } ] }"#;
+        let WebhookEvent::Installation { added, removed, .. } =
+            parse_event("installation", payload).unwrap()
+        else {
+            panic!("expected installation");
+        };
+        assert!(added.is_empty() && removed.is_empty());
     }
 
     #[test]

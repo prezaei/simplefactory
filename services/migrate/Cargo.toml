@@ -1,0 +1,13 @@
+[package]
+name = "factory-migrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+factory-record.workspace = true
+factory-telemetry.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true

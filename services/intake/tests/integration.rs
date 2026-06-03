@@ -1,7 +1,7 @@
 //! Intake integration tests against a real Postgres. Gated on `DATABASE_URL`
 //! (skip cleanly when unset). Isolated per-run via unique repo names.
 
-use factory_github::{FakeGitHub, RepoRef, Subject, WebhookEvent};
+use factory_github::{FakeGitHub, RepoCoord, RepoRef, Subject, WebhookEvent};
 use factory_intake::{apply_config_from_push, ingest, ApplyOutcome, IngestOutcome};
 use factory_record as record;
 use uuid::Uuid;
@@ -653,4 +653,101 @@ async fn apply_config_writes_an_audit_event_for_both_outcomes() {
             .unwrap();
     assert_eq!(applied, 1, "an Applied decision writes one audit event");
     assert_eq!(rejected, 1, "a rejection writes one audit event");
+}
+
+// ---- P8: installation-webhook repo onboarding/offboarding ----
+
+#[tokio::test]
+async fn installation_webhook_onboards_offboards_and_reactivates_repo() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let name = unique("onboard");
+    let coord = |n: &str| RepoCoord {
+        owner: "acme".to_owned(),
+        name: n.to_owned(),
+    };
+
+    // Onboard: an `installation` created delivery upserts the repos row active with the
+    // delivery's installation id — no manual SQL seeding (the P7 gap this closes).
+    let created = WebhookEvent::Installation {
+        installation_id: 4242,
+        added: vec![coord(&name)],
+        removed: vec![],
+    };
+    assert_eq!(
+        ingest(&pool, &created, &unique("dlv")).await.unwrap(),
+        IngestOutcome::Installation {
+            onboarded: 1,
+            offboarded: 0
+        }
+    );
+    let ident = record::repo_by_name(&pool, "acme", &name)
+        .await
+        .unwrap()
+        .expect("repo onboarded");
+    let id = ident.id;
+    assert_eq!(
+        record::repo_by_id(&pool, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .installation_id,
+        4242,
+        "onboarding records the delivery's installation id"
+    );
+
+    // Offboard: an uninstall marks it removed (one row affected).
+    let deleted = WebhookEvent::Installation {
+        installation_id: 4242,
+        added: vec![],
+        removed: vec![coord(&name)],
+    };
+    assert_eq!(
+        ingest(&pool, &deleted, &unique("dlv")).await.unwrap(),
+        IngestOutcome::Installation {
+            onboarded: 0,
+            offboarded: 1
+        }
+    );
+    // Offboarding again is idempotent — already removed, so zero rows affected.
+    assert_eq!(
+        ingest(&pool, &deleted, &unique("dlv")).await.unwrap(),
+        IngestOutcome::Installation {
+            onboarded: 0,
+            offboarded: 0
+        }
+    );
+
+    // Re-onboard (re-install) reactivates the SAME repo with a refreshed installation id.
+    let reinstalled = WebhookEvent::Installation {
+        installation_id: 5555,
+        added: vec![coord(&name)],
+        removed: vec![],
+    };
+    assert_eq!(
+        ingest(&pool, &reinstalled, &unique("dlv")).await.unwrap(),
+        IngestOutcome::Installation {
+            onboarded: 1,
+            offboarded: 0
+        }
+    );
+    let reident = record::repo_by_name(&pool, "acme", &name)
+        .await
+        .unwrap()
+        .expect("repo still present");
+    assert_eq!(
+        reident.id, id,
+        "re-onboard updates the same row, not a duplicate"
+    );
+    assert_eq!(
+        record::repo_by_id(&pool, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .installation_id,
+        5555,
+        "re-onboard refreshes the installation id"
+    );
 }
