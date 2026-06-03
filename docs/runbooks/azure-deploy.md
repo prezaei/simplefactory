@@ -148,6 +148,19 @@ az containerapp job start -g $RG -n factory-migrate-dev
 
 ## Verify
 
+**Structural (Layer 2) — one command.** Run the post-deploy check, which asserts every resource
+exists, each service revision is actually Running (not crash-looping on a bad command / unresolved
+secret / failed image pull), the migration ran, secrets resolve, and the least-privilege roles are
+in place. It's read-only (`az ... show/list` only) and exits non-zero on any failure:
+
+```bash
+FACTORY_RG=$RG FACTORY_ENV=dev ./scripts/verify-deploy.sh
+# optionally assert the exact deployed image tag too:
+FACTORY_RG=$RG FACTORY_ENV=dev FACTORY_IMAGE_TAG=<git-sha> ./scripts/verify-deploy.sh
+```
+
+**Functional (Layer 3) — the real proof.** Once the structural check is green:
+
 ```bash
 # Logs (KQL) — last 30 min of service stdout:
 az monitor log-analytics query -w <workspace-id> \
