@@ -83,6 +83,11 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: name
           image: image
+          // The shared `services` image has NO ENTRYPOINT/CMD (each service picks its binary —
+          // see the Dockerfile + docker-compose). Every service binary is `factory-<name>`
+          // (intake→factory-intake, dashboard-api→factory-dashboard-api, …), so derive it from
+          // the service name. Without this the container starts the base image's default + exits.
+          command: [ '/usr/local/bin/factory-${name}' ]
           resources: {
             cpu: json('0.5')
             memory: '1Gi'
