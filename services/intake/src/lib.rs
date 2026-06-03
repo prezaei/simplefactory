@@ -103,33 +103,44 @@ async fn process_installation(
     added: &[RepoCoord],
     removed: &[RepoCoord],
 ) -> anyhow::Result<(Option<Uuid>, IngestOutcome)> {
+    let mut onboarded = 0usize;
     for r in added {
-        let id = record::upsert_repo(pool, &r.owner, &r.name, installation_id).await?;
-        tracing::info!(
-            owner = %r.owner, name = %r.name, installation_id, repo_id = %id,
-            "onboarded repo via installation webhook"
-        );
-        // The events book records every onboarding decision per repo (not just the
-        // coarse per-delivery audit), per the "every activity is logged" mandate.
+        // Onboarding reactivates a 'removed' repo but NOT an operator-'suspended' one, so
+        // count/log the onboard only when the repo is actually active afterward; otherwise
+        // record a distinct 'skipped (suspended)' event so the audit/counts stay honest.
+        let (repo_id, is_active) =
+            record::upsert_repo_status(pool, &r.owner, &r.name, installation_id).await?;
+        let (action, msg) = if is_active {
+            onboarded += 1;
+            ("repo_onboarded", "onboarded repo via installation webhook")
+        } else {
+            (
+                "repo_onboard_skipped_suspended",
+                "installation webhook onboard left repo suspended (operator-paused); skipped",
+            )
+        };
+        tracing::info!(owner = %r.owner, name = %r.name, installation_id, %repo_id, is_active, "{msg}");
+        // The events book records every onboarding decision per repo (not just the coarse
+        // per-delivery audit), per the "every activity is logged" mandate.
         record::append_event(
             pool,
-            Some(id),
+            Some(repo_id),
             None,
             None,
             "intake",
-            "repo_onboarded",
+            action,
             serde_json::json!({ "owner": r.owner, "name": r.name, "installation_id": installation_id }),
         )
         .await?;
     }
     let mut offboarded = 0usize;
     for r in removed {
-        // `deactivate_repo` returns the repo id only when a row was newly removed, so an
-        // already-removed repo (re-delivery) is a no-op that contributes nothing.
+        // `deactivate_repo` returns the repo id only when an ACTIVE repo was removed, so an
+        // already-removed/suspended repo (or re-delivery) is a no-op that contributes nothing.
         if let Some(repo_id) = record::deactivate_repo(pool, &r.owner, &r.name).await? {
             offboarded += 1;
             tracing::info!(
-                owner = %r.owner, name = %r.name, %repo_id,
+                owner = %r.owner, name = %r.name, installation_id, %repo_id,
                 "offboarded repo via installation webhook"
             );
             record::append_event(
@@ -139,7 +150,7 @@ async fn process_installation(
                 None,
                 "intake",
                 "repo_offboarded",
-                serde_json::json!({ "owner": r.owner, "name": r.name }),
+                serde_json::json!({ "owner": r.owner, "name": r.name, "installation_id": installation_id }),
             )
             .await?;
         }
@@ -147,7 +158,7 @@ async fn process_installation(
     Ok((
         None,
         IngestOutcome::Installation {
-            onboarded: added.len(),
+            onboarded,
             offboarded,
         },
     ))

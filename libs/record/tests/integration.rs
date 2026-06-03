@@ -1628,3 +1628,69 @@ async fn last_checkpoint_returns_latest_with_resume_count() {
         "two re-dispatches since the last checkpoint count toward the resume budget"
     );
 }
+
+// ---- P8: onboarding/offboarding respect an operator 'suspended' repo ----
+
+#[tokio::test]
+async fn onboarding_and_offboarding_respect_operator_suspension() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    let name = format!("suspend-sem-{}", Uuid::now_v7());
+
+    // Onboard active.
+    let (id, active) = record::upsert_repo_status(&pool, "acme", &name, 1)
+        .await
+        .unwrap();
+    assert!(active, "a fresh onboard is active");
+
+    // Operator deliberately suspends the repo (the only writer of 'suspended').
+    sqlx::query("UPDATE repos SET status = 'suspended' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // A re-install/added webhook upsert must NOT reactivate it: stays 'suspended', reported
+    // not-active (so intake records it as skipped, not onboarded). Installation id still refreshes.
+    let (id2, active2) = record::upsert_repo_status(&pool, "acme", &name, 2)
+        .await
+        .unwrap();
+    assert_eq!(id2, id, "same row");
+    assert!(
+        !active2,
+        "an operator-suspended repo is not reactivated by onboarding"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM repos WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "suspended");
+    assert_eq!(
+        record::repo_by_id(&pool, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .installation_id,
+        2,
+        "installation id still refreshes on a suspended repo"
+    );
+
+    // A GitHub suspend/delete (deactivate) must NOT clobber an operator suspension.
+    assert_eq!(
+        record::deactivate_repo(&pool, "acme", &name).await.unwrap(),
+        None,
+        "deactivate only touches 'active' repos, not 'suspended'"
+    );
+    let status2: String = sqlx::query_scalar("SELECT status FROM repos WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        status2, "suspended",
+        "still suspended after a deactivate attempt"
+    );
+}

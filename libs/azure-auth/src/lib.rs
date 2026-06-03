@@ -197,9 +197,18 @@ impl TokenCredential for ManagedIdentityCredential {
         }
 
         let resource = resource_for_scopes(scopes);
+        // Treat an empty env value as UNSET (a misconfigured/blank secret injection must
+        // not select the Container Apps protocol with an empty X-IDENTITY-HEADER — that
+        // would fail obscurely; fall cleanly back to IMDS instead).
+        let identity_endpoint = std::env::var("IDENTITY_ENDPOINT")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let identity_header = std::env::var("IDENTITY_HEADER")
+            .ok()
+            .filter(|s| !s.is_empty());
         let req = build_token_request(
-            std::env::var("IDENTITY_ENDPOINT").ok().as_deref(),
-            std::env::var("IDENTITY_HEADER").ok().as_deref(),
+            identity_endpoint.as_deref(),
+            identity_header.as_deref(),
             self.client_id.as_deref(),
             &resource,
         );
