@@ -83,7 +83,7 @@ flowchart LR
 ## Components
 
 ### Intake API
-Axum service. Receives GitHub webhooks, verifies the HMAC signature, filters by the **opt-in label** (`factory`), and writes a work item into the Postgres to-do list inside one transaction. Returns 2xx fast; all downstream work is async off the queue. Idempotent on GitHub delivery ID (dedupes redelivered webhooks).
+Axum service. Receives GitHub webhooks, verifies the HMAC signature, filters by the **opt-in label** (`factory`), and writes a work item into the Postgres to-do list inside one transaction. Returns 2xx fast; all downstream work is async off the queue. Idempotent on GitHub delivery ID (dedupes redelivered webhooks). It also handles the App's **installation lifecycle** — `installation` / `installation_repositories` webhooks auto-onboard a connected repo (`upsert_repo` with its `installation_id`) and deactivate it on removal/uninstall — so connecting a repo needs no manual seeding.
 
 ### Scheduler
 Reads each onboarded repo's `.factory/config.yml` timer definitions and enqueues due work into Postgres. Uses a Postgres advisory lock so exactly one replica fires a given schedule tick (no duplicate nightly runs across replicas).
@@ -92,7 +92,9 @@ Reads each onboarded repo's `.factory/config.yml` timer definitions and enqueues
 Single source of truth. The to-do list is a table; the dispatcher leases rows with `SELECT … FOR UPDATE SKIP LOCKED`, which is the **no-double-starts arbitration** — it works correctly with many dispatcher replicas and after restarts, with no "exactly one coordinator" requirement. (See [Data model](#data-model).)
 
 ### Dispatcher
-Polls the queue under capacity caps (global + per repo-and-worker-type, enforced as counts in SQL). For each leased task it starts a Container Apps Job execution, injecting a **per-task scoped token** and the task id. The lease has an expiry; the worker heartbeats via the Tools API to extend it.
+Polls the queue under capacity caps (global + per repo-and-worker-type, enforced as counts in SQL). For each leased task it launches a worker via a pluggable **`WorkerLauncher`** seam — **local Docker** for dev/CI, **Azure Container Apps Jobs** in production (selected by `FACTORY_WORKER_RUNTIME`) — injecting a **per-task scoped token** and the task id. The lease has an expiry; the worker heartbeats via the Tools API to extend it.
+
+> **Container Apps Jobs start contract.** Azure's `jobs/{job}/start` **replaces the job's entire execution template** for that run — a partial override is silently dropped. The dispatcher doesn't hold the worker image or secrets, so the launcher mirrors `az containerapp job start --yaml`: **GET** the job's current template, **merge** the per-task env onto the `worker` container (preserving its image, resources, and the Key-Vault-backed secret refs), **project** to the execution-template shape `/start` accepts, then **POST**. It authenticates with the dispatcher's Managed Identity (an ARM token) over the same rustls reqwest the rest of the tree uses — no heavyweight management SDK.
 
 ### Coordinator
 The **deterministic** orchestrator — **never** calls a model. Reacts to completions in the record book and decides the next step (assign a Coder, wake a Reviewer on a new CR, hand an approved+green CR to a human, close the loop, or escalate). It only decides and delegates — it enqueues new work items; it never writes code. Runs as replicas; per-issue decisions are serialized with a row lock on the issue.
@@ -419,7 +421,7 @@ The worker's only channel to Factory, exposed by the Tools service as a **remote
 
 ## Security & least privilege
 
-- **Factory services** authenticate to Postgres/Blob/Key Vault via **Managed Identity** — no secrets in images or config.
+- **Factory services** authenticate to **Blob and Key Vault** via **Managed Identity** — no secrets in images or config. The **Postgres credential** is a `DATABASE_URL` injected as a Key-Vault-backed Container Apps secret in dev; prod moves to **Managed-Identity / Entra-token** Postgres auth (the rotating token used as the sqlx password), provisioned in Bicep as a prod follow-up.
 - **Workers** receive only a **per-task token** (scoped to one task/repo) for the Tools/MCP endpoint and a **short-lived GitHub installation token** for the clone/PR. No DB/Blob creds. Tokens revoked when the task ends or its lease is reclaimed.
 - **Anthropic key** lives in Key Vault; the worker reads the model endpoint config, the key is injected at job start and never written to the transcript (best-effort secret scrubbing, per the product spec's stated limits).
 - **Model-provider data handling.** Code and prompts sent to Anthropic use the **commercial API**, whose terms do not train on inputs/outputs; **zero-data-retention** is enabled where available so the provider persists nothing. This is what backs the product spec's "never used to train models" for the egressed *code* (not just Factory's own records).
@@ -430,17 +432,17 @@ The worker's only channel to Factory, exposed by the Tools service as a **remote
 
 Every service and the worker harness emit **OpenTelemetry** traces/metrics/logs, exported to **Azure Monitor / Application Insights** (traces, metrics) and **Log Analytics** (structured logs, queried via KQL). A `correlation_id` per work item threads webhook → queue → dispatch → worker → tools → completion. Per the repo mandate: every decision, state transition, tool call, and error path is logged; an absent log is a defect.
 
-> **Implementation status (as of P4).** `libs/telemetry` currently configures **structured `tracing` logs** (env-filtered), which is what satisfies the "every decision/transition/tool-call/error is logged" mandate today, and `correlation_id` is recorded as a column on `work_items`/`events` and propagated through the data model. The **OpenTelemetry exporter** (OTLP → Azure Monitor) for **traces and metrics**, plus a `tracing`→OTel `correlation_id` span-propagation helper, are wired in **P8** (Azure productionization) — see the implementation plan. The vendor-neutral *instrumentation* points are the P8 swap; the logging mandate is met in the interim by `tracing`.
+> **Implementation status.** `libs/telemetry` configures **structured `tracing` logs** (env-filtered) — satisfying the "every decision/transition/tool-call/error is logged" mandate — and `correlation_id` is a column on `work_items`/`events`, propagated through the data model. On Azure, the Container Apps environment ships each service's stdout/stderr to **Log Analytics**, so those structured logs are **KQL-queryable in production today**. The in-process **OpenTelemetry traces/metrics exporter** (OTLP → Azure Monitor) is a **deliberately deferred upgrade** — no `opentelemetry` deps are added yet; logs-to-Log-Analytics covers the observability need in the interim.
 
 ## Deployment & local parity
 
 - **Azure:** Container Apps environment hosting the services (N replicas) and worker Jobs; Azure DB for PostgreSQL Flexible Server; Blob Storage with lifecycle policies; Key Vault; ACR for images; Azure Monitor. Provisioned as **Bicep** (see [Infrastructure & sizing](#infrastructure--sizing-azure)).
-- **CI/CD:** GitHub Actions runs `cargo fmt --check && cargo clippy -D warnings && cargo test`, builds images, pushes to ACR, deploys to Container Apps.
+- **CI/CD:** GitHub Actions runs the Rust gates (`cargo fmt --check && cargo clippy -D warnings && cargo test`) plus `az bicep build`/`build-params` and `actionlint` (warnings = errors). Deploy is `workflow_dispatch`, authenticated by **OIDC federated credentials** (no stored cloud secret), and runs in **two phases** to break the ACR/image bootstrap cycle (an app can't be created before its image exists, but the ACR that holds it is in the same template): **phase 1** provisions infra + an empty ACR (`deployWorkloads=false`); the service + worker images are then built **in ACR** and pushed; **phase 2** deploys the workloads (`deployWorkloads=true`). A one-shot **migrate Job** runs to completion before the service revisions roll. Operator steps: `docs/runbooks/azure-deploy.md`.
 - **Local:** `docker-compose` brings up Postgres + **Azurite** (Blob emulator) + the Factory services; workers run as local Docker containers driving Claude Code. Same binaries/images as production — one codebase, not two.
 
 ## Infrastructure & sizing (Azure)
 
-Provisioned as **Bicep** (Azure-native, no state backend), across two environments — **dev** and **prod** — as separate resource groups (ideally separate subscriptions), parameterized by environment. **Single region** (regional-outage survival is an explicit non-goal).
+Provisioned as **Bicep** (Azure-native, no state backend). Each environment — **dev** and **prod** — is **one self-contained resource group** (ideally separate subscriptions): `infra/main.bicep` deploys at resource-group scope, so per-environment separation is by RG + `*.bicepparam`, not multiple RGs in one deployment. Resource names use `namePrefix` + env + `uniqueString()` for globally-unique ACR / Key-Vault / storage names. **Single region** (regional-outage survival is an explicit non-goal).
 
 | Resource | dev | prod | Notes |
 | --- | --- | --- | --- |
@@ -451,12 +453,14 @@ Provisioned as **Bicep** (Azure-native, no state backend), across two environmen
 | Azure Key Vault | Standard | Standard | Secrets; accessed via Managed Identity. |
 | Azure Monitor / Log Analytics / App Insights | shared workspace | dedicated workspace | OTel export sink. |
 
-**Identity & access:** each service runs with a **user-assigned Managed Identity** holding least-privilege roles (Postgres login, Blob Data Contributor on its own container, Key Vault Secrets User). **Networking:** services exposed over HTTPS; in prod, Postgres/Blob reached via private endpoints; in dev, public access + firewall rules for simplicity.
+**Bicep layout.** `infra/main.bicep` composes per-concern modules — Postgres, storage (+ the 30-day lifecycle policy), Container Apps environment (+ Log Analytics), ACR, Key Vault and its secrets, per-service identities and role assignments, the five service apps, and the worker + migrate **Jobs** — behind the `deployWorkloads` flag described under [Deployment](#deployment--local-parity). Workers and the migration each run as Container Apps **Jobs** (worker: event/manual-triggered, scale-to-zero; migrate: one-shot).
+
+**Identity & access:** each service runs with a **user-assigned Managed Identity** holding only the roles it needs — Key Vault Secrets User, Blob Data Contributor on its own container, AcrPull; the dispatcher's MI may additionally **start the worker Job**. Secrets reach the apps as **environment variables via `secretRef`** (resolved through each app's MI), so services read `GITHUB_APP_*`, `CLAUDE_CODE_OAUTH_TOKEN`, `DATABASE_URL`, and blob config from the environment exactly as they do locally — there is **no in-code Key Vault client**. **Networking:** services exposed over HTTPS; in prod, Postgres/Blob reached via private endpoints; in dev, public access + firewall rules for simplicity.
 
 ## Database migrations & rollback
 
 - **Tool:** **sqlx migrations** — versioned SQL files in `migrations/`, committed to the repo, applied with `sqlx migrate run`. No second tool beyond our DB layer.
-- **Application:** a **dedicated pipeline step** runs migrations exactly once (single runner) **before** the new service revision rolls out, so the N replicas never race and schema change is decoupled from app start.
+- **Application:** a dedicated one-shot **migrate Container Apps Job** (the same services image, run by CD) applies migrations exactly once **before** the new service revisions roll out, so the N replicas never race and schema change is decoupled from app start. (Services also keep an idempotent, advisory-locked startup-migrate as a belt-and-suspenders no-op.)
 - **Model — forward-only + expand/contract** (no down-migrations):
   1. **Expand** — additive only (new nullable column, new table, index built `CONCURRENTLY`); deployed first, so old *and* new app versions both work against it.
   2. **Backfill** — migrate/populate data in a later step if needed.
