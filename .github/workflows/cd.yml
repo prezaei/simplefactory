@@ -91,14 +91,15 @@ jobs:
           echo "ACR: $acr"
 
       # Build both images in ACR (cloud build — no docker-in-CI), tagged with the image tag.
-      - name: Build & push images (az acr build)
+      # acb.yaml builds both in ONE run so the shared Rust builder stage compiles once (the worker
+      # build reuses the services build's cached builder layers) instead of two full recompiles.
+      - name: Build & push images (az acr run, one shared-builder compile)
         env:
           ACR: ${{ steps.infra.outputs.acr }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          az acr build --registry "$ACR" --image "factory-services:$TAG" --target services -f Dockerfile .
-          az acr build --registry "$ACR" --image "factory-worker:$TAG"   --target worker   -f Dockerfile .
+          az acr run --registry "$ACR" -f acb.yaml --set tag="$TAG" .
 
       # Phase 2 — now that the images exist, deploy the workloads (apps + jobs).
       - name: Deploy workloads (phase 2, deployWorkloads=true)

@@ -6,7 +6,7 @@
 # does NOT auto-teardown — that would destroy a good/partial deploy + its logs on a transient
 # blip); re-run `redeploy` to retry from a clean slate.
 #
-# Two-phase (breaks the ACR/image bootstrap cycle): phase-1 infra + ACR → az acr build →
+# Two-phase (breaks the ACR/image bootstrap cycle): phase-1 infra + ACR → az acr run (acb.yaml) →
 # phase-2 workloads → migration job → structural verify.
 #
 # Usage:
@@ -70,18 +70,19 @@ deploy() {
     -p deployWorkloads=false --query properties.outputs.acrName.value -o tsv)
   log "ACR = $acr"
 
-  log "building + pushing images (az acr build, from a clean source export)"
-  # Build context = a `git archive` of HEAD (tracked files only). `az acr build` walks the WHOLE
-  # context directory to build the upload tar even though .dockerignore excludes target/ from the
-  # image — and this repo's target/ can be tens of GB (Rust artifacts), which makes packing the
-  # live worktree pathologically slow (minutes at full CPU before any upload). A git-archive
-  # export is only the tracked source → instant pack + tiny upload. (It also can't leak an
-  # untracked .env.live, which isn't in git.)
+  log "building + pushing images (az acr run, one shared-builder compile, clean source export)"
+  # Build context = a `git archive` of HEAD (tracked files only, incl. acb.yaml + Dockerfile).
+  # Two reasons not to point ACR at the live worktree: (1) `az acr` walks the WHOLE context dir to
+  # pack the upload tar even though .dockerignore excludes target/ from the image, and this repo's
+  # target/ can be tens of GB (Rust artifacts) → pathologically slow pack; a git-archive is only
+  # tracked source (instant pack, and can't leak an untracked .env.live).
+  # acb.yaml builds BOTH images in ONE run so the shared Rust `builder` stage compiles ONCE (the
+  # worker build reuses the services build's cached builder layers) — vs two `az acr build` runs
+  # that each recompiled the whole workspace.
   local ctx
   ctx="$(mktemp -d)"
   git -C "$ROOT" archive HEAD | tar -x -C "$ctx"
-  az acr build --registry "$acr" --image "factory-services:$FACTORY_IMAGE_TAG" --target services -f "$ctx/Dockerfile" "$ctx"
-  az acr build --registry "$acr" --image "factory-worker:$FACTORY_IMAGE_TAG"   --target worker   -f "$ctx/Dockerfile" "$ctx"
+  az acr run --registry "$acr" -f acb.yaml --set tag="$FACTORY_IMAGE_TAG" "$ctx"
   rm -rf "$ctx"
 
   log "phase 2 — workloads (deployWorkloads=true)"
