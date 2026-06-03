@@ -167,7 +167,9 @@ resource pg 'Microsoft.DBforPostgreSQL/flexibleServers@2023-12-01-preview' = {
     backup: { backupRetentionDays: 7, geoRedundantBackup: 'Disabled' }
     highAvailability: { mode: 'Disabled' }
     network: {
-      // dev: public access + firewall (simpler). prod should use a private endpoint.
+      // Public access + firewall (simpler). Prod hardening (deferred) = a private endpoint
+      // with publicNetworkAccess 'Disabled', at which point the AllowAzureServices rule below
+      // becomes unnecessary. See docs/runbooks/azure-deploy.md "Prod hardening".
       publicNetworkAccess: 'Enabled'
     }
   }
@@ -180,12 +182,17 @@ resource pgDb 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2023-12-01-pr
     collation: 'en_US.utf8'
   }
 }
-// dev firewall: allow other Azure services + an optional operator IP.
-resource pgAllowAzure 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2023-12-01-preview' = if (isDev) {
+// Allow Azure-origin traffic (the special 0.0.0.0 rule) whenever public access is on — this is
+// what lets the Container Apps services + jobs reach Postgres. It must track the networking
+// config, NOT the env: `publicNetworkAccess` is 'Enabled' for every env here, so a prod deploy
+// needs this rule too (without it, prod Postgres is unreachable by Container Apps). It becomes
+// unnecessary only once prod moves to a private endpoint (publicNetworkAccess 'Disabled').
+resource pgAllowAzure 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2023-12-01-preview' = {
   parent: pg
   name: 'AllowAzureServices'
   properties: { startIpAddress: '0.0.0.0', endIpAddress: '0.0.0.0' }
 }
+// dev convenience: an optional operator IP through the firewall (e.g. for psql from a laptop).
 resource pgAllowClient 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2023-12-01-preview' = if (isDev && !empty(devClientIp)) {
   parent: pg
   name: 'AllowClientIp'
