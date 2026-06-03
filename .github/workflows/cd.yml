@@ -1,0 +1,153 @@
+name: CD (Azure)
+
+# Manual deploy of the Factory stack into its single resource group (P8). Operator-run
+# (the live `az` calls below need a real subscription + the OIDC federated credential
+# configured per docs/runbooks/azure-deploy.md). workflow_dispatch only — no auto-deploy.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment (dev | prod)
+        type: choice
+        options: [dev, prod]
+        default: dev
+      image_tag:
+        description: Image tag to build & deploy (defaults to the commit SHA)
+        type: string
+        required: false
+        default: ''
+
+# OIDC: GitHub mints a short-lived token that azure/login exchanges for an Azure token
+# against the App Registration's federated credential — no long-lived client secret.
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  # One deploy per environment at a time (a second push waits rather than racing ARM).
+  group: cd-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      RG: ${{ vars.FACTORY_RESOURCE_GROUP }}
+      REGION: ${{ vars.FACTORY_REGION }}
+      ENVN: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Resolve + VALIDATE the image tag. The operator-supplied input flows into shell +
+      # `az` commands below, so it is taken via env (never inline `${{ }}` in run:) and
+      # constrained to valid Docker-tag characters — rejecting any shell metacharacter.
+      - name: Resolve image tag
+        id: tag
+        env:
+          IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          tag="$IMAGE_TAG_INPUT"
+          if [ -z "$tag" ]; then tag="${GITHUB_SHA::12}"; fi
+          if ! printf '%s' "$tag" | grep -Eq '^[A-Za-z0-9._-]{1,128}$'; then
+            echo "::error::invalid image tag '$tag' (allowed: A-Za-z0-9._-)"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Deploying image tag: $tag"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure resource group
+        run: az group create -n "$RG" -l "$REGION" -o none
+
+      # Phase 1 — infra + an empty ACR, WITHOUT the workloads (an app can't be created
+      # before its image exists; the ACR that holds the image is created here). Secrets are
+      # read by the .bicepparam from these env vars at compile time.
+      - name: Deploy infra (phase 1, deployWorkloads=false)
+        id: infra
+        env:
+          FACTORY_IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+          FACTORY_DEV_CLIENT_IP: ''
+          FACTORY_GITHUB_APP_ID: ${{ secrets.FACTORY_GITHUB_APP_ID }}
+          FACTORY_GITHUB_APP_PRIVATE_KEY: ${{ secrets.FACTORY_GITHUB_APP_PRIVATE_KEY }}
+          FACTORY_GITHUB_WEBHOOK_SECRET: ${{ secrets.FACTORY_GITHUB_WEBHOOK_SECRET }}
+          FACTORY_CLAUDE_OAUTH_TOKEN: ${{ secrets.FACTORY_CLAUDE_OAUTH_TOKEN }}
+          FACTORY_PG_ADMIN_PASSWORD: ${{ secrets.FACTORY_PG_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          acr=$(az deployment group create \
+            -g "$RG" -n "factory-infra-${ENVN}" \
+            -f infra/main.bicep -p "infra/main.${ENVN}.bicepparam" \
+            -p deployWorkloads=false \
+            --query 'properties.outputs.acrName.value' -o tsv)
+          echo "acr=$acr" >> "$GITHUB_OUTPUT"
+          echo "ACR: $acr"
+
+      # Build both images in ACR (cloud build — no docker-in-CI), tagged with the image tag.
+      - name: Build & push images (az acr build)
+        env:
+          ACR: ${{ steps.infra.outputs.acr }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          az acr build --registry "$ACR" --image "factory-services:$TAG" --target services -f Dockerfile .
+          az acr build --registry "$ACR" --image "factory-worker:$TAG"   --target worker   -f Dockerfile .
+
+      # Phase 2 — now that the images exist, deploy the workloads (apps + jobs).
+      - name: Deploy workloads (phase 2, deployWorkloads=true)
+        env:
+          FACTORY_IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+          FACTORY_DEV_CLIENT_IP: ''
+          FACTORY_GITHUB_APP_ID: ${{ secrets.FACTORY_GITHUB_APP_ID }}
+          FACTORY_GITHUB_APP_PRIVATE_KEY: ${{ secrets.FACTORY_GITHUB_APP_PRIVATE_KEY }}
+          FACTORY_GITHUB_WEBHOOK_SECRET: ${{ secrets.FACTORY_GITHUB_WEBHOOK_SECRET }}
+          FACTORY_CLAUDE_OAUTH_TOKEN: ${{ secrets.FACTORY_CLAUDE_OAUTH_TOKEN }}
+          FACTORY_PG_ADMIN_PASSWORD: ${{ secrets.FACTORY_PG_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            -g "$RG" -n "factory-workloads-${ENVN}" \
+            -f infra/main.bicep -p "infra/main.${ENVN}.bicepparam" \
+            -p deployWorkloads=true -o none
+
+      # Explicit, observable DB migration gate. (The services also self-migrate on boot, and
+      # migrations are idempotent / advisory-locked, so this is a clear failure signal, not the
+      # only migration path.) Start the one-shot migrate Job and wait for it to succeed.
+      - name: Run migration job
+        run: |
+          set -euo pipefail
+          job="factory-migrate-${ENVN}"
+          exec_name=$(az containerapp job start -g "$RG" -n "$job" --query name -o tsv)
+          if [ -z "$exec_name" ]; then echo "job start returned no execution name"; exit 1; fi
+          echo "migration execution: $exec_name"
+          for i in $(seq 1 60); do
+            status=$(az containerapp job execution show -g "$RG" --job-name "$job" \
+              --job-execution-name "$exec_name" --query 'properties.status' -o tsv 2>/dev/null || echo "")
+            echo "  [$i] status=${status:-<unavailable>}"
+            case "$status" in
+              Succeeded) echo "migration succeeded"; exit 0 ;;
+              Failed|Cancelled|Degraded) echo "migration ended in status: $status"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "migration timed out after ~10m (last status: ${status:-<unavailable>})"; exit 1
+
+      - name: Deployment summary
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          intake=$(az containerapp show -g "$RG" -n intake \
+            --query 'properties.configuration.ingress.fqdn' -o tsv 2>/dev/null || echo "n/a")
+          {
+            echo "### Factory deployed (${ENVN})"
+            echo "- image tag: \`$TAG\`"
+            echo "- intake webhook URL: \`https://$intake/webhooks/github\`"
+          } >> "$GITHUB_STEP_SUMMARY"

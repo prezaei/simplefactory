@@ -25,6 +25,7 @@ RUN cargo build --release --locked \
     -p factory-dispatcher \
     -p factory-coordinator \
     -p factory-dashboard-api \
+    -p factory-migrate \
     -p factory-worker
 
 # ---- services: the long-running service binaries ----
@@ -39,6 +40,7 @@ COPY --from=builder \
     /src/target/release/factory-dispatcher \
     /src/target/release/factory-coordinator \
     /src/target/release/factory-dashboard-api \
+    /src/target/release/factory-migrate \
     /usr/local/bin/
 # The dispatcher launches worker containers via `docker run` against the host's
 # mounted socket, so it needs the docker CLI client (only the client, not a daemon).

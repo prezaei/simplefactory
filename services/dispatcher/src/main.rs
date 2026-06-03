@@ -1,10 +1,14 @@
-//! Dispatcher service binary: every tick, lease ready work under capacity caps
-//! and launch a worker job per task via the live [`DockerLauncher`] (P3).
+//! Dispatcher service binary: every tick, lease ready work under capacity caps and
+//! launch a worker job per task. The launcher is selected by `FACTORY_WORKER_RUNTIME`:
+//! `docker` (default, local — [`DockerLauncher`]) or `container_apps` (Azure, P8 —
+//! [`ContainerAppsJobLauncher`]).
 #![forbid(unsafe_code)]
 
 use std::time::Duration;
 
-use factory_dispatcher::{dispatch_once, DockerLauncher, WorkerRuntime};
+use factory_dispatcher::{
+    dispatch_once, ContainerAppsJobLauncher, DockerLauncher, WorkerLauncher, WorkerRuntime,
+};
 use factory_github::OctocrabGitHub;
 use uuid::Uuid;
 
@@ -17,8 +21,6 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url =
         std::env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL is required"))?;
-    let image = std::env::var("FACTORY_WORKER_IMAGE")
-        .map_err(|_| anyhow::anyhow!("FACTORY_WORKER_IMAGE is required"))?;
     let tools_url = std::env::var("FACTORY_TOOLS_URL")
         .map_err(|_| anyhow::anyhow!("FACTORY_TOOLS_URL is required"))?;
 
@@ -32,22 +34,52 @@ async fn main() -> anyhow::Result<()> {
     let pool = factory_record::connect(&database_url).await?;
     factory_record::migrate(&pool).await?;
 
-    // Forward the worker-container runtime wiring (Azure Blob connection string +
-    // claude token) read from the dispatcher's env. A worker launched via `docker
-    // run` isn't on the compose network, so it can't inherit these — they must be
-    // injected explicitly per launch.
-    let runtime = WorkerRuntime::from_env();
-    // Fail loud-but-early-ish: every worker hard-requires the blob connection string
-    // (no Fs fallback), so without it on the dispatcher each launched container would
-    // boot-loop on startup. Warn once here so the cause is one clear dispatcher log,
-    // not a stream of opaque per-worker boot failures.
-    if runtime.blob_connection_string.is_none() {
-        tracing::warn!(
-            "FACTORY_BLOB_CONNECTION_STRING is not set on the dispatcher; launched workers \
-             require it and will fail to start (no checkpoints / crash-resume)"
-        );
-    }
-    let launcher = DockerLauncher::new(image.clone()).with_runtime(runtime);
+    // Select the worker runtime. `container_apps` (Azure, P8): start a Container Apps Job
+    // per task — secrets (blob/claude) come from the Job template's Key Vault, so the
+    // dispatcher injects only per-task env. Otherwise `docker` (local): inject the blob
+    // connection string + claude token per `docker run` (a local worker isn't on the
+    // compose network and can't inherit them).
+    let launcher: Box<dyn WorkerLauncher> = match std::env::var("FACTORY_WORKER_RUNTIME")
+        .ok()
+        .as_deref()
+    {
+        Some("container_apps") => {
+            let require = |k: &str| {
+                factory_dispatcher::non_empty_env(k).ok_or_else(|| {
+                    anyhow::anyhow!("{k} is required for the container_apps runtime")
+                })
+            };
+            let subscription = require("FACTORY_AZURE_SUBSCRIPTION_ID")?;
+            let resource_group = require("FACTORY_AZURE_RESOURCE_GROUP")?;
+            let job_name = require("FACTORY_WORKER_JOB_NAME")?;
+            let mi_client_id =
+                factory_dispatcher::non_empty_env("FACTORY_MANAGED_IDENTITY_CLIENT_ID");
+            tracing::info!(%subscription, %resource_group, %job_name, "dispatcher: Azure Container Apps Jobs runtime");
+            Box::new(ContainerAppsJobLauncher::new(
+                subscription,
+                resource_group,
+                job_name,
+                mi_client_id,
+            ))
+        }
+        _ => {
+            let image = std::env::var("FACTORY_WORKER_IMAGE").map_err(|_| {
+                anyhow::anyhow!("FACTORY_WORKER_IMAGE is required for the docker runtime")
+            })?;
+            let runtime = WorkerRuntime::from_env();
+            // Every worker hard-requires the blob connection string (no Fs fallback);
+            // warn once here so a missing one is one clear dispatcher log, not a stream
+            // of opaque per-worker boot failures.
+            if runtime.blob_connection_string.is_none() {
+                tracing::warn!(
+                    "FACTORY_BLOB_CONNECTION_STRING is not set on the dispatcher; launched \
+                         workers require it and will fail to start (no checkpoints / crash-resume)"
+                );
+            }
+            tracing::info!(worker_image = %image, "dispatcher: local Docker runtime");
+            Box::new(DockerLauncher::new(image).with_runtime(runtime))
+        }
+    };
 
     // The dispatcher mints a per-launch installation token via the GitHub App. If
     // the App credentials are absent we keep the loop alive but skip every tick:
@@ -62,7 +94,6 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(
         %lease_owner,
-        worker_image = %image,
         tools_url = %tools_url,
         tick_secs = DISPATCH_TICK.as_secs(),
         "dispatcher starting"
@@ -75,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!("skipping dispatch tick: GitHub App credentials are not configured");
             continue;
         };
-        match dispatch_once(&pool, &launcher, gh, &tools_url, &lease_owner).await {
+        match dispatch_once(&pool, launcher.as_ref(), gh, &tools_url, &lease_owner).await {
             Ok(n) if n > 0 => tracing::info!(launched = n, "dispatch tick launched workers"),
             Ok(_) => tracing::info!("dispatch tick launched nothing"),
             Err(e) => tracing::error!(error = %e, "dispatch tick failed"),

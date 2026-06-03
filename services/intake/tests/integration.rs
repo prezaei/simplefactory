@@ -675,6 +675,7 @@ async fn installation_webhook_onboards_offboards_and_reactivates_repo() {
         installation_id: 4242,
         added: vec![coord(&name)],
         removed: vec![],
+        remove_all: false,
     };
     assert_eq!(
         ingest(&pool, &created, &unique("dlv")).await.unwrap(),
@@ -703,6 +704,7 @@ async fn installation_webhook_onboards_offboards_and_reactivates_repo() {
         installation_id: 4242,
         added: vec![],
         removed: vec![coord(&name)],
+        remove_all: false,
     };
     assert_eq!(
         ingest(&pool, &deleted, &unique("dlv")).await.unwrap(),
@@ -725,6 +727,7 @@ async fn installation_webhook_onboards_offboards_and_reactivates_repo() {
         installation_id: 5555,
         added: vec![coord(&name)],
         removed: vec![],
+        remove_all: false,
     };
     assert_eq!(
         ingest(&pool, &reinstalled, &unique("dlv")).await.unwrap(),
@@ -749,5 +752,53 @@ async fn installation_webhook_onboards_offboards_and_reactivates_repo() {
             .installation_id,
         5555,
         "re-onboard refreshes the installation id"
+    );
+}
+
+#[tokio::test]
+async fn installation_deleted_offboards_all_repos_for_the_installation() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
+    // A UNIQUE installation id so the by-installation offboard can't touch other tests' repos.
+    let inst: i64 = (Uuid::now_v7().as_u128() & 0x3fff_ffff) as i64 + 1;
+    let a = unique("uninstall-a");
+    let b = unique("uninstall-b");
+    record::upsert_repo(&pool, "acme", &a, inst).await.unwrap();
+    record::upsert_repo(&pool, "acme", &b, inst).await.unwrap();
+
+    // Uninstall: GitHub's `installation` `deleted` carries no repo list → remove_all=true,
+    // which must offboard EVERY repo for the installation (not the empty `removed` list).
+    let deleted = WebhookEvent::Installation {
+        installation_id: inst,
+        added: vec![],
+        removed: vec![],
+        remove_all: true,
+    };
+    assert_eq!(
+        ingest(&pool, &deleted, &unique("dlv")).await.unwrap(),
+        IngestOutcome::Installation {
+            onboarded: 0,
+            offboarded: 2
+        }
+    );
+    // Both repos are now removed (repo_by_name only returns active repos).
+    assert!(record::repo_by_name(&pool, "acme", &a)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(record::repo_by_name(&pool, "acme", &b)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Re-delivery is idempotent — nothing active left, so zero offboarded.
+    assert_eq!(
+        ingest(&pool, &deleted, &unique("dlv")).await.unwrap(),
+        IngestOutcome::Installation {
+            onboarded: 0,
+            offboarded: 0
+        }
     );
 }

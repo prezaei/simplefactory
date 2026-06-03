@@ -140,12 +140,15 @@ pub enum WebhookEvent {
     /// The GitHub App was installed/uninstalled, or repos were added/removed from an
     /// existing installation. Drives repo onboarding/offboarding (P8): `added` repos are
     /// upserted into the record book with `installation_id` (so no manual seeding), and
-    /// `removed` repos are deactivated. One `installation_id` per delivery; the repos are
-    /// owner/name pairs.
+    /// `removed` repos are deactivated. `remove_all` is set for an **uninstall/suspend**
+    /// (`installation` `deleted`/`suspend`), whose payload carries NO repository list — so
+    /// the handler offboards *every* repo for `installation_id` rather than the (empty)
+    /// `removed` list. One `installation_id` per delivery; repos are owner/name pairs.
     Installation {
         installation_id: i64,
         added: Vec<RepoCoord>,
         removed: Vec<RepoCoord>,
+        remove_all: bool,
     },
     /// Anything Factory doesn't act on.
     Other,
@@ -263,25 +266,30 @@ pub fn parse_event(event_type: &str, payload: &[u8]) -> Result<WebhookEvent, Git
         "installation" => {
             let p: InstallationPayload = serde_json::from_slice(payload)?;
             let coords = full_names_to_coords(&p.repositories);
-            let (added, removed) = match p.action.as_str() {
-                "created" | "unsuspend" => (coords, Vec::new()),
-                "deleted" | "suspend" => (Vec::new(), coords),
+            // deleted/suspend payloads do NOT carry a repositories list, so we can't derive
+            // the repos to offboard — set `remove_all` to offboard every repo for the
+            // installation id instead.
+            let (added, removed, remove_all) = match p.action.as_str() {
+                "created" | "unsuspend" => (coords, Vec::new(), false),
+                "deleted" | "suspend" => (Vec::new(), Vec::new(), true),
                 // e.g. "new_permissions_accepted" — no repo membership change.
-                _ => (Vec::new(), Vec::new()),
+                _ => (Vec::new(), Vec::new(), false),
             };
             Ok(WebhookEvent::Installation {
                 installation_id: p.installation.id,
                 added,
                 removed,
+                remove_all,
             })
         }
-        // Repos added to / removed from an existing installation.
+        // Repos added to / removed from an existing installation (carries explicit lists).
         "installation_repositories" => {
             let p: InstallationPayload = serde_json::from_slice(payload)?;
             Ok(WebhookEvent::Installation {
                 installation_id: p.installation.id,
                 added: full_names_to_coords(&p.repositories_added),
                 removed: full_names_to_coords(&p.repositories_removed),
+                remove_all: false,
             })
         }
         _ => Ok(WebhookEvent::Other),
@@ -602,6 +610,7 @@ mod tests {
             installation_id,
             added,
             removed,
+            remove_all,
         } = ev
         else {
             panic!("expected installation");
@@ -621,27 +630,29 @@ mod tests {
             ]
         );
         assert!(removed.is_empty());
+        assert!(!remove_all);
     }
 
     #[test]
-    fn parses_installation_deleted_offboards_repos() {
-        let payload = br#"{
-            "action": "deleted",
-            "installation": { "id": 5 },
-            "repositories": [ { "full_name": "acme/widgets" } ]
-        }"#;
-        let WebhookEvent::Installation { added, removed, .. } =
-            parse_event("installation", payload).unwrap()
+    fn parses_installation_deleted_offboards_the_whole_installation() {
+        // An uninstall payload carries NO repositories list, so we offboard by
+        // installation id via `remove_all` rather than the (empty) `removed` list.
+        let payload = br#"{ "action": "deleted", "installation": { "id": 5 } }"#;
+        let WebhookEvent::Installation {
+            installation_id,
+            added,
+            removed,
+            remove_all,
+        } = parse_event("installation", payload).unwrap()
         else {
             panic!("expected installation");
         };
+        assert_eq!(installation_id, 5);
         assert!(added.is_empty());
-        assert_eq!(
-            removed,
-            vec![RepoCoord {
-                owner: "acme".into(),
-                name: "widgets".into()
-            }]
+        assert!(removed.is_empty());
+        assert!(
+            remove_all,
+            "uninstall offboards every repo for the installation"
         );
     }
 
@@ -657,11 +668,13 @@ mod tests {
             installation_id,
             added,
             removed,
+            remove_all,
         } = parse_event("installation_repositories", payload).unwrap()
         else {
             panic!("expected installation");
         };
         assert_eq!(installation_id, 9);
+        assert!(!remove_all);
         assert_eq!(
             added,
             vec![RepoCoord {
@@ -683,12 +696,16 @@ mod tests {
     fn installation_new_permissions_accepted_changes_no_repos() {
         let payload = br#"{ "action": "new_permissions_accepted", "installation": { "id": 1 },
             "repositories": [ { "full_name": "o/r" } ] }"#;
-        let WebhookEvent::Installation { added, removed, .. } =
-            parse_event("installation", payload).unwrap()
+        let WebhookEvent::Installation {
+            added,
+            removed,
+            remove_all,
+            ..
+        } = parse_event("installation", payload).unwrap()
         else {
             panic!("expected installation");
         };
-        assert!(added.is_empty() && removed.is_empty());
+        assert!(added.is_empty() && removed.is_empty() && !remove_all);
     }
 
     #[test]

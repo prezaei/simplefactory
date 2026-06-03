@@ -780,10 +780,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "factory-azure-auth",
  "factory-config",
  "factory-github",
  "factory-record",
  "factory-telemetry",
+ "reqwest",
  "serde_json",
  "sqlx",
  "tokio",
