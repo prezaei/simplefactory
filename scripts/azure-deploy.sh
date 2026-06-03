@@ -81,7 +81,7 @@ deploy() {
   local acr
   acr=$(az deployment group create -g "$RG" -n "${PREFIX}-infra-${ENVN}" \
     -f "$ROOT/infra/main.bicep" -p "$ROOT/infra/main.${ENVN}.bicepparam" \
-    -p deployWorkloads=false --query properties.outputs.acrName.value -o tsv)
+    -p namePrefix="$PREFIX" -p deployWorkloads=false --query properties.outputs.acrName.value -o tsv)
   log "ACR = $acr"
 
   log "building + pushing images (az acr run, one shared-builder compile, clean source export)"
@@ -108,7 +108,7 @@ deploy() {
   log "phase 2 — workloads (deployWorkloads=true)"
   az deployment group create -g "$RG" -n "${PREFIX}-workloads-${ENVN}" \
     -f "$ROOT/infra/main.bicep" -p "$ROOT/infra/main.${ENVN}.bicepparam" \
-    -p deployWorkloads=true -o none
+    -p namePrefix="$PREFIX" -p deployWorkloads=true -o none
 
   log "running one-shot migration job"
   local job exec_name status
@@ -129,7 +129,7 @@ deploy() {
   [ "$status" = "Succeeded" ] || { echo "migration did not succeed (last: ${status:-none})"; return 1; }
 
   log "structural verification"
-  FACTORY_RG="$RG" FACTORY_ENV="$ENVN" FACTORY_IMAGE_TAG="$FACTORY_IMAGE_TAG" "$ROOT/scripts/verify-deploy.sh"
+  FACTORY_RG="$RG" FACTORY_ENV="$ENVN" FACTORY_NAME_PREFIX="$PREFIX" FACTORY_IMAGE_TAG="$FACTORY_IMAGE_TAG" "$ROOT/scripts/verify-deploy.sh"
 
   local fqdn
   fqdn=$(az containerapp show -g "$RG" -n intake --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null || echo "")
