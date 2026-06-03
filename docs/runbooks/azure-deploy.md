@@ -98,7 +98,7 @@ credential subject (`...:environment:dev`) matches.
 1. Logs in via OIDC.
 2. `az group create` (idempotent).
 3. **Phase 1** — deploys infra + an empty ACR (`deployWorkloads=false`).
-4. **`az acr build`** — builds + pushes `factory-services` and `factory-worker` to the ACR.
+4. **`az acr run -f acb.yaml`** — builds + pushes `factory-services` and `factory-worker` to the ACR in ONE run (the shared Rust builder stage compiles once; the worker build reuses its cached layers).
 5. **Phase 2** — deploys the workloads (apps + jobs) now that the images exist.
 6. Starts the **migrate Job** and waits for `Succeeded`.
 7. Prints the intake webhook URL to the job summary.
@@ -122,9 +122,9 @@ ACR=$(az deployment group create -g $RG -n factory-infra \
   -f infra/main.bicep -p infra/main.dev.bicepparam -p deployWorkloads=false \
   --query 'properties.outputs.acrName.value' -o tsv)
 
-# Build + push images
-az acr build --registry $ACR --image factory-services:$FACTORY_IMAGE_TAG --target services -f Dockerfile .
-az acr build --registry $ACR --image factory-worker:$FACTORY_IMAGE_TAG   --target worker   -f Dockerfile .
+# Build + push BOTH images in one ACR run (acb.yaml) — the shared Rust builder compiles once,
+# the worker build reuses its cached layers (~halves the build vs two separate `az acr build`).
+az acr run --registry $ACR -f acb.yaml --set tag=$FACTORY_IMAGE_TAG .
 
 # Phase 2: workloads
 az deployment group create -g $RG -n factory-workloads \

@@ -42,13 +42,22 @@ teardown() {
   # keeps its globally-unique name reserved and blocks recreating it). Scope strictly to this RG
   # via the deleted vault's original resourceId (`properties.vaultId`) — NEVER a sub-wide name
   # prefix, which would irreversibly `purge` other environments'/projects' ${PREFIX}-kv* vaults.
-  for v in $(az keyvault list-deleted --query "[?contains(properties.vaultId, '/resourceGroups/${RG}/')].name" -o tsv 2>/dev/null); do
+  # Capture the list separately so a FAILED enumeration (not logged in / insufficient RBAC) is
+  # warned about rather than silently treated as "nothing to purge" — a reserved vault name would
+  # otherwise make the next deploy fail non-obviously on KV create. ($() exit code is preserved
+  # because the assignment is on its own line, not `local x=$(...)` which always returns 0.)
+  local deleted
+  deleted=$(az keyvault list-deleted --query "[?contains(properties.vaultId, '/resourceGroups/${RG}/')].name" -o tsv 2>/dev/null) || {
+    log "WARNING: could not list soft-deleted Key Vaults (not logged in / insufficient RBAC?) — skipping purge; a reserved vault name could make the next deploy fail on KV create"
+    deleted=""
+  }
+  while IFS= read -r v; do
+    [ -z "$v" ] && continue
     log "purging soft-deleted Key Vault $v (was in $RG)"
-    # Don't silently swallow a purge failure: a still-reserved name makes the next deploy fail
-    # non-obviously on KV create. Warn loudly so teardown isn't reported clean when it wasn't.
+    # Don't silently swallow a purge failure either: warn loudly so teardown isn't reported clean.
     az keyvault purge -n "$v" >/dev/null 2>&1 \
       || log "WARNING: purge of $v failed — its name stays reserved; the next deploy may fail on KV create until it is purged manually (az keyvault purge -n $v)"
-  done
+  done <<< "$deleted"
 }
 
 deploy() {
@@ -124,7 +133,11 @@ deploy() {
 
   local fqdn
   fqdn=$(az containerapp show -g "$RG" -n intake --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null || echo "")
-  log "DEPLOY COMPLETE. Point the GitHub App webhook at: https://${fqdn}/webhooks/github"
+  if [ -n "$fqdn" ]; then
+    log "DEPLOY COMPLETE. Point the GitHub App webhook at: https://${fqdn}/webhooks/github"
+  else
+    log "DEPLOY COMPLETE. intake ingress FQDN not available yet — fetch it shortly with: az containerapp show -g $RG -n intake --query properties.configuration.ingress.fqdn -o tsv"
+  fi
 }
 
 # On failure, LEAVE resources in place for diagnosis — do NOT auto-teardown. Auto-deleting on any
