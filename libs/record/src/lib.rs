@@ -320,6 +320,28 @@ pub async fn deactivate_repo(pool: &Pool, owner: &str, name: &str) -> Result<Opt
     })
 }
 
+/// Offboard **every active repo** for an installation — used when the App is uninstalled or
+/// suspended (those webhooks carry no repository list, only the installation id). Marks all
+/// `active` repos with this `installation_id` as `removed` and returns `(id, owner, name)`
+/// for each, so the caller can audit per repo. Only `active` rows are touched (a
+/// deliberately-`suspended` repo is left untouched); idempotent (returns empty if none).
+pub async fn deactivate_repos_by_installation(
+    pool: &Pool,
+    installation_id: i64,
+) -> Result<Vec<(Uuid, String, String)>> {
+    let rows = sqlx::query(
+        "UPDATE repos SET status = 'removed', updated_at = now()
+          WHERE installation_id = $1 AND status = 'active'
+        RETURNING id, owner, name",
+    )
+    .bind(installation_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| Ok((r.try_get("id")?, r.try_get("owner")?, r.try_get("name")?)))
+        .collect()
+}
+
 /// Enqueue a work item. Idempotent: if an active item for the same
 /// (repo, subject, kind) already exists, returns [`EnqueueOutcome::DuplicateActive`].
 ///

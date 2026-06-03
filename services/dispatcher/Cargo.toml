@@ -18,6 +18,10 @@ factory-record.workspace = true
 factory-config.workspace = true
 factory-github.workspace = true
 factory-telemetry.workspace = true
+# P8: the Container Apps Jobs launcher gets an ARM token from the shared MI credential and
+# POSTs the job-start over the rustls reqwest already in the tree (no openssl).
+factory-azure-auth.workspace = true
+reqwest.workspace = true
 tokio = { workspace = true, features = ["process"] }
 tracing.workspace = true
 anyhow.workspace = true

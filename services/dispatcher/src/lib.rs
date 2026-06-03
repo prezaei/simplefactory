@@ -389,6 +389,127 @@ fn new_raw_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
+/// ARM management plane + the Container Apps Jobs `…/start` API version + the worker Job's
+/// container name (must match the Bicep worker-job container so the env override merges).
+const ARM_ENDPOINT: &str = "https://management.azure.com";
+const ARM_RESOURCE: &str = "https://management.azure.com";
+const CONTAINERAPPS_JOBS_API_VERSION: &str = "2024-03-01";
+const WORKER_CONTAINER_NAME: &str = "worker";
+
+/// Live launcher for **Azure Container Apps Jobs** (P8): starts a one-shot Job *execution*
+/// per task, overriding the worker container's env with the per-task values (token, role,
+/// repo, resume, …) via the ARM `Microsoft.App/jobs/{job}/start` REST API. Auth is an ARM
+/// bearer token from the dispatcher's Managed Identity. The blob connection + claude token
+/// are NOT injected here — in Container Apps they come from the Job template's Key Vault
+/// secrets; only the per-task env is overridden (hence `WorkerRuntime::default()` below).
+/// The HTTP call is the deploy seam ([`DockerLauncher`] stays for local); the request
+/// construction is pure + unit-tested.
+pub struct ContainerAppsJobLauncher {
+    subscription_id: String,
+    resource_group: String,
+    job_name: String,
+    credential: factory_azure_auth::ManagedIdentityCredential,
+    http: reqwest::Client,
+}
+
+impl ContainerAppsJobLauncher {
+    /// `mi_client_id` selects the dispatcher's user-assigned Managed Identity (`None` =
+    /// system-assigned).
+    pub fn new(
+        subscription_id: impl Into<String>,
+        resource_group: impl Into<String>,
+        job_name: impl Into<String>,
+        mi_client_id: Option<String>,
+    ) -> Self {
+        Self {
+            subscription_id: subscription_id.into(),
+            resource_group: resource_group.into(),
+            job_name: job_name.into(),
+            credential: factory_azure_auth::ManagedIdentityCredential::new(mi_client_id),
+            http: reqwest::Client::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkerLauncher for ContainerAppsJobLauncher {
+    async fn launch(&self, spec: &LaunchSpec) -> anyhow::Result<String> {
+        // Secrets/config that the Job template already carries (blob, claude) are NOT
+        // re-sent; only the per-task env is overridden, so a default runtime is correct.
+        let env = docker_env(&WorkerRuntime::default(), spec);
+        let url = job_start_url(&self.subscription_id, &self.resource_group, &self.job_name);
+        let body = job_start_body(&env);
+        let token = self
+            .credential
+            .bearer_token(ARM_RESOURCE)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("acquiring ARM token for Container Apps job start: {e}")
+            })?;
+        tracing::info!(
+            work_item = %spec.work_item_id,
+            role = spec.role.as_str(),
+            job = %self.job_name,
+            "ContainerAppsJobLauncher: starting job execution"
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Container Apps job start request: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let snippet: String = text.chars().take(500).collect();
+            anyhow::bail!("Container Apps job start returned {status}: {snippet}");
+        }
+        // Best-effort: the start response carries the new execution's `name`.
+        let execution =
+            parse_execution_name(&text).unwrap_or_else(|| format!("{}-execution", self.job_name));
+        tracing::info!(
+            work_item = %spec.work_item_id,
+            execution = %execution,
+            "ContainerAppsJobLauncher: job execution started"
+        );
+        Ok(execution)
+    }
+}
+
+/// The ARM URL to start a Container Apps Job execution. Pure + unit-tested.
+fn job_start_url(subscription_id: &str, resource_group: &str, job_name: &str) -> String {
+    format!(
+        "{ARM_ENDPOINT}/subscriptions/{subscription_id}/resourceGroups/{resource_group}\
+         /providers/Microsoft.App/jobs/{job_name}/start?api-version={CONTAINERAPPS_JOBS_API_VERSION}"
+    )
+}
+
+/// The Container Apps Jobs `start` body: a template override setting the worker container's
+/// env to the per-task pairs (merged by container name with the Job's base template). Pure
+/// + unit-tested. Secrets travel only as env *values* (never logged here).
+fn job_start_body(env: &[(&str, String)]) -> serde_json::Value {
+    let env_json: Vec<serde_json::Value> = env
+        .iter()
+        .map(|(k, v)| json!({ "name": k, "value": v }))
+        .collect();
+    json!({
+        "template": {
+            "containers": [ { "name": WORKER_CONTAINER_NAME, "env": env_json } ]
+        }
+    })
+}
+
+/// Extract the started execution's `name` from the ARM start response (best-effort).
+fn parse_execution_name(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(str::to_string)
+}
+
 /// One dispatch pass: lease ready work under caps and launch a worker per task.
 ///
 /// Returns the total number of workers launched across all repos. Per-repo and
@@ -622,6 +743,52 @@ mod tests {
             token_ttl_from_cap(record::DEFAULT_WALL_CLOCK_CAP_SECS),
             record::DEFAULT_WALL_CLOCK_CAP_SECS + TOKEN_TTL_GRACE_SECS
         );
+    }
+
+    #[test]
+    fn container_apps_job_start_url_is_the_arm_start_endpoint() {
+        let url = job_start_url("sub-1", "rg-factory", "factory-worker");
+        assert_eq!(
+            url,
+            "https://management.azure.com/subscriptions/sub-1/resourceGroups/rg-factory\
+             /providers/Microsoft.App/jobs/factory-worker/start?api-version=2024-03-01"
+        );
+    }
+
+    #[test]
+    fn container_apps_job_start_body_overrides_worker_env() {
+        let env = docker_env(&WorkerRuntime::default(), &spec());
+        let body = job_start_body(&env);
+        let container = &body["template"]["containers"][0];
+        assert_eq!(
+            container["name"], "worker",
+            "must match the Job's container name"
+        );
+        let env_arr = container["env"].as_array().expect("env array");
+        // Every (key,value) pair is rendered as {name,value}; the task token is present
+        // (as an env value — Container Apps gets blob/claude secrets from the Job template,
+        // so a default runtime omits them here).
+        let token = env_arr
+            .iter()
+            .find(|e| e["name"] == "FACTORY_TASK_TOKEN")
+            .expect("token env");
+        assert_eq!(token["value"], TOKEN);
+        let keys: Vec<&str> = env_arr.iter().filter_map(|e| e["name"].as_str()).collect();
+        assert!(keys.contains(&"FACTORY_ROLE") && keys.contains(&"FACTORY_TOOLS_URL"));
+        // Default runtime ⇒ no blob/claude secrets in the per-task override.
+        assert!(!keys.contains(&"FACTORY_BLOB_CONNECTION_STRING"));
+        assert!(!keys.contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
+    }
+
+    #[test]
+    fn parse_execution_name_reads_the_arm_response() {
+        let body = r#"{"id":"/subscriptions/s/.../executions/factory-worker-abc12","name":"factory-worker-abc12"}"#;
+        assert_eq!(
+            parse_execution_name(body),
+            Some("factory-worker-abc12".to_string())
+        );
+        assert_eq!(parse_execution_name("not json"), None);
+        assert_eq!(parse_execution_name("{}"), None);
     }
 
     #[test]

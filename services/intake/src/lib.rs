@@ -102,6 +102,7 @@ async fn process_installation(
     installation_id: i64,
     added: &[RepoCoord],
     removed: &[RepoCoord],
+    remove_all: bool,
 ) -> anyhow::Result<(Option<Uuid>, IngestOutcome)> {
     let mut onboarded = 0usize;
     for r in added {
@@ -134,25 +135,23 @@ async fn process_installation(
         .await?;
     }
     let mut offboarded = 0usize;
-    for r in removed {
-        // `deactivate_repo` returns the repo id only when an ACTIVE repo was removed, so an
-        // already-removed/suspended repo (or re-delivery) is a no-op that contributes nothing.
-        if let Some(repo_id) = record::deactivate_repo(pool, &r.owner, &r.name).await? {
+    if remove_all {
+        // Uninstall/suspend: the payload carries no repo list, so offboard EVERY active repo
+        // for this installation — otherwise an uninstall would leave repos active.
+        for (repo_id, owner, name) in
+            record::deactivate_repos_by_installation(pool, installation_id).await?
+        {
             offboarded += 1;
-            tracing::info!(
-                owner = %r.owner, name = %r.name, installation_id, %repo_id,
-                "offboarded repo via installation webhook"
-            );
-            record::append_event(
-                pool,
-                Some(repo_id),
-                None,
-                None,
-                "intake",
-                "repo_offboarded",
-                serde_json::json!({ "owner": r.owner, "name": r.name, "installation_id": installation_id }),
-            )
-            .await?;
+            audit_offboard(pool, repo_id, &owner, &name, installation_id).await?;
+        }
+    } else {
+        for r in removed {
+            // `deactivate_repo` returns the id only when an ACTIVE repo was removed, so an
+            // already-removed/suspended repo (or re-delivery) contributes nothing.
+            if let Some(repo_id) = record::deactivate_repo(pool, &r.owner, &r.name).await? {
+                offboarded += 1;
+                audit_offboard(pool, repo_id, &r.owner, &r.name, installation_id).await?;
+            }
         }
     }
     Ok((
@@ -162,6 +161,29 @@ async fn process_installation(
             offboarded,
         },
     ))
+}
+
+/// Audit (events book) + log one offboarded repo. Shared by the per-repo and
+/// whole-installation offboard paths.
+async fn audit_offboard(
+    pool: &Pool,
+    repo_id: Uuid,
+    owner: &str,
+    name: &str,
+    installation_id: i64,
+) -> anyhow::Result<()> {
+    tracing::info!(owner, name, installation_id, %repo_id, "offboarded repo via installation webhook");
+    record::append_event(
+        pool,
+        Some(repo_id),
+        None,
+        None,
+        "intake",
+        "repo_offboarded",
+        serde_json::json!({ "owner": owner, "name": name, "installation_id": installation_id }),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Resolve the repo + config and act on the event. Idempotent. Returns the
@@ -177,9 +199,10 @@ async fn process(
         installation_id,
         added,
         removed,
+        remove_all,
     } = event
     {
-        return process_installation(pool, *installation_id, added, removed).await;
+        return process_installation(pool, *installation_id, added, removed, *remove_all).await;
     }
 
     let Some(repo_ref) = event_repo(event) else {

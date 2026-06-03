@@ -15,6 +15,7 @@
 //! this code path is never exercised in tests).
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -38,9 +39,10 @@ const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct ManagedIdentityCredential {
     client_id: Option<String>,
     http: reqwest::Client,
-    /// Cache the last token until it nears expiry — MSI endpoints rate-limit, and every
-    /// call would otherwise re-fetch.
-    cached: Mutex<Option<AccessToken>>,
+    /// Cache tokens until they near expiry — MSI endpoints rate-limit. **Keyed by
+    /// resource** (one credential may serve multiple audiences, e.g. Storage AND ARM), so
+    /// a cached Storage token is never returned for an ARM request and vice versa.
+    cached: Mutex<HashMap<String, AccessToken>>,
 }
 
 impl std::fmt::Debug for ManagedIdentityCredential {
@@ -57,9 +59,25 @@ impl ManagedIdentityCredential {
         Self {
             client_id,
             http: reqwest::Client::new(),
-            cached: Mutex::new(None),
+            cached: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Fetch a bearer token *string* for `resource` — for non-`azure_storage` callers
+    /// (the dispatcher's Container Apps Jobs launcher needs an ARM token,
+    /// `https://management.azure.com`). Builds the `{resource}/.default` scope and returns
+    /// the secret. See [`default_scope`] for the pure scope-construction (unit-tested).
+    pub async fn bearer_token(&self, resource: &str) -> azure_core::Result<String> {
+        let scope = default_scope(resource);
+        let token = self.get_token(&[&scope]).await?;
+        Ok(token.token.secret().to_string())
+    }
+}
+
+/// The `{resource}/.default` OAuth scope for an audience `resource` (trailing slash
+/// normalized so we don't emit `…//.default`). Pure + unit-tested.
+fn default_scope(resource: &str) -> String {
+    format!("{}/.default", resource.trim_end_matches('/'))
 }
 
 /// A built MSI/IMDS token request: base URL + query pairs (encoded by reqwest) + the one
@@ -182,21 +200,23 @@ fn expires_on_unix(v: &serde_json::Value, now_unix: i64) -> Option<i64> {
 #[async_trait::async_trait]
 impl TokenCredential for ManagedIdentityCredential {
     async fn get_token(&self, scopes: &[&str]) -> azure_core::Result<AccessToken> {
-        // Serve a cached token until it nears expiry. Recover from a poisoned mutex
-        // (the critical section only clones/assigns, so the data is always consistent)
-        // rather than panicking and turning a recoverable state into a credential outage.
+        let resource = resource_for_scopes(scopes);
+        // Serve a cached token for THIS resource until it nears expiry. Keyed by resource so
+        // a credential serving multiple audiences (Storage + ARM) never returns a
+        // wrong-scope token. Recover from a poisoned mutex (the critical section only
+        // clones/inserts, so the map is always consistent) rather than panicking and
+        // turning a recoverable state into a credential outage.
         if let Some(tok) = self
             .cached
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
+            .get(&resource)
         {
             if tok.expires_on > OffsetDateTime::now_utc() {
                 return Ok(tok.clone());
             }
         }
 
-        let resource = resource_for_scopes(scopes);
         // Treat an empty env value as UNSET (a misconfigured/blank secret injection must
         // not select the Container Apps protocol with an empty X-IDENTITY-HEADER — that
         // would fail obscurely; fall cleanly back to IMDS instead).
@@ -243,12 +263,18 @@ impl TokenCredential for ManagedIdentityCredential {
             ));
         }
         let token = parse_token_response(&body, OffsetDateTime::now_utc().unix_timestamp())?;
-        *self.cached.lock().unwrap_or_else(|e| e.into_inner()) = Some(token.clone());
+        self.cached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(resource, token.clone());
         Ok(token)
     }
 
     async fn clear_cache(&self) -> azure_core::Result<()> {
-        *self.cached.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.cached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         Ok(())
     }
 }
@@ -310,6 +336,19 @@ mod tests {
             "header value must be redacted"
         );
         assert!(dbg.contains("<REDACTED>"));
+    }
+
+    #[test]
+    fn default_scope_appends_dot_default_and_normalizes_slash() {
+        assert_eq!(
+            default_scope("https://management.azure.com"),
+            "https://management.azure.com/.default"
+        );
+        // A trailing slash must not produce `…//.default`.
+        assert_eq!(
+            default_scope("https://management.azure.com/"),
+            "https://management.azure.com/.default"
+        );
     }
 
     #[test]
