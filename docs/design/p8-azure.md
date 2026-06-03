@@ -107,12 +107,16 @@ blob MI credential path, the OTel exporter, and the onboarding handler.
   redelivery is idempotent. Pure parsing unit-tested.
 
 ### 6. CD — `.github/workflows/cd.yml`
-- `workflow_dispatch` (manual; env input dev/prod). Steps: OIDC `azure/login` (federated creds — no
-  stored secret; operator creates the Entra app + federated credential), `az acr build` (or docker
-  build + push) for the services + worker images, run the **one-shot migration Job** (`az containerapp
-  job start` on the migrate-job, wait for success), then `az containerapp update`/revision for each
-  service + the worker job image. Idempotent; redeploy = prior revision (rollback drill documented).
-- **Test contract:** `actionlint` (add to CI) + a documented dry-run; the live run is operator-only.
+- `workflow_dispatch` (manual; env input dev/prod, image_tag input defaulting to the commit SHA).
+  OIDC `azure/login` (federated creds — no stored secret; operator creates the Entra app + federated
+  credential per the runbook). **Two-phase deploy** keyed off the Bicep `deployWorkloads` flag, which
+  breaks the ACR/image bootstrap cycle (an app can't be created before its image exists, but the ACR
+  that holds the image is in the same template): **phase 1** deploys infra + an empty ACR
+  (`deployWorkloads=false`); **`az acr build`** builds + pushes the services + worker images;
+  **phase 2** deploys the workloads (`deployWorkloads=true`). Then the **one-shot migration Job**
+  (`az containerapp job start` + poll to `Succeeded`). Idempotent; redeploy of a prior tag rolls back.
+- **Test contract:** `actionlint` (in CI) + `az bicep build`/`build-params` (in CI, warnings = errors)
+  + the documented runbook (`docs/runbooks/azure-deploy.md`); the live run is operator-only.
 
 ### 7. One-shot migration step
 - A dedicated **migrate** Container Apps Job (same services image, command = a `--migrate` subcommand
@@ -126,8 +130,11 @@ blob MI credential path, the OTel exporter, and the onboarding handler.
 
 ## Telemetry plan
 Every new function/decision/error path gets info-level logging (AGENTS.md): launcher job-start +
-failure, blob credential-mode selection, OTel enabled/disabled, onboarding upsert/deactivate,
-migration run. The OTel exporter is itself the telemetry upgrade (traces/metrics → Azure Monitor).
+failure, blob credential-mode selection, runtime selection (docker vs container_apps), onboarding
+upsert/deactivate (incl. uninstall offboard-all), migration run. **Logging transport (operator
+decision "Logs→Log Analytics now, OTel later"):** the Bicep wires the Container Apps environment's
+stdout/stderr → Log Analytics, so the structured `tracing` JSON is KQL-queryable now; the in-process
+OTel traces/metrics exporter is a deferred upgrade (no `opentelemetry` deps added this phase).
 
 ## Build sequence (actual cadence)
 Delivered as **two PRs** (operator chose to bank the foundational Rust first, then the heavier
@@ -137,9 +144,19 @@ deploy seams), each a full `/implement-e2e` run (gauntlet → Copilot-gated ship
   - one-shot `factory-migrate` bin;
   - blob Managed-Identity credential path (libs/blob), openssl-free.
   No behavior change to running services; all green on a clean DB.
-- **Part 2 (next PR off fresh main) — deploy seams + infra:**
-  - `ContainerAppsJobLauncher` (dispatcher) + a shared MI-auth crate extraction;
-  - OTel → Azure Monitor exporter (libs/telemetry);
-  - `infra/` Bicep (single resource group) + CI `az bicep build`/`actionlint`;
-  - GitHub Actions CD workflow.
+- **Part 2 (this PR) — deploy seams + infra:**
+  - `ContainerAppsJobLauncher` (dispatcher) over the shared `factory-azure-auth` MI crate; runtime
+    selected by `FACTORY_WORKER_RUNTIME` (`docker` default / `container_apps`);
+  - `infra/` Bicep (**single resource group**): Postgres Flexible Server, Storage (LRS + 30d
+    lifecycle), Container Apps env wired → Log Analytics, ACR, Key Vault + secrets, per-service
+    user-assigned MIs + least-priv roles, the 5 service apps (intake/dashboard external, tools
+    internal, coordinator/dispatcher no-ingress), worker + migrate Jobs; a **two-phase
+    `deployWorkloads` flag** breaks the ACR/image bootstrap cycle;
+  - CI `az bicep build` + `build-params` (warnings = errors) + `actionlint`;
+  - GitHub Actions CD (OIDC, two-phase deploy + `az acr build` + migrate-Job gate) + the operator
+    runbook (`docs/runbooks/azure-deploy.md`);
+  - carry-over **PR #24 round-3 review fixes**: uninstall/suspend offboards ALL repos for the
+    installation (`remove_all` → `deactivate_repos_by_installation`); MI token cache keyed by resource.
+  - **OTel exporter DEFERRED** (operator decision): Log Analytics gives KQL-queryable structured logs
+    now; the in-process traces/metrics exporter is a later upgrade. No `opentelemetry` deps added.
 The live Azure deploy (operator) lands after part 2 merges.
