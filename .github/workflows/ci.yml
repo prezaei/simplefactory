@@ -42,11 +42,14 @@ jobs:
       # Warning/Error — the IaC equivalent of clippy `-D warnings`. The
       # `use_binary_from_path` notice is a local-config artifact, not a template
       # diagnostic, so it's filtered out.
+      # Match only real Bicep diagnostics (`<file>(L,C) : Warning|Error CODE: ...`) so a
+      # benign az-CLI stderr notice can't false-fail the gate, and a real warning can't slip
+      # through. Bicep writes diagnostics to stderr and exits 0 even on warnings.
       - name: Build main.bicep (warnings = errors)
         run: |
           set -euo pipefail
           az bicep build --file infra/main.bicep --outfile /tmp/main.arm.json 2>/tmp/bicep.diag
-          diags=$(grep -v "use_binary_from_path" /tmp/bicep.diag || true)
+          diags=$(grep -E ' : (Warning|Error) ' /tmp/bicep.diag || true)
           if [ -n "$diags" ]; then echo "$diags"; echo "bicep diagnostics above"; exit 1; fi
       - name: Build param files
         run: |
@@ -54,7 +57,7 @@ jobs:
           for p in dev prod; do
             az bicep build-params --file "infra/main.$p.bicepparam" \
               --outfile "/tmp/main.$p.params.json" 2>"/tmp/$p.diag"
-            diags=$(grep -v "use_binary_from_path" "/tmp/$p.diag" || true)
+            diags=$(grep -E ' : (Warning|Error) ' "/tmp/$p.diag" || true)
             if [ -n "$diags" ]; then echo "$diags"; exit 1; fi
           done
 

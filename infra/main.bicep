@@ -335,6 +335,9 @@ var blobConnWorker = 'AccountName=${storageName};BlobEndpoint=https://${storageN
 // --- Service apps ---
 module intake 'modules/service-app.bicep' = if (deployWorkloads) {
   name: 'svc-intake'
+  // Order the app AFTER its image-pull + secret-read grants and the secrets themselves, so
+  // the first revision doesn't lose the race (image pull / KV secret resolution would 403).
+  dependsOn: [ acrPullForServices, kvForServices, secrets, databaseUrlSecret ]
   params: {
     name: 'intake'
     location: location
@@ -356,6 +359,7 @@ module intake 'modules/service-app.bicep' = if (deployWorkloads) {
 }
 module tools 'modules/service-app.bicep' = if (deployWorkloads) {
   name: 'svc-tools'
+  dependsOn: [ acrPullForServices, kvForServices, blobForTools, secrets, databaseUrlSecret ]
   params: {
     name: 'tools'
     location: location
@@ -377,6 +381,7 @@ module tools 'modules/service-app.bicep' = if (deployWorkloads) {
 }
 module coordinator 'modules/service-app.bicep' = if (deployWorkloads) {
   name: 'svc-coordinator'
+  dependsOn: [ acrPullForServices, kvForServices, secrets, databaseUrlSecret ]
   params: {
     name: 'coordinator'
     location: location
@@ -395,6 +400,7 @@ module coordinator 'modules/service-app.bicep' = if (deployWorkloads) {
 }
 module dispatcher 'modules/service-app.bicep' = if (deployWorkloads) {
   name: 'svc-dispatcher'
+  dependsOn: [ acrPullForServices, kvForServices, secrets, databaseUrlSecret ]
   params: {
     name: 'dispatcher'
     location: location
@@ -420,6 +426,7 @@ module dispatcher 'modules/service-app.bicep' = if (deployWorkloads) {
 }
 module dashboard 'modules/service-app.bicep' = if (deployWorkloads) {
   name: 'svc-dashboard'
+  dependsOn: [ acrPullForServices, kvForServices, databaseUrlSecret ]
   params: {
     name: 'dashboard-api'
     location: location
@@ -458,6 +465,7 @@ resource workerJobRes 'Microsoft.App/jobs@2024-03-01' existing = {
 // --- Worker Job (started per task by the dispatcher) ---
 module workerJob 'modules/job.bicep' = if (deployWorkloads) {
   name: 'job-worker'
+  dependsOn: [ acrPullForWorker, kvForWorker, blobForWorker, secrets ]
   params: {
     name: workerJobName
     location: location
@@ -482,6 +490,7 @@ module workerJob 'modules/job.bicep' = if (deployWorkloads) {
 // --- One-shot migration Job (CD runs it before rolling the service revisions) ---
 module migrateJob 'modules/job.bicep' = if (deployWorkloads) {
   name: 'job-migrate'
+  dependsOn: [ acrPullForServices, kvForServices, databaseUrlSecret ]
   params: {
     name: '${namePrefix}-migrate-${env}'
     location: location

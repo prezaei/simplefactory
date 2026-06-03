@@ -60,20 +60,28 @@ blob MI credential path, the OTel exporter, and the onboarding handler.
 
 ### 2. `ContainerAppsJobLauncher` — `WorkerLauncher` impl (`services/dispatcher`)
 - New impl behind the existing `trait WorkerLauncher` (DockerLauncher stays for local). Starts a
-  Container Apps **Job execution** with per-task env overrides (the same env `docker_env` builds:
-  `FACTORY_TASK_TOKEN`, `FACTORY_INSTALL_TOKEN`, `FACTORY_ROLE`, `FACTORY_WORK_ITEM`, tools URL,
-  repo URL, config sha, resume vars). Auth via the dispatcher's MI (`TokenCredential`). Uses the
-  Container Apps Jobs **start** REST API (`POST .../jobs/{job}/start` with a template override) —
-  prefer a thin REST call over pulling a heavy mgmt SDK crate (keeps the dep tree + openssl out;
-  reuse the rustls reqwest already in the tree).
-- **`main.rs` selection:** `WorkerRuntime::from_env()` already chooses Docker vs (new) ContainerApps
-  by env (e.g. `FACTORY_WORKER_RUNTIME=container_apps` + job/resource-group/subscription env). Local
-  stays Docker; Azure sets the env.
-- **Telemetry:** info-log job-start (job name, execution id, role, work_item), error path on
-  start failure.
-- **Tests:** pure helpers unit-tested without Azure — the job-template **override builder** (env
-  list → request JSON) is a pure fn with a unit test (mirrors `docker_env` tests); the REST call
-  itself is a deploy seam (faked in tests via the trait, like DockerLauncher). No live Azure in CI.
+  Container Apps **Job execution** carrying the per-task env `docker_env` builds (`FACTORY_TASK_TOKEN`,
+  `FACTORY_INSTALL_TOKEN`, `FACTORY_ROLE`, `FACTORY_WORK_ITEM`, tools URL, repo URL, config sha,
+  resume vars). Auth via the dispatcher's MI (an ARM bearer token, `https://management.azure.com/`).
+  Thin REST over the rustls reqwest already in the tree (no heavy mgmt SDK / openssl).
+- **GET-merge-POST (start REPLACES the template).** Azure's `…/jobs/{job}/start` **replaces the job's
+  entire template** for the execution — a partial override is silently dropped (verified against the
+  Azure docs: "the job's entire template configuration is replaced … include all required settings";
+  the REST body is the **bare template**, NOT wrapped in `template`). The dispatcher doesn't know the
+  worker image/secrets, so it mirrors `az containerapp job start --yaml`: **GET** the job's current
+  `properties.template`, **merge** the per-task env onto the `worker` container (override-by-name,
+  preserving image/resources + the base env incl. the KV-backed `CLAUDE_CODE_OAUTH_TOKEN` secretRef
+  + blob connection), then **POST** that full template to start. So blob/claude come from the live
+  template (hence `WorkerRuntime::default()` for the per-task env).
+- **`main.rs` selection:** `FACTORY_WORKER_RUNTIME` chooses Docker (default, local) vs `container_apps`
+  (Azure, needs `FACTORY_AZURE_SUBSCRIPTION_ID` / `_RESOURCE_GROUP` / `FACTORY_WORKER_JOB_NAME`,
+  optional `FACTORY_MANAGED_IDENTITY_CLIENT_ID`).
+- **Telemetry:** info-log job-start (job name, execution id, role, work_item); error paths on GET,
+  template-missing, container-missing, and start failure; warn on an unreadable start-response body.
+- **Tests:** pure helpers unit-tested without Azure — `job_get_url` / `job_start_url`, the env
+  **merge** (preserves image/resources + base secretRefs, overrides same-named once, appends the
+  rest), the container-absent error, and `parse_execution_name`. The HTTP calls are the deploy seam
+  (faked via the trait, like DockerLauncher). No live Azure in CI.
 
 ### 3. Blob MI credential path — `libs/blob`
 - `connect_container` gains a credential branch: if the connection string is present →

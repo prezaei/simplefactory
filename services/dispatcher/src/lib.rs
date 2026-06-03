@@ -397,13 +397,20 @@ const CONTAINERAPPS_JOBS_API_VERSION: &str = "2024-03-01";
 const WORKER_CONTAINER_NAME: &str = "worker";
 
 /// Live launcher for **Azure Container Apps Jobs** (P8): starts a one-shot Job *execution*
-/// per task, overriding the worker container's env with the per-task values (token, role,
-/// repo, resume, …) via the ARM `Microsoft.App/jobs/{job}/start` REST API. Auth is an ARM
-/// bearer token from the dispatcher's Managed Identity. The blob connection + claude token
-/// are NOT injected here — in Container Apps they come from the Job template's Key Vault
-/// secrets; only the per-task env is overridden (hence `WorkerRuntime::default()` below).
-/// The HTTP call is the deploy seam ([`DockerLauncher`] stays for local); the request
-/// construction is pure + unit-tested.
+/// per task with the worker container's env carrying the per-task values (token, role, repo,
+/// resume, …). Auth is an ARM bearer token from the dispatcher's Managed Identity.
+///
+/// The Container Apps `…/jobs/{job}/start` API **replaces the job's entire template** for the
+/// execution — it does NOT merge a partial override onto the base template (Azure docs: "the
+/// job's entire template configuration is replaced … include all required settings"). So the
+/// launcher mirrors what `az containerapp job start --yaml` does: **GET the job's current
+/// template, merge the per-task env onto the `worker` container, then POST that full template**
+/// to start. This preserves the image, resources, and the base env/secrets the Bicep set on
+/// the Job (the blob connection + the Key-Vault-backed `CLAUDE_CODE_OAUTH_TOKEN`) — they are
+/// read from the live template, not reconstructed here (the dispatcher doesn't know them).
+/// Hence `WorkerRuntime::default()` for the per-task env: blob/claude come from the template.
+/// The HTTP calls are the deploy seam ([`DockerLauncher`] stays for local); the URL builders
+/// + the env merge are pure + unit-tested.
 pub struct ContainerAppsJobLauncher {
     subscription_id: String,
     resource_group: String,
@@ -434,41 +441,78 @@ impl ContainerAppsJobLauncher {
 #[async_trait::async_trait]
 impl WorkerLauncher for ContainerAppsJobLauncher {
     async fn launch(&self, spec: &LaunchSpec) -> anyhow::Result<String> {
-        // Secrets/config that the Job template already carries (blob, claude) are NOT
-        // re-sent; only the per-task env is overridden, so a default runtime is correct.
+        // Blob/claude come from the live Job template (merged below), so a default runtime
+        // is correct here — only the per-task env is added.
         let env = docker_env(&WorkerRuntime::default(), spec);
-        let url = job_start_url(&self.subscription_id, &self.resource_group, &self.job_name);
-        let body = job_start_body(&env);
         let token = self
             .credential
             .bearer_token(ARM_RESOURCE)
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("acquiring ARM token for Container Apps job start: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("acquiring ARM token for Container Apps job: {e}"))?;
+
+        // 1. GET the job's current template (image, resources, base env + KV secretRefs).
+        let get_url = job_get_url(&self.subscription_id, &self.resource_group, &self.job_name);
+        let get_resp = self
+            .http
+            .get(&get_url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Container Apps job GET request: {e}"))?;
+        let get_status = get_resp.status();
+        let get_text = get_resp
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("reading Container Apps job GET body: {e}"))?;
+        if !get_status.is_success() {
+            let snippet: String = get_text.chars().take(500).collect();
+            anyhow::bail!("Container Apps job GET returned {get_status}: {snippet}");
+        }
+        let job: serde_json::Value = serde_json::from_str(&get_text)
+            .map_err(|e| anyhow::anyhow!("parsing Container Apps job GET body: {e}"))?;
+        let template = job
+            .get("properties")
+            .and_then(|p| p.get("template"))
+            .ok_or_else(|| anyhow::anyhow!("Container Apps job has no properties.template"))?;
+
+        // 2. Merge the per-task env onto the worker container (preserving image/resources/
+        //    base env + secretRefs), yielding the full template to send as the start body.
+        let body = merge_worker_env(template, WORKER_CONTAINER_NAME, &env)?;
+
         tracing::info!(
             work_item = %spec.work_item_id,
             role = spec.role.as_str(),
             job = %self.job_name,
             "ContainerAppsJobLauncher: starting job execution"
         );
+
+        // 3. POST start with the merged template (the start body IS the template, no wrapper).
+        let start_url = job_start_url(&self.subscription_id, &self.resource_group, &self.job_name);
         let resp = self
             .http
-            .post(&url)
-            .bearer_auth(token)
+            .post(&start_url)
+            .bearer_auth(&token)
             .json(&body)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Container Apps job start request: {e}"))?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
             let snippet: String = text.chars().take(500).collect();
             anyhow::bail!("Container Apps job start returned {status}: {snippet}");
         }
-        // Best-effort: the start response carries the new execution's `name`.
-        let execution =
-            parse_execution_name(&text).unwrap_or_else(|| format!("{}-execution", self.job_name));
+        // The start response carries the new execution's `name`. A body-read failure here is
+        // non-fatal — the job DID start (2xx); fall back to a synthetic name + warn rather
+        // than failing the launch (which would re-dispatch + double-launch).
+        let execution = match resp.text().await {
+            Ok(text) => parse_execution_name(&text)
+                .unwrap_or_else(|| format!("{}-execution", self.job_name)),
+            Err(e) => {
+                tracing::warn!(error = %e, job = %self.job_name, "could not read job-start response body; using synthetic execution name");
+                format!("{}-execution", self.job_name)
+            }
+        };
         tracing::info!(
             work_item = %spec.work_item_id,
             execution = %execution,
@@ -476,6 +520,14 @@ impl WorkerLauncher for ContainerAppsJobLauncher {
         );
         Ok(execution)
     }
+}
+
+/// The ARM URL for the job resource itself (GET the current template). Pure + unit-tested.
+fn job_get_url(subscription_id: &str, resource_group: &str, job_name: &str) -> String {
+    format!(
+        "{ARM_ENDPOINT}/subscriptions/{subscription_id}/resourceGroups/{resource_group}\
+         /providers/Microsoft.App/jobs/{job_name}?api-version={CONTAINERAPPS_JOBS_API_VERSION}"
+    )
 }
 
 /// The ARM URL to start a Container Apps Job execution. Pure + unit-tested.
@@ -486,19 +538,45 @@ fn job_start_url(subscription_id: &str, resource_group: &str, job_name: &str) ->
     )
 }
 
-/// The Container Apps Jobs `start` body: a template override setting the worker container's
-/// env to the per-task pairs (merged by container name with the Job's base template). Pure
-/// + unit-tested. Secrets travel only as env *values* (never logged here).
-fn job_start_body(env: &[(&str, String)]) -> serde_json::Value {
-    let env_json: Vec<serde_json::Value> = env
-        .iter()
-        .map(|(k, v)| json!({ "name": k, "value": v }))
-        .collect();
-    json!({
-        "template": {
-            "containers": [ { "name": WORKER_CONTAINER_NAME, "env": env_json } ]
+/// Merge the per-task `env` onto the named container within a job `template` (the GET'd
+/// `properties.template`), returning the full modified template to POST as the start body
+/// (start replaces the whole template, so image/resources/base env + secretRefs must survive
+/// — they do, untouched). For each pair: override an existing env entry of the same name
+/// (replacing any prior `value`/`secretRef`) or append it. Pure + unit-tested. Secrets travel
+/// only as env *values* (never logged here).
+fn merge_worker_env(
+    template: &serde_json::Value,
+    container_name: &str,
+    env: &[(&str, String)],
+) -> anyhow::Result<serde_json::Value> {
+    let mut template = template.clone();
+    let containers = template
+        .get_mut("containers")
+        .and_then(|c| c.as_array_mut())
+        .ok_or_else(|| anyhow::anyhow!("job template has no containers array"))?;
+    let container = containers
+        .iter_mut()
+        .find(|c| c.get("name").and_then(|n| n.as_str()) == Some(container_name))
+        .ok_or_else(|| anyhow::anyhow!("job template has no container named {container_name:?}"))?;
+    // Preserve the container's existing env (base env values + Key-Vault secretRefs); merge
+    // the per-task pairs over it by name.
+    let mut merged: Vec<serde_json::Value> = container
+        .get("env")
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for (k, v) in env {
+        let entry = json!({ "name": k, "value": v });
+        match merged
+            .iter_mut()
+            .find(|e| e.get("name").and_then(|n| n.as_str()) == Some(*k))
+        {
+            Some(slot) => *slot = entry,
+            None => merged.push(entry),
         }
-    })
+    }
+    container["env"] = serde_json::Value::Array(merged);
+    Ok(template)
 }
 
 /// Extract the started execution's `name` from the ARM start response (best-effort).
@@ -756,28 +834,73 @@ mod tests {
     }
 
     #[test]
-    fn container_apps_job_start_body_overrides_worker_env() {
-        let env = docker_env(&WorkerRuntime::default(), &spec());
-        let body = job_start_body(&env);
-        let container = &body["template"]["containers"][0];
+    fn container_apps_job_get_url_targets_the_job_resource() {
+        let url = job_get_url("sub-1", "rg-factory", "factory-worker");
         assert_eq!(
-            container["name"], "worker",
-            "must match the Job's container name"
+            url,
+            "https://management.azure.com/subscriptions/sub-1/resourceGroups/rg-factory\
+             /providers/Microsoft.App/jobs/factory-worker?api-version=2024-03-01"
         );
+    }
+
+    /// The merge preserves the live template's image/resources + base env (incl. the
+    /// Key-Vault `secretRef` for the claude token), overrides a same-named base entry once
+    /// (no duplicate), and appends the new per-task vars. This is the whole correctness
+    /// premise: start REPLACES the template, so everything must survive the merge.
+    #[test]
+    fn merge_worker_env_preserves_base_and_overrides_by_name() {
+        let base = json!({
+            "containers": [{
+                "name": "worker",
+                "image": "acr.azurecr.io/factory-worker:abc123",
+                "resources": { "cpu": 1.0, "memory": "2Gi" },
+                "env": [
+                    { "name": "CLAUDE_CODE_OAUTH_TOKEN", "secretRef": "claude-oauth-token" },
+                    { "name": "FACTORY_BLOB_CONNECTION_STRING", "value": "AccountName=x;..." },
+                    { "name": "FACTORY_TOOLS_URL", "value": "https://tools.stale" }
+                ]
+            }],
+            "volumes": []
+        });
+        let env = docker_env(&WorkerRuntime::default(), &spec());
+        let merged = merge_worker_env(&base, "worker", &env).expect("merge");
+        let container = &merged["containers"][0];
+        // Image + resources + volumes untouched (start would otherwise drop them).
+        assert_eq!(container["image"], "acr.azurecr.io/factory-worker:abc123");
+        assert_eq!(container["resources"]["memory"], "2Gi");
+        assert!(merged.get("volumes").is_some());
         let env_arr = container["env"].as_array().expect("env array");
-        // Every (key,value) pair is rendered as {name,value}; the task token is present
-        // (as an env value — Container Apps gets blob/claude secrets from the Job template,
-        // so a default runtime omits them here).
+        // Base-only secretRef + blob conn preserved.
+        let claude = env_arr
+            .iter()
+            .find(|e| e["name"] == "CLAUDE_CODE_OAUTH_TOKEN")
+            .expect("claude secretRef preserved");
+        assert_eq!(claude["secretRef"], "claude-oauth-token");
+        assert!(env_arr
+            .iter()
+            .any(|e| e["name"] == "FACTORY_BLOB_CONNECTION_STRING"));
+        // Per-task task token appended as a value.
         let token = env_arr
             .iter()
             .find(|e| e["name"] == "FACTORY_TASK_TOKEN")
             .expect("token env");
         assert_eq!(token["value"], TOKEN);
-        let keys: Vec<&str> = env_arr.iter().filter_map(|e| e["name"].as_str()).collect();
-        assert!(keys.contains(&"FACTORY_ROLE") && keys.contains(&"FACTORY_TOOLS_URL"));
-        // Default runtime ⇒ no blob/claude secrets in the per-task override.
-        assert!(!keys.contains(&"FACTORY_BLOB_CONNECTION_STRING"));
-        assert!(!keys.contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
+        // FACTORY_TOOLS_URL was in the base AND the per-task env → overridden exactly once,
+        // to the per-task value (no stale duplicate).
+        let tools: Vec<&serde_json::Value> = env_arr
+            .iter()
+            .filter(|e| e["name"] == "FACTORY_TOOLS_URL")
+            .collect();
+        assert_eq!(tools.len(), 1, "no duplicate FACTORY_TOOLS_URL");
+        assert_eq!(tools[0]["value"], "http://tools.local:8080");
+    }
+
+    #[test]
+    fn merge_worker_env_errors_when_container_absent() {
+        let base = json!({ "containers": [{ "name": "main", "env": [] }] });
+        let env = docker_env(&WorkerRuntime::default(), &spec());
+        let err = merge_worker_env(&base, "worker", &env).expect_err("no worker container");
+        assert!(err.to_string().contains("worker"));
     }
 
     #[test]

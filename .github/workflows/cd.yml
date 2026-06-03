@@ -83,7 +83,7 @@ jobs:
         run: |
           set -euo pipefail
           acr=$(az deployment group create \
-            -g "$RG" -n "factory-infra-${ENVN}-${FACTORY_IMAGE_TAG}" \
+            -g "$RG" -n "factory-infra-${ENVN}" \
             -f infra/main.bicep -p "infra/main.${ENVN}.bicepparam" \
             -p deployWorkloads=false \
             --query 'properties.outputs.acrName.value' -o tsv)
@@ -113,7 +113,7 @@ jobs:
         run: |
           set -euo pipefail
           az deployment group create \
-            -g "$RG" -n "factory-workloads-${ENVN}-${FACTORY_IMAGE_TAG}" \
+            -g "$RG" -n "factory-workloads-${ENVN}" \
             -f infra/main.bicep -p "infra/main.${ENVN}.bicepparam" \
             -p deployWorkloads=true -o none
 
@@ -125,18 +125,19 @@ jobs:
           set -euo pipefail
           job="factory-migrate-${ENVN}"
           exec_name=$(az containerapp job start -g "$RG" -n "$job" --query name -o tsv)
+          if [ -z "$exec_name" ]; then echo "job start returned no execution name"; exit 1; fi
           echo "migration execution: $exec_name"
           for i in $(seq 1 60); do
             status=$(az containerapp job execution show -g "$RG" --job-name "$job" \
               --job-execution-name "$exec_name" --query 'properties.status' -o tsv 2>/dev/null || echo "")
-            echo "  [$i] status=$status"
+            echo "  [$i] status=${status:-<unavailable>}"
             case "$status" in
               Succeeded) echo "migration succeeded"; exit 0 ;;
-              Failed|Degraded) echo "migration FAILED"; exit 1 ;;
+              Failed|Cancelled|Degraded) echo "migration ended in status: $status"; exit 1 ;;
             esac
             sleep 10
           done
-          echo "migration timed out"; exit 1
+          echo "migration timed out after ~10m (last status: ${status:-<unavailable>})"; exit 1
 
       - name: Deployment summary
         env:
