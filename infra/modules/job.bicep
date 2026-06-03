@@ -22,13 +22,17 @@ param command array = []
 param replicaTimeoutSeconds int = 2100
 @description('Plain (non-secret) env vars: list of { name, value }.')
 param envVars array = []
-@description('Key Vault secret references: list of { name, secretName, keyVaultUri }.')
+@description('Key Vault secret references: list of { name (the env var, e.g. DATABASE_URL), keyVaultUri }.')
 param secretRefs array = []
 param tags object = {}
 
+// Container App secret names must be lowercase alphanumeric + dashes (NO underscores), so derive
+// the secret name from the env-var name by lowercasing AND replacing `_` with `-`
+// (DATABASE_URL → database-url). The env-var `name` keeps underscores; only the secret name +
+// secretRef use the normalized form (they must match each other).
 var caSecrets = [
   for s in secretRefs: {
-    name: toLower(s.name)
+    name: toLower(replace(s.name, '_', '-'))
     keyVaultUrl: s.keyVaultUri
     identity: identityId
   }
@@ -36,7 +40,7 @@ var caSecrets = [
 var secretEnv = [
   for s in secretRefs: {
     name: s.name
-    secretRef: toLower(s.name)
+    secretRef: toLower(replace(s.name, '_', '-'))
   }
 ]
 

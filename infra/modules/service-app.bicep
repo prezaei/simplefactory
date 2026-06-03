@@ -29,24 +29,28 @@ param minReplicas int = 1
 param maxReplicas int = 3
 @description('Plain (non-secret) environment variables: list of { name, value }.')
 param envVars array = []
-@description('Key Vault secret references: list of { name (env var), secretName, keyVaultUri }.')
+@description('Key Vault secret references: list of { name (the env var, e.g. DATABASE_URL), keyVaultUri }.')
 param secretRefs array = []
 @description('Common resource tags.')
 param tags object = {}
 
+// Container App secret names must be lowercase alphanumeric + dashes (NO underscores), so derive
+// the secret name from the env-var name by lowercasing AND replacing `_` with `-`
+// (DATABASE_URL → database-url). The env-var `name` itself keeps underscores; only the Container
+// App secret name + the secretRef use the normalized form (they must match each other).
 // Container App secrets backed by Key Vault, pulled via this app's Managed Identity.
 var caSecrets = [
   for s in secretRefs: {
-    name: toLower(s.name)
+    name: toLower(replace(s.name, '_', '-'))
     keyVaultUrl: s.keyVaultUri
     identity: identityId
   }
 ]
-// Env vars that reference those secrets.
+// Env vars that reference those secrets (env-var name keeps underscores; secretRef is normalized).
 var secretEnv = [
   for s in secretRefs: {
     name: s.name
-    secretRef: toLower(s.name)
+    secretRef: toLower(replace(s.name, '_', '-'))
   }
 ]
 
