@@ -256,10 +256,16 @@ pub async fn upsert_repo(
     installation_id: i64,
 ) -> Result<Uuid> {
     let row = sqlx::query(
+        // Re-onboarding (re-install / unsuspend) must REACTIVATE a previously-removed repo,
+        // so the conflict path resets status to 'active' as well as refreshing the
+        // installation id — otherwise a repo offboarded then re-added stays 'removed' and
+        // Factory keeps ignoring it.
         "INSERT INTO repos (id, installation_id, owner, name, status)
          VALUES ($1, $2, $3, $4, 'active')
          ON CONFLICT (owner, name)
-           DO UPDATE SET installation_id = EXCLUDED.installation_id, updated_at = now()
+           DO UPDATE SET installation_id = EXCLUDED.installation_id,
+                         status = 'active',
+                         updated_at = now()
          RETURNING id",
     )
     .bind(Uuid::now_v7())
@@ -269,6 +275,22 @@ pub async fn upsert_repo(
     .fetch_one(pool)
     .await?;
     Ok(row.try_get("id")?)
+}
+
+/// Offboard a repo (App uninstalled / repo removed from the installation): mark it
+/// `removed` so Factory stops acting on it. Idempotent — returns the number of rows
+/// updated (0 if the repo was never onboarded). Re-onboarding via [`upsert_repo`]
+/// reactivates it.
+pub async fn deactivate_repo(pool: &Pool, owner: &str, name: &str) -> Result<u64> {
+    let res = sqlx::query(
+        "UPDATE repos SET status = 'removed', updated_at = now()
+          WHERE owner = $1 AND name = $2 AND status <> 'removed'",
+    )
+    .bind(owner)
+    .bind(name)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 /// Enqueue a work item. Idempotent: if an active item for the same

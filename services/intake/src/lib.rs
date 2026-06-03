@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, Utc};
 use factory_config::{Config, Role, Trigger};
-use factory_github::{RepoRef, WebhookEvent};
+use factory_github::{RepoCoord, RepoRef, WebhookEvent};
 use factory_record::{self as record, EnqueueOutcome, Kind, NewWorkItem, Pool};
 use uuid::Uuid;
 
@@ -27,6 +27,9 @@ pub enum IngestOutcome {
     Enqueued(usize),
     /// `n` blocked items were re-queued (resume on reply).
     Resumed(u64),
+    /// An installation webhook onboarded/offboarded repos (P8). `onboarded` repos were
+    /// upserted active with their installation id; `offboarded` were marked removed.
+    Installation { onboarded: usize, offboarded: usize },
 }
 
 /// What `apply_config` did.
@@ -90,12 +93,59 @@ pub async fn ingest(
     Ok(outcome)
 }
 
+/// Onboard/offboard repos from an installation webhook (P8). Upserts `added` repos active
+/// with their installation id (so onboarding needs no manual SQL) and marks `removed` repos
+/// removed. Idempotent — re-delivery upserts the same rows / re-removes (a no-op). Returns
+/// `repo_id = None` since it spans 0..N repos (audit row carries the counts).
+async fn process_installation(
+    pool: &Pool,
+    installation_id: i64,
+    added: &[RepoCoord],
+    removed: &[RepoCoord],
+) -> anyhow::Result<(Option<Uuid>, IngestOutcome)> {
+    for r in added {
+        let id = record::upsert_repo(pool, &r.owner, &r.name, installation_id).await?;
+        tracing::info!(
+            owner = %r.owner, name = %r.name, installation_id, repo_id = %id,
+            "onboarded repo via installation webhook"
+        );
+    }
+    let mut offboarded = 0usize;
+    for r in removed {
+        let n = record::deactivate_repo(pool, &r.owner, &r.name).await?;
+        offboarded += n as usize;
+        tracing::info!(
+            owner = %r.owner, name = %r.name, deactivated = n,
+            "offboarded repo via installation webhook"
+        );
+    }
+    Ok((
+        None,
+        IngestOutcome::Installation {
+            onboarded: added.len(),
+            offboarded,
+        },
+    ))
+}
+
 /// Resolve the repo + config and act on the event. Idempotent. Returns the
 /// resolved `repo_id` (for the audit trail) alongside the outcome.
 async fn process(
     pool: &Pool,
     event: &WebhookEvent,
 ) -> anyhow::Result<(Option<Uuid>, IngestOutcome)> {
+    // Installation events onboard/offboard repos and MUST be handled before the
+    // repo-resolution gate below — the repo may not exist yet (that is the point of
+    // onboarding), so `repo_by_name` would reject it.
+    if let WebhookEvent::Installation {
+        installation_id,
+        added,
+        removed,
+    } = event
+    {
+        return process_installation(pool, *installation_id, added, removed).await;
+    }
+
     let Some(repo_ref) = event_repo(event) else {
         return Ok((None, IngestOutcome::Ignored));
     };
@@ -146,7 +196,11 @@ async fn process(
         }
         // Push → config-apply requires fetching the file content via the GitHub
         // API (octocrab, P3); `apply_config` below is the tested unit for it.
-        WebhookEvent::Push { .. } | WebhookEvent::Other => IngestOutcome::Ignored,
+        // Installation is handled by the early return above (before the repo gate); this
+        // arm is unreachable for it but keeps the match exhaustive (defensive: Ignored).
+        WebhookEvent::Push { .. } | WebhookEvent::Other | WebhookEvent::Installation { .. } => {
+            IngestOutcome::Ignored
+        }
     };
     Ok((Some(rc.id), outcome))
 }
@@ -431,6 +485,8 @@ fn event_repo(event: &WebhookEvent) -> Option<&RepoRef> {
         | WebhookEvent::ReviewRequested { repo, .. }
         | WebhookEvent::IssueComment { repo, .. }
         | WebhookEvent::Push { repo, .. } => Some(repo),
-        WebhookEvent::Other => None,
+        // Installation carries 0..N repos (handled in `process_installation`, not via this
+        // single-repo accessor), so it has no single RepoRef.
+        WebhookEvent::Other | WebhookEvent::Installation { .. } => None,
     }
 }
