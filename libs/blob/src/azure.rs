@@ -28,20 +28,33 @@ use crate::{CheckpointStore, TranscriptStore};
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlobLocation {
     account: String,
-    key: String,
+    credential: BlobCredential,
     /// `Some((host, port))` ⇒ the emulator/custom endpoint (Azurite); `None` ⇒ the
     /// real Azure public cloud (`https://{account}.blob.core.windows.net`).
     emulator: Option<(String, u16)>,
 }
 
+/// How to authenticate to Blob — the one dev/prod fork (the rest of the data path is
+/// identical). Azurite/dev (and any `AccountKey=` connection string) is **shared-key**;
+/// a keyless prod connection string (`AccountName` + endpoint, no `AccountKey`) is
+/// **Managed Identity** with an optional user-assigned `ManagedIdentityClientId`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlobCredential {
+    SharedKey(String),
+    ManagedIdentity { client_id: Option<String> },
+}
+
 /// Parse an Azure Storage connection string into the bits we need. Supports the
-/// `UseDevelopmentStorage=true` shortcut, an explicit Azurite `BlobEndpoint=`, and a
-/// real-Azure `AccountName`/`AccountKey` pair. Unknown segments (e.g.
+/// `UseDevelopmentStorage=true` shortcut, an explicit Azurite `BlobEndpoint=`, a
+/// real-Azure `AccountName`/`AccountKey` pair (shared-key), AND a keyless prod string
+/// (`AccountName` with no `AccountKey`) which selects **Managed Identity** — optionally
+/// with a user-assigned `ManagedIdentityClientId=<guid>`. Unknown segments (e.g.
 /// `DefaultEndpointsProtocol`) are ignored.
 fn parse_connection_string(conn: &str) -> anyhow::Result<BlobLocation> {
     let mut account: Option<String> = None;
     let mut key: Option<String> = None;
     let mut endpoint: Option<String> = None;
+    let mut mi_client_id: Option<String> = None;
     let mut use_dev = false;
 
     for segment in conn.split(';') {
@@ -57,6 +70,7 @@ fn parse_connection_string(conn: &str) -> anyhow::Result<BlobLocation> {
             "AccountName" => account = Some(v.trim().to_string()),
             "AccountKey" => key = Some(v.trim().to_string()),
             "BlobEndpoint" => endpoint = Some(v.trim().to_string()),
+            "ManagedIdentityClientId" => mi_client_id = Some(v.trim().to_string()),
             "UseDevelopmentStorage" => use_dev = v.trim().eq_ignore_ascii_case("true"),
             _ => {} // ignore the rest (DefaultEndpointsProtocol, QueueEndpoint, …)
         }
@@ -65,23 +79,36 @@ fn parse_connection_string(conn: &str) -> anyhow::Result<BlobLocation> {
     // The emulator endpoint: an explicit BlobEndpoint always wins (so a worker
     // container can point at host.docker.internal), with `UseDevelopmentStorage=true`
     // supplying the default 127.0.0.1:10000 + dev credentials when no endpoint is set.
-    let emulator = match &endpoint {
-        Some(ep) => Some(parse_host_port(ep)?),
-        None if use_dev => Some(("127.0.0.1".to_string(), 10000)),
-        None => None,
+    // Managed Identity targets real Azure, so its endpoint is the public cloud (the
+    // account URL), never the emulator — only a shared-key string maps to the emulator.
+    let emulator = match (&endpoint, key.is_some() || use_dev) {
+        (Some(ep), true) => Some(parse_host_port(ep)?),
+        (Some(_), false) => None, // MI + endpoint → public cloud (sovereign/custom is a follow-up)
+        (None, _) if use_dev => Some(("127.0.0.1".to_string(), 10000)),
+        (None, _) => None,
     };
 
     if use_dev {
         return Ok(BlobLocation {
             account: account.unwrap_or_else(|| EMULATOR_ACCOUNT.to_string()),
-            key: key.unwrap_or_else(|| EMULATOR_ACCOUNT_KEY.to_string()),
+            credential: BlobCredential::SharedKey(
+                key.unwrap_or_else(|| EMULATOR_ACCOUNT_KEY.to_string()),
+            ),
             emulator,
         });
     }
 
+    let account = account.context("connection string missing AccountName")?;
+    // A key ⇒ shared-key; no key ⇒ Managed Identity (the prod credential).
+    let credential = match key {
+        Some(k) => BlobCredential::SharedKey(k),
+        None => BlobCredential::ManagedIdentity {
+            client_id: mi_client_id,
+        },
+    };
     Ok(BlobLocation {
-        account: account.context("connection string missing AccountName")?,
-        key: key.context("connection string missing AccountKey")?,
+        account,
+        credential,
         emulator,
     })
 }
@@ -106,7 +133,21 @@ fn parse_host_port(endpoint: &str) -> anyhow::Result<(String, u16)> {
 /// once.
 async fn connect_container(conn: &str, container: &str) -> anyhow::Result<ContainerClient> {
     let loc = parse_connection_string(conn)?;
-    let credentials = StorageCredentials::access_key(loc.account.clone(), loc.key.clone());
+    // The ONE dev/prod fork: shared-key (Azurite/dev) vs Managed Identity (prod). The
+    // read/write data path below is identical for both — that's why P8 is a credential
+    // swap, not new code.
+    let credentials = match &loc.credential {
+        BlobCredential::SharedKey(key) => {
+            tracing::info!(account = %loc.account, "azure blob: connecting with shared key");
+            StorageCredentials::access_key(loc.account.clone(), key.clone())
+        }
+        BlobCredential::ManagedIdentity { client_id } => {
+            tracing::info!(account = %loc.account, client_id = ?client_id, "azure blob: connecting with managed identity");
+            StorageCredentials::token_credential(std::sync::Arc::new(
+                crate::managed_identity::ManagedIdentityCredential::new(client_id.clone()),
+            ))
+        }
+    };
     let cloud = match loc.emulator {
         Some((address, port)) => CloudLocation::Emulator { address, port },
         None => CloudLocation::Public {
@@ -292,6 +333,14 @@ mod tests {
 
     // ---- connection-string parsing (no Azurite needed) ----
 
+    /// Extract the shared key, asserting the credential is shared-key (test helper).
+    fn shared_key(loc: &BlobLocation) -> &str {
+        match &loc.credential {
+            BlobCredential::SharedKey(k) => k,
+            other => panic!("expected shared key, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parses_azurite_connection_string_with_custom_blob_endpoint() {
         let conn = "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;\
@@ -300,7 +349,7 @@ mod tests {
         let loc = parse_connection_string(conn).unwrap();
         assert_eq!(loc.account, "devstoreaccount1");
         assert!(
-            loc.key.ends_with("GMGw=="),
+            shared_key(&loc).ends_with("GMGw=="),
             "the full base64 key (with '=') is kept"
         );
         assert_eq!(
@@ -313,8 +362,38 @@ mod tests {
     fn use_development_storage_shortcut_maps_to_local_emulator() {
         let loc = parse_connection_string("UseDevelopmentStorage=true;").unwrap();
         assert_eq!(loc.account, EMULATOR_ACCOUNT);
-        assert_eq!(loc.key, EMULATOR_ACCOUNT_KEY);
+        assert_eq!(shared_key(&loc), EMULATOR_ACCOUNT_KEY);
         assert_eq!(loc.emulator, Some(("127.0.0.1".to_string(), 10000)));
+    }
+
+    #[test]
+    fn keyless_connection_string_selects_managed_identity() {
+        // Prod: AccountName + endpoint, NO AccountKey ⇒ Managed Identity (system-assigned).
+        let loc = parse_connection_string(
+            "AccountName=factoryprod;BlobEndpoint=https://factoryprod.blob.core.windows.net/;",
+        )
+        .unwrap();
+        assert_eq!(loc.account, "factoryprod");
+        assert_eq!(
+            loc.credential,
+            BlobCredential::ManagedIdentity { client_id: None }
+        );
+        // MI targets real Azure, never the emulator — an endpoint with MI is public cloud.
+        assert_eq!(loc.emulator, None);
+    }
+
+    #[test]
+    fn keyless_connection_string_with_client_id_is_user_assigned_mi() {
+        let loc =
+            parse_connection_string("AccountName=factoryprod;ManagedIdentityClientId=abc-123;")
+                .unwrap();
+        assert_eq!(
+            loc.credential,
+            BlobCredential::ManagedIdentity {
+                client_id: Some("abc-123".to_string())
+            }
+        );
+        assert_eq!(loc.emulator, None);
     }
 
     #[test]
@@ -339,7 +418,7 @@ mod tests {
             EndpointSuffix=core.windows.net";
         let loc = parse_connection_string(conn).unwrap();
         assert_eq!(loc.account, "factoryprod");
-        assert_eq!(loc.key, "c2VjcmV0a2V5==");
+        assert_eq!(shared_key(&loc), "c2VjcmV0a2V5==");
         assert_eq!(
             loc.emulator, None,
             "no BlobEndpoint ⇒ public cloud, not emulator"

@@ -1,0 +1,15 @@
+[package]
+name = "factory-migrate"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "factory-migrate"
+path = "src/main.rs"
+
+[dependencies]
+factory-record.workspace = true
+factory-telemetry.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true

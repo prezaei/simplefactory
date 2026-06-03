@@ -705,7 +705,10 @@ dependencies = [
  "azure_storage",
  "azure_storage_blobs",
  "flate2",
+ "reqwest",
+ "serde_json",
  "tar",
+ "time",
  "tokio",
  "tracing",
 ]
@@ -837,6 +840,17 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "factory-migrate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "factory-record",
+ "factory-telemetry",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

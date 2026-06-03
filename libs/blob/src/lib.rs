@@ -11,6 +11,7 @@
 
 mod archive;
 mod azure;
+mod managed_identity;
 pub use archive::{archive_dirs, extract_dirs};
 pub use azure::{AzureBlobCheckpoints, AzureBlobTranscripts};
 

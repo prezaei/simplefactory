@@ -12,6 +12,7 @@ members = [
     "services/tools",
     "services/dashboard-api",
     "services/worker",
+    "services/migrate",
     "e2e",
 ]
 
@@ -51,6 +52,9 @@ tower = { version = "0.5", features = ["util"] }
 octocrab = "0.51"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
+# Token expiry timestamps for the Managed Identity credential (already in the tree via
+# azure_core). default-features off keeps it lean; `std` for OffsetDateTime arithmetic.
+time = { version = "0.3", default-features = false, features = ["std"] }
 
 # Worktree/session checkpoint archives (P7 crash-resume): tar + gzip the worktree to Blob.
 tar = "0.4"
