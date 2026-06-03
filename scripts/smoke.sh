@@ -54,14 +54,14 @@ wait_for() {
   done
 }
 
-# shellcheck disable=SC2329  # invoked indirectly via wait_for's eval'd command string
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via wait_for's eval'd command string
 work_items_json() { curl -fsS "$DASHBOARD_URL/api/repos/$OWNER/$NAME/work-items" 2>/dev/null || echo '[]'; }
 # Prints "seen" iff a work item exists for issue #$1. A function so the jq filter runs in
 # normal shell context — NOT embedded in a double-quoted string handed to wait_for's
 # `eval`, where the jq program's own `"issue#"` literal would close the shell quote and
 # expose `$n` to `set -u` ("unbound variable"). The subject is built here and passed as a
 # jq --arg, so the filter contains no `"`.
-# shellcheck disable=SC2329  # invoked indirectly via wait_for's eval'd command string
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via wait_for's eval'd command string
 has_issue_work_item() {
   work_items_json | jq -e --arg s "issue#$1" '[.[]|select(.subject_ref==$s)]|length>0' \
     >/dev/null && echo seen
@@ -70,7 +70,7 @@ has_issue_work_item() {
 # (`factory/issue-N`) FIRST — a free-text `--search "$1"` only matches if the CR body
 # happens to mention the number, so it silently misses CRs (and produced a false crash
 # FAIL). Fall back to the text search for any non-standard branch naming.
-# shellcheck disable=SC2329  # invoked indirectly via wait_for's eval'd command string
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via wait_for's eval'd command string
 pr_for_issue() {
   local url
   url="$(gh pr list -R "$REPO" --state all --head "factory/issue-$1" --json url -q '.[0].url' 2>/dev/null)"

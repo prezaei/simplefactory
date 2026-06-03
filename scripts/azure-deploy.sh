@@ -81,9 +81,15 @@ deploy() {
   # that each recompiled the whole workspace.
   local ctx
   ctx="$(mktemp -d)"
+  # Always remove the build-context tempdir, even if git archive/tar/`az acr run` fails and the
+  # ERR trap exits the script — otherwise a failed deploy leaks a mktemp dir (and disk on repeated
+  # retries). An EXIT trap (not RETURN) is required: the ERR trap calls `exit`, which bypasses a
+  # function-RETURN trap but always fires the EXIT trap. $ctx is expanded now so the path is baked
+  # into the trap string regardless of the local going out of scope.
+  # shellcheck disable=SC2064  # intentional: expand $ctx at trap-set time, not at trap-fire time
+  trap "rm -rf '$ctx'" EXIT
   git -C "$ROOT" archive HEAD | tar -x -C "$ctx"
   az acr run --registry "$acr" -f acb.yaml --set tag="$FACTORY_IMAGE_TAG" "$ctx"
-  rm -rf "$ctx"
 
   log "phase 2 — workloads (deployWorkloads=true)"
   az deployment group create -g "$RG" -n "${PREFIX}-workloads-${ENVN}" \
