@@ -133,6 +133,9 @@ jobs:
           # still tolerates a transient miss (the execution can lag a moment behind start) — a failed
           # call logs the CLI error and retries; a persistent failure is now visible every iteration.
           mig_err=$(mktemp)
+          # Reap the stderr scratch file on every exit path (the loop's early exit 0/1 included), so
+          # the step leaves no artifact even though the runner is ephemeral.
+          trap 'rm -f "$mig_err"' EXIT
           for i in $(seq 1 60); do
             if status=$(az containerapp job execution show -g "$RG" --name "$job" \
               --job-execution-name "$exec_name" --query 'properties.status' -o tsv 2>"$mig_err"); then
