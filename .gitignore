@@ -18,3 +18,5 @@ Cargo.lock.orig
 *.local
 .claude/scheduled_tasks.lock
 .claude/scheduled_tasks.json
+.factory-deploy.env
+.azure-factory/

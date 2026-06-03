@@ -9,6 +9,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  scripts:
+    name: shellcheck · actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Operator scripts (deploy/verify/smoke) ship real behavior but aren't exercised by the
+      # Rust suite — gate them so they can't rot (a wrong `az` flag in the migrate poll once
+      # slipped every review). shellcheck is preinstalled on ubuntu-latest.
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
   quality:
     name: fmt · clippy · test
     runs-on: ubuntu-latest

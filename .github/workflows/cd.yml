@@ -128,7 +128,7 @@ jobs:
           if [ -z "$exec_name" ]; then echo "job start returned no execution name"; exit 1; fi
           echo "migration execution: $exec_name"
           for i in $(seq 1 60); do
-            status=$(az containerapp job execution show -g "$RG" --job-name "$job" \
+            status=$(az containerapp job execution show -g "$RG" --name "$job" \
               --job-execution-name "$exec_name" --query 'properties.status' -o tsv 2>/dev/null || echo "")
             echo "  [$i] status=${status:-<unavailable>}"
             case "$status" in

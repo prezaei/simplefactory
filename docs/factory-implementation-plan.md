@@ -30,6 +30,7 @@
 | **P6 Dashboard** | Live read-only view | SSE stream reflects state within seconds |
 | **P7 Local live smoke** | One real end-to-end run locally (real GitHub App + `claude` + Docker + Azurite) | A labelled issue in a throwaway repo drives the full loop locally → real CR + merge-handoff |
 | **P8 Azure productionization** | Deploy to dev + prod | Bicep-provisioned dev env runs the full loop on Azure |
+| **P9 Default role skills** | Repos with no per-role prompt fall back to public Claude skills | A repo with roles but no prompts runs the loop via `/feature-dev:feature-dev` (coder) + `/code-review` (reviewer) → reviewed PR |
 
 ---
 
@@ -213,6 +214,27 @@ This backs the technical spec's resilience requirements-traceability rows (crash
 
 **Tests:** smoke-test the full loop in dev Azure; deploy/rollback (redeploy prior revision) drill; expand/contract migration applied with old+new replicas coexisting.
 **Exit:** a labelled issue in a real connected repo runs end-to-end on Azure dev. **Depends on:** P7 (the seams are proven locally first, so a failure here is infra, not integration); P4 for the full loop; ideally P5–P6 for a production-honest deploy. (A thin P3-only slice can be deployed earlier to validate the Azure plumbing, but that is not the full-loop exit above.)
+
+---
+
+## P9 — Default role behaviors via public Claude skills (skill fallback)
+
+**Goal:** a repo whose `.factory/config.yml` defines roles but **no per-role prompt** gets *high-quality* coder/reviewer behavior by invoking Claude's packaged **public skills** (`/feature-dev:feature-dev` for the coder, `/code-review` for the reviewer) — so onboarding a repo needs zero prompt authoring. Repos that *do* define prompts are unchanged (additive).
+
+**What's already there (don't rebuild it):** the worker already has a "no prompt authoring needed" fallback — `libs/config::resolve_prompt` layers a built-in `role_default_prompt` (`services/tools`) when the repo omits a prompt, and today the worker drives `claude --print` with a *composed prose prompt* (`services/worker/src/main.rs`). P9's delta is **richer behavior via real skills**, not "a default exists." Frame the value as quality, and reuse the existing resolution layer rather than adding a parallel one.
+
+**⚠️ De-risk SPIKE first (gate — the rest is blocked on it).** Two premises are currently unproven and must be proven before the phase is real:
+- **Headless invocation:** can `claude --print --dangerously-skip-permissions "/code-review …"` (non-interactive, as the worker runs it) actually *execute* a slash-command skill and emit the verdict marker the worker parses (`outcome_for_role`)? The repo's own risk register already says driving Claude Code headless needs a spike (see "Sequencing rationale & risks"). If a leading `/slash-command` isn't expanded from argv in `--print` mode, this phase needs a different invocation (e.g. an explicit skill flag) or is infeasible as specified.
+- **Skill provenance + offline install:** confirm `/feature-dev:feature-dev` and `/code-review` are genuinely **public**, name the exact **marketplace/plugin + version**, and prove they install into the worker image's `CLAUDE_CONFIG_DIR` at *build* time and are invocable with **no network at run time**. (They are NOT vendored in this repo's `.agents/skills/`; the closest local skill is `feature-engineer`. If the public ones aren't offline-installable, fall back to vendoring `feature-engineer`/`code-review`-style skills.)
+
+**Tasks (after the spike passes)**
+- **Role-skill resolution (worker):** extend the existing `resolve_prompt` layering so a role with no repo prompt resolves to its default **skill** invocation. Mapping: **coder → `/feature-dev:feature-dev`**, **reviewer → `/code-review`** (manager/tester keep their built-in triage/verdict prompts). 
+- **Worker image:** install the spike-confirmed skill plugins into the `worker` Docker stage's `CLAUDE_CONFIG_DIR`, pinned, with an image test asserting `claude` lists them offline.
+- **Config schema:** optional per-role `prompt` (inline) **or** `skill` (named) override in `.factory/config.yml`; absent → the role default skill. Precedence: repo prompt > repo skill > built-in default skill.
+- **Invocation plumbing:** thread the resolved skill/prompt through the existing worker→`claude` launch; leave the per-task token + MCP Tools wiring unchanged.
+
+**Tests:** spike artifact (a runnable demo of headless skill invocation in the worker image, emitting a parseable verdict); unit — role→default-skill resolution + repo-override precedence, **every role through every path**; image test — skills installed + listable offline; E2E — a repo with roles but no prompts runs the loop via the skills, producing a reviewed PR.
+**Exit:** label an issue in a repo whose config defines roles but no prompts → coder uses feature-dev, reviewer uses code-review, and a reviewed PR is produced. **Depends on:** P8 (worker runtime + image build are the seam this extends); **gated on the de-risk spike**.
 
 ---
 

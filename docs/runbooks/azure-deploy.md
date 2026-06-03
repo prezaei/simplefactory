@@ -139,10 +139,18 @@ az containerapp job start -g $RG -n factory-migrate-dev
 ## Point the GitHub App at the deployment
 
 1. Get the intake FQDN: `az containerapp show -g $RG -n intake --query properties.configuration.ingress.fqdn -o tsv`.
-2. In the GitHub App settings, set the **Webhook URL** to `https://<intake-fqdn>/webhooks/github`
-   and the **webhook secret** to `FACTORY_GITHUB_WEBHOOK_SECRET`.
-3. Install the App on `prezaei/factory-smoke` (or your test repo). The `installation` webhook
-   auto-onboards the repo (no manual DB seeding).
+2. In the GitHub App settings → **General → Webhook**: set **Active** ✓, **Webhook URL** to
+   `https://<intake-fqdn>/webhooks/github`, **Content type** `application/json`, and the **Secret** to
+   `FACTORY_GITHUB_WEBHOOK_SECRET`.
+3. **Subscribe the App to events** (App settings → **Permissions & events → Subscribe to events**):
+   **Issues, Issue comment, Push, Pull request, Pull request review.** This is REQUIRED and easy to
+   miss — locally P7 used `gh webhook forward` (which subscribes to events itself), so a fresh App
+   often has `events: []` and GitHub delivers **nothing** but the `ping`, silently stalling the loop.
+   Verify with the App JWT: `GET /app` → `.events` must be non-empty. (Permissions already cover these.)
+4. Install the App on `prezaei/factory-smoke` (or your test repo). The `installation` webhook
+   auto-onboards the repo (no manual DB seeding). On a fresh DB where the App is *already* installed,
+   no install event fires — re-onboard by toggling the repo in the installation, or replay a signed
+   `installation_repositories` delivery, so intake's onboarding handler runs.
 
 ---
 
