@@ -239,7 +239,8 @@ impl WorkerRuntime {
     }
 }
 
-fn non_empty_env(key: &str) -> Option<String> {
+/// Read an env var, treating whitespace-only as unset (the trimmed value, or `None`).
+pub fn non_empty_env(key: &str) -> Option<String> {
     // Trim first so a whitespace-only value (common when copying env files) is treated
     // as unset rather than forwarded into a worker container, where it would surface as
     // a confusing parse/startup failure instead of "absent".
@@ -454,22 +455,11 @@ impl WorkerLauncher for ContainerAppsJobLauncher {
 
         // 1. GET the job's current template (image, resources, base env + KV secretRefs).
         let get_url = job_get_url(&self.subscription_id, &self.resource_group, &self.job_name);
-        let get_resp = self
-            .http
-            .get(&get_url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Container Apps job GET request: {e}"))?;
-        let get_status = get_resp.status();
-        let get_text = get_resp
-            .text()
-            .await
-            .map_err(|e| anyhow::anyhow!("reading Container Apps job GET body: {e}"))?;
-        if !get_status.is_success() {
-            let snippet: String = get_text.chars().take(500).collect();
-            anyhow::bail!("Container Apps job GET returned {get_status}: {snippet}");
-        }
+        let get_text = send_checked(
+            self.http.get(&get_url).bearer_auth(&token),
+            "Container Apps job GET",
+        )
+        .await?;
         let job: serde_json::Value = serde_json::from_str(&get_text)
             .map_err(|e| anyhow::anyhow!("parsing Container Apps job GET body: {e}"))?;
         let template = job
@@ -488,33 +478,20 @@ impl WorkerLauncher for ContainerAppsJobLauncher {
             "ContainerAppsJobLauncher: starting job execution"
         );
 
-        // 3. POST start with the merged template (the start body IS the template, no wrapper).
+        // 3. POST start with the projected template (the start body IS the template, no wrapper).
         let start_url = job_start_url(&self.subscription_id, &self.resource_group, &self.job_name);
-        let resp = self
-            .http
-            .post(&start_url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Container Apps job start request: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            let snippet: String = text.chars().take(500).collect();
-            anyhow::bail!("Container Apps job start returned {status}: {snippet}");
-        }
-        // The start response carries the new execution's `name`. A body-read failure here is
-        // non-fatal — the job DID start (2xx); fall back to a synthetic name + warn rather
-        // than failing the launch (which would re-dispatch + double-launch).
-        let execution = match resp.text().await {
-            Ok(text) => parse_execution_name(&text)
-                .unwrap_or_else(|| format!("{}-execution", self.job_name)),
-            Err(e) => {
-                tracing::warn!(error = %e, job = %self.job_name, "could not read job-start response body; using synthetic execution name");
-                format!("{}-execution", self.job_name)
-            }
-        };
+        let text = send_checked(
+            self.http.post(&start_url).bearer_auth(&token).json(&body),
+            "Container Apps job start",
+        )
+        .await?;
+        // The start response carries the new execution's `name`. A missing/unreadable name is
+        // non-fatal — the job DID start (2xx); fall back to a synthetic name + warn rather than
+        // failing the launch (which would re-dispatch + double-launch).
+        let execution = parse_execution_name(&text).unwrap_or_else(|| {
+            tracing::warn!(job = %self.job_name, "job-start response had no execution name; using synthetic");
+            format!("{}-execution", self.job_name)
+        });
         tracing::info!(
             work_item = %spec.work_item_id,
             execution = %execution,
@@ -522,6 +499,24 @@ impl WorkerLauncher for ContainerAppsJobLauncher {
         );
         Ok(execution)
     }
+}
+
+/// Send an ARM request and return the response body text on a 2xx; on a transport failure or a
+/// non-2xx, an error naming the call (`what`) with a truncated body snippet. Body read is
+/// best-effort (an unreadable 2xx body yields `""`, which the GET caller turns into a parse
+/// error and the start caller into a synthetic execution name — neither must hard-fail there).
+async fn send_checked(req: reqwest::RequestBuilder, what: &str) -> anyhow::Result<String> {
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("{what} request: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let snippet: String = text.chars().take(500).collect();
+        anyhow::bail!("{what} returned {status}: {snippet}");
+    }
+    Ok(text)
 }
 
 /// The ARM URL for the job resource itself (GET the current template). Pure + unit-tested.

@@ -45,19 +45,15 @@ async fn main() -> anyhow::Result<()> {
     {
         Some("container_apps") => {
             let require = |k: &str| {
-                std::env::var(k)
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("{k} is required for the container_apps runtime")
-                    })
+                factory_dispatcher::non_empty_env(k).ok_or_else(|| {
+                    anyhow::anyhow!("{k} is required for the container_apps runtime")
+                })
             };
             let subscription = require("FACTORY_AZURE_SUBSCRIPTION_ID")?;
             let resource_group = require("FACTORY_AZURE_RESOURCE_GROUP")?;
             let job_name = require("FACTORY_WORKER_JOB_NAME")?;
-            let mi_client_id = std::env::var("FACTORY_MANAGED_IDENTITY_CLIENT_ID")
-                .ok()
-                .filter(|v| !v.trim().is_empty());
+            let mi_client_id =
+                factory_dispatcher::non_empty_env("FACTORY_MANAGED_IDENTITY_CLIENT_ID");
             tracing::info!(%subscription, %resource_group, %job_name, "dispatcher: Azure Container Apps Jobs runtime");
             Box::new(ContainerAppsJobLauncher::new(
                 subscription,
