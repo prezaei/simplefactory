@@ -256,15 +256,17 @@ pub async fn upsert_repo(
     installation_id: i64,
 ) -> Result<Uuid> {
     let row = sqlx::query(
-        // Re-onboarding (re-install / unsuspend) must REACTIVATE a previously-removed repo,
-        // so the conflict path resets status to 'active' as well as refreshing the
-        // installation id — otherwise a repo offboarded then re-added stays 'removed' and
-        // Factory keeps ignoring it.
+        // Re-onboarding (re-install / unsuspend) must REACTIVATE a previously-REMOVED repo,
+        // so the conflict path flips 'removed' → 'active' (and refreshes the installation
+        // id) — otherwise a repo offboarded then re-added stays 'removed' and Factory keeps
+        // ignoring it. But it must NOT clobber a deliberately-'suspended' repo (an operator
+        // paused Factory on it): only 'removed' is reactivated; any other status is kept.
         "INSERT INTO repos (id, installation_id, owner, name, status)
          VALUES ($1, $2, $3, $4, 'active')
          ON CONFLICT (owner, name)
            DO UPDATE SET installation_id = EXCLUDED.installation_id,
-                         status = 'active',
+                         status = CASE WHEN repos.status = 'removed' THEN 'active'
+                                       ELSE repos.status END,
                          updated_at = now()
          RETURNING id",
     )

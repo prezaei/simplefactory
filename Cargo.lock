@@ -696,6 +696,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "factory-azure-auth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "azure_core",
+ "reqwest",
+ "serde_json",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "factory-blob"
 version = "0.1.0"
 dependencies = [
@@ -704,11 +718,9 @@ dependencies = [
  "azure_core",
  "azure_storage",
  "azure_storage_blobs",
+ "factory-azure-auth",
  "flate2",
- "reqwest",
- "serde_json",
  "tar",
- "time",
  "tokio",
  "tracing",
 ]

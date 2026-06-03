@@ -253,7 +253,13 @@ pub fn parse_event(event_type: &str, payload: &[u8]) -> Result<WebhookEvent, Git
             })
         }
         // App installed/uninstalled (whole-installation lifecycle). `repositories` lists
-        // the selected repos; created/unsuspend onboard them, deleted/suspend offboard.
+        // the selected repos. We model just two actions: ONBOARD (created/unsuspend) and
+        // OFFBOARD (deleted/suspend). A GitHub `suspend` is deliberately treated as an
+        // offboard (Factory stops acting on the repo, status → 'removed') rather than a
+        // distinct lifecycle state; `unsuspend` re-onboards it (`upsert_repo` reactivates a
+        // 'removed' repo). The schema's separate 'suspended' status is reserved for an
+        // operator manually pausing Factory and is never written by these webhooks — so an
+        // operator 'suspend' is never clobbered by a GitHub suspend/unsuspend round-trip.
         "installation" => {
             let p: InstallationPayload = serde_json::from_slice(payload)?;
             let coords = full_names_to_coords(&p.repositories);

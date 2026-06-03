@@ -6,6 +6,7 @@ members = [
     "libs/record",
     "libs/github",
     "libs/blob",
+    "libs/azure-auth",
     "services/intake",
     "services/dispatcher",
     "services/coordinator",
@@ -80,6 +81,7 @@ factory-config = { path = "libs/config" }
 factory-record = { path = "libs/record" }
 factory-github = { path = "libs/github" }
 factory-blob = { path = "libs/blob" }
+factory-azure-auth = { path = "libs/azure-auth" }
 factory-intake = { path = "services/intake" }
 factory-tools = { path = "services/tools" }
 factory-dispatcher = { path = "services/dispatcher" }

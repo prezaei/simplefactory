@@ -29,9 +29,14 @@ use crate::{CheckpointStore, TranscriptStore};
 struct BlobLocation {
     account: String,
     credential: BlobCredential,
-    /// `Some((host, port))` ⇒ the emulator/custom endpoint (Azurite); `None` ⇒ the
-    /// real Azure public cloud (`https://{account}.blob.core.windows.net`).
+    /// `Some((host, port))` ⇒ the Azurite emulator (shared-key + `BlobEndpoint`, or
+    /// `UseDevelopmentStorage=true`). `None` ⇒ real Azure (see `custom_endpoint`).
     emulator: Option<(String, u16)>,
+    /// A real-Azure custom base URL (Managed Identity + an explicit `BlobEndpoint`, e.g. a
+    /// Private Link / sovereign-cloud endpoint). `Some` ⇒ `CloudLocation::Custom`; `None`
+    /// with no emulator ⇒ public cloud (`https://{account}.blob.core.windows.net`). Honored
+    /// rather than silently dropped.
+    custom_endpoint: Option<String>,
 }
 
 /// How to authenticate to Blob — the one dev/prod fork (the rest of the data path is
@@ -68,25 +73,31 @@ fn parse_connection_string(conn: &str) -> anyhow::Result<BlobLocation> {
             .with_context(|| format!("malformed connection-string segment: {segment}"))?;
         match k.trim() {
             "AccountName" => account = Some(v.trim().to_string()),
-            "AccountKey" => key = Some(v.trim().to_string()),
-            "BlobEndpoint" => endpoint = Some(v.trim().to_string()),
-            "ManagedIdentityClientId" => mi_client_id = Some(v.trim().to_string()),
+            // An empty value (`AccountKey=;`, a blanked template) is treated as ABSENT,
+            // not as an empty shared key — so it selects Managed Identity (the prod
+            // default) rather than failing later with an opaque empty-key auth error.
+            "AccountKey" => key = non_empty(v),
+            "BlobEndpoint" => endpoint = non_empty(v),
+            "ManagedIdentityClientId" => mi_client_id = non_empty(v),
             "UseDevelopmentStorage" => use_dev = v.trim().eq_ignore_ascii_case("true"),
             _ => {} // ignore the rest (DefaultEndpointsProtocol, QueueEndpoint, …)
         }
     }
 
-    // The emulator endpoint: an explicit BlobEndpoint always wins (so a worker
-    // container can point at host.docker.internal), with `UseDevelopmentStorage=true`
-    // supplying the default 127.0.0.1:10000 + dev credentials when no endpoint is set.
-    // Managed Identity targets real Azure, so its endpoint is the public cloud (the
-    // account URL), never the emulator — only a shared-key string maps to the emulator.
-    let emulator = match (&endpoint, key.is_some() || use_dev) {
-        (Some(ep), true) => Some(parse_host_port(ep)?),
-        (Some(_), false) => None, // MI + endpoint → public cloud (sovereign/custom is a follow-up)
-        (None, _) if use_dev => Some(("127.0.0.1".to_string(), 10000)),
-        (None, _) => None,
-    };
+    // Endpoint handling. A shared-key string with a `BlobEndpoint` (or
+    // `UseDevelopmentStorage=true`) is the Azurite emulator — an explicit endpoint lets a
+    // worker container point at host.docker.internal. Managed Identity targets real Azure,
+    // so a `BlobEndpoint` with MI is a real CUSTOM base URL (Private Link / sovereign) and
+    // is HONORED via `custom_endpoint`, not dropped. No endpoint ⇒ public cloud.
+    let shared_key_or_dev = key.is_some() || use_dev;
+    let mut emulator = None;
+    let mut custom_endpoint = None;
+    match (&endpoint, shared_key_or_dev) {
+        (Some(ep), true) => emulator = Some(parse_host_port(ep)?),
+        (Some(ep), false) => custom_endpoint = Some(ep.clone()),
+        (None, _) if use_dev => emulator = Some(("127.0.0.1".to_string(), 10000)),
+        (None, _) => {}
+    }
 
     if use_dev {
         return Ok(BlobLocation {
@@ -95,6 +106,7 @@ fn parse_connection_string(conn: &str) -> anyhow::Result<BlobLocation> {
                 key.unwrap_or_else(|| EMULATOR_ACCOUNT_KEY.to_string()),
             ),
             emulator,
+            custom_endpoint,
         });
     }
 
@@ -110,7 +122,15 @@ fn parse_connection_string(conn: &str) -> anyhow::Result<BlobLocation> {
         account,
         credential,
         emulator,
+        custom_endpoint,
     })
+}
+
+/// A trimmed connection-string value, or `None` if empty — so a blank `Key=` segment is
+/// treated as absent rather than an empty string.
+fn non_empty(v: &str) -> Option<String> {
+    let t = v.trim();
+    (!t.is_empty()).then(|| t.to_string())
 }
 
 /// Pull `(host, port)` out of a `BlobEndpoint` URL, defaulting the port by scheme.
@@ -144,13 +164,18 @@ async fn connect_container(conn: &str, container: &str) -> anyhow::Result<Contai
         BlobCredential::ManagedIdentity { client_id } => {
             tracing::info!(account = %loc.account, client_id = ?client_id, "azure blob: connecting with managed identity");
             StorageCredentials::token_credential(std::sync::Arc::new(
-                crate::managed_identity::ManagedIdentityCredential::new(client_id.clone()),
+                factory_azure_auth::ManagedIdentityCredential::new(client_id.clone()),
             ))
         }
     };
-    let cloud = match loc.emulator {
-        Some((address, port)) => CloudLocation::Emulator { address, port },
-        None => CloudLocation::Public {
+    let cloud = match (loc.emulator, loc.custom_endpoint) {
+        (Some((address, port)), _) => CloudLocation::Emulator { address, port },
+        // A real-Azure custom base URL (MI + Private Link / sovereign endpoint) — honored.
+        (None, Some(uri)) => CloudLocation::Custom {
+            account: loc.account.clone(),
+            uri,
+        },
+        (None, None) => CloudLocation::Public {
             account: loc.account.clone(),
         },
     };
@@ -367,10 +392,10 @@ mod tests {
     }
 
     #[test]
-    fn keyless_connection_string_selects_managed_identity() {
+    fn keyless_connection_string_selects_managed_identity_and_honors_endpoint() {
         // Prod: AccountName + endpoint, NO AccountKey ⇒ Managed Identity (system-assigned).
         let loc = parse_connection_string(
-            "AccountName=factoryprod;BlobEndpoint=https://factoryprod.blob.core.windows.net/;",
+            "AccountName=factoryprod;BlobEndpoint=https://factoryprod.privatelink.blob.core.windows.net/;",
         )
         .unwrap();
         assert_eq!(loc.account, "factoryprod");
@@ -378,8 +403,35 @@ mod tests {
             loc.credential,
             BlobCredential::ManagedIdentity { client_id: None }
         );
-        // MI targets real Azure, never the emulator — an endpoint with MI is public cloud.
+        // MI never uses the emulator; an explicit endpoint is a real custom base URL
+        // (Private Link / sovereign) and is HONORED, not dropped.
         assert_eq!(loc.emulator, None);
+        assert_eq!(
+            loc.custom_endpoint.as_deref(),
+            Some("https://factoryprod.privatelink.blob.core.windows.net/")
+        );
+    }
+
+    #[test]
+    fn keyless_no_endpoint_is_managed_identity_on_public_cloud() {
+        let loc = parse_connection_string("AccountName=factoryprod;").unwrap();
+        assert_eq!(
+            loc.credential,
+            BlobCredential::ManagedIdentity { client_id: None }
+        );
+        assert_eq!(loc.emulator, None);
+        assert_eq!(loc.custom_endpoint, None); // → CloudLocation::Public
+    }
+
+    #[test]
+    fn empty_account_key_is_treated_as_absent_and_selects_managed_identity() {
+        // A blanked `AccountKey=` (template placeholder) must NOT become an empty shared
+        // key — it's absent, so Managed Identity is selected.
+        let loc = parse_connection_string("AccountName=factoryprod;AccountKey=;").unwrap();
+        assert_eq!(
+            loc.credential,
+            BlobCredential::ManagedIdentity { client_id: None }
+        );
     }
 
     #[test]

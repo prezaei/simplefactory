@@ -1,19 +1,22 @@
-//! A minimal Azure **Managed Identity** [`TokenCredential`] (P8) — the prod credential
-//! the blob stores swap to (Azurite/dev keeps shared-key). It speaks the two MSI token
-//! protocols Factory's runtimes use:
+//! A minimal Azure **Managed Identity** [`TokenCredential`] (MSI/IMDS) shared across
+//! Factory services (P8): `libs/blob` uses it for Blob `StorageCredentials`, and the
+//! dispatcher (P8 part 2) will use it for an ARM token to start Container Apps Jobs.
 //!
+//! It speaks the two MSI token protocols Factory's runtimes use:
 //! - **Container Apps / App Service**: the per-container MSI endpoint advertised via the
 //!   `IDENTITY_ENDPOINT` + `IDENTITY_HEADER` env vars (header `X-IDENTITY-HEADER`).
 //! - **IMDS** (VM/VMSS) fallback: `http://169.254.169.254/...` with header `Metadata: true`.
 //!
-//! It is implemented directly over the rustls `reqwest` already in the tree rather than
-//! pulling `azure_identity`, whose default `oauth2`→native-tls dependency would drag
-//! openssl back into a stack that deliberately drops it (rustls + `hmac_rust`). The
-//! request *construction* is a pure, unit-tested fn ([`build_token_request`]); the network
-//! call + token cache is a **deploy seam** (prod-only — CI/local always uses Azurite
-//! shared-key, so this code path is never exercised in tests).
+//! Implemented directly over the rustls `reqwest` already in the tree rather than pulling
+//! `azure_identity`, whose default `oauth2`→native-tls dependency would drag openssl back
+//! into a stack that deliberately drops it (rustls + `hmac_rust`). The request
+//! *construction* + token *parsing* are pure, unit-tested fns; the network call + token
+//! cache are a **deploy seam** (prod-only — CI/local always uses Azurite shared-key, so
+//! this code path is never exercised in tests).
+#![forbid(unsafe_code)]
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use azure_core::auth::{AccessToken, TokenCredential};
 use azure_core::error::{Error as AzureError, ErrorKind};
@@ -24,14 +27,19 @@ const STORAGE_RESOURCE: &str = "https://storage.azure.com/";
 /// Refresh a cached token this many seconds before its real expiry (clock skew + the
 /// in-flight request window), so a call never uses a token that expires mid-flight.
 const EXPIRY_SKEW_SECS: i64 = 300;
+/// Per-request timeout for the MSI/IMDS call. The IMDS link-local address (169.254.169.254)
+/// blackholes off-Azure / when firewalled (no route, no RST), so without a timeout
+/// `get_token` would hang forever and wedge every blob op. Azure's own IMDS guidance
+/// mandates a client-side timeout.
+const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Managed Identity credential. `client_id` selects a specific **user-assigned** identity
 /// (Factory gives each service its own); `None` uses the system-assigned identity.
-pub(crate) struct ManagedIdentityCredential {
+pub struct ManagedIdentityCredential {
     client_id: Option<String>,
     http: reqwest::Client,
     /// Cache the last token until it nears expiry — MSI endpoints rate-limit, and every
-    /// blob op would otherwise re-fetch.
+    /// call would otherwise re-fetch.
     cached: Mutex<Option<AccessToken>>,
 }
 
@@ -45,23 +53,47 @@ impl std::fmt::Debug for ManagedIdentityCredential {
 }
 
 impl ManagedIdentityCredential {
-    pub(crate) fn new(client_id: Option<String>) -> Self {
+    pub fn new(client_id: Option<String>) -> Self {
         Self {
             client_id,
             http: reqwest::Client::new(),
             cached: Mutex::new(None),
         }
     }
+
+    /// Convenience for non-`azure_storage` callers (e.g. the dispatcher's ARM token):
+    /// fetch a bearer token string for `resource` (the `{resource}/.default` scope).
+    pub async fn bearer_token(&self, resource: &str) -> anyhow::Result<String> {
+        let scope = format!("{}/.default", resource.trim_end_matches('/'));
+        let token = self
+            .get_token(&[&scope])
+            .await
+            .map_err(|e| anyhow::anyhow!("acquiring managed-identity token: {e}"))?;
+        Ok(token.token.secret().to_string())
+    }
 }
 
 /// A built MSI/IMDS token request: base URL + query pairs (encoded by reqwest) + the one
 /// auth header. Pure data so the protocol selection is unit-tested without the network.
-#[derive(Debug, PartialEq, Eq)]
+/// `Debug` redacts `header_value` — on the Container Apps path it carries the MSI secret
+/// (`X-IDENTITY-HEADER`), so a stray `debug!(?req)` must not leak it.
+#[derive(PartialEq, Eq)]
 struct TokenRequest {
     base_url: String,
     query: Vec<(String, String)>,
     header_name: String,
     header_value: String,
+}
+
+impl std::fmt::Debug for TokenRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenRequest")
+            .field("base_url", &self.base_url)
+            .field("query", &self.query)
+            .field("header_name", &self.header_name)
+            .field("header_value", &"<REDACTED>")
+            .finish()
+    }
 }
 
 /// Choose the MSI protocol from the environment and build the token request. When the
@@ -74,46 +106,42 @@ fn build_token_request(
     client_id: Option<&str>,
     resource: &str,
 ) -> TokenRequest {
-    match (identity_endpoint, identity_header) {
-        (Some(endpoint), Some(_header)) => {
-            let mut query = vec![
-                ("api-version".to_string(), "2019-08-01".to_string()),
-                ("resource".to_string(), resource.to_string()),
-            ];
-            if let Some(c) = client_id {
-                query.push(("client_id".to_string(), c.to_string()));
-            }
-            TokenRequest {
-                base_url: endpoint.to_string(),
-                query,
-                header_name: "X-IDENTITY-HEADER".to_string(),
-                header_value: identity_header.unwrap_or_default().to_string(),
-            }
-        }
-        _ => {
-            let mut query = vec![
-                ("api-version".to_string(), "2018-02-01".to_string()),
-                ("resource".to_string(), resource.to_string()),
-            ];
-            if let Some(c) = client_id {
-                query.push(("client_id".to_string(), c.to_string()));
-            }
-            TokenRequest {
-                base_url: "http://169.254.169.254/metadata/identity/oauth2/token".to_string(),
-                query,
-                header_name: "Metadata".to_string(),
-                header_value: "true".to_string(),
-            }
-        }
+    let (base_url, api_version, header_name, header_value) =
+        match (identity_endpoint, identity_header) {
+            (Some(endpoint), Some(header)) => (
+                endpoint.to_string(),
+                "2019-08-01",
+                "X-IDENTITY-HEADER".to_string(),
+                header.to_string(),
+            ),
+            _ => (
+                "http://169.254.169.254/metadata/identity/oauth2/token".to_string(),
+                "2018-02-01",
+                "Metadata".to_string(),
+                "true".to_string(),
+            ),
+        };
+    let mut query = vec![
+        ("api-version".to_string(), api_version.to_string()),
+        ("resource".to_string(), resource.to_string()),
+    ];
+    if let Some(c) = client_id {
+        query.push(("client_id".to_string(), c.to_string()));
+    }
+    TokenRequest {
+        base_url,
+        query,
+        header_name,
+        header_value,
     }
 }
 
-/// The MSI/IMDS resource for a set of OAuth scopes: drop the `/.default` suffix Azure SDK
-/// scopes carry (the MSI `resource` param wants the bare audience), defaulting to the
-/// storage resource. Pure + unit-tested.
+/// The MSI/IMDS resource for a set of OAuth scopes: drop the `.default` suffix Azure SDK
+/// scopes carry (the resource keeps its trailing slash), defaulting to the storage
+/// resource. Pure + unit-tested.
 fn resource_for_scopes(scopes: &[&str]) -> String {
-    // An Azure scope is `{resource}.default` (the resource keeps its trailing slash),
-    // e.g. `https://storage.azure.com/.default` → resource `https://storage.azure.com/`.
+    // An Azure scope is `{resource}.default`, e.g. `https://storage.azure.com/.default`
+    // → resource `https://storage.azure.com/`.
     scopes
         .first()
         .map(|s| s.trim_end_matches(".default"))
@@ -165,8 +193,15 @@ fn expires_on_unix(v: &serde_json::Value, now_unix: i64) -> Option<i64> {
 #[async_trait::async_trait]
 impl TokenCredential for ManagedIdentityCredential {
     async fn get_token(&self, scopes: &[&str]) -> azure_core::Result<AccessToken> {
-        // Serve a cached token until it nears expiry.
-        if let Some(tok) = self.cached.lock().expect("token cache mutex").as_ref() {
+        // Serve a cached token until it nears expiry. Recover from a poisoned mutex
+        // (the critical section only clones/assigns, so the data is always consistent)
+        // rather than panicking and turning a recoverable state into a credential outage.
+        if let Some(tok) = self
+            .cached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             if tok.expires_on > OffsetDateTime::now_utc() {
                 return Ok(tok.clone());
             }
@@ -189,6 +224,7 @@ impl TokenCredential for ManagedIdentityCredential {
             .get(&req.base_url)
             .query(&req.query)
             .header(&req.header_name, &req.header_value)
+            .timeout(TOKEN_REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(|e| {
@@ -205,12 +241,12 @@ impl TokenCredential for ManagedIdentityCredential {
             ));
         }
         let token = parse_token_response(&body, OffsetDateTime::now_utc().unix_timestamp())?;
-        *self.cached.lock().expect("token cache mutex") = Some(token.clone());
+        *self.cached.lock().unwrap_or_else(|e| e.into_inner()) = Some(token.clone());
         Ok(token)
     }
 
     async fn clear_cache(&self) -> azure_core::Result<()> {
-        *self.cached.lock().expect("token cache mutex") = None;
+        *self.cached.lock().unwrap_or_else(|e| e.into_inner()) = None;
         Ok(())
     }
 }
@@ -259,6 +295,22 @@ mod tests {
     }
 
     #[test]
+    fn token_request_debug_redacts_the_identity_header() {
+        let req = build_token_request(
+            Some("http://localhost/msi"),
+            Some("super-secret-header"),
+            None,
+            "r",
+        );
+        let dbg = format!("{req:?}");
+        assert!(
+            !dbg.contains("super-secret-header"),
+            "header value must be redacted"
+        );
+        assert!(dbg.contains("<REDACTED>"));
+    }
+
+    #[test]
     fn resource_strips_default_suffix_and_defaults() {
         assert_eq!(
             resource_for_scopes(&["https://storage.azure.com/.default"]),
@@ -273,20 +325,17 @@ mod tests {
 
     #[test]
     fn parses_expires_on_string_and_number() {
-        // expires_on as a string of epoch seconds (Container Apps / IMDS shape).
         let tok = parse_token_response(
             r#"{"access_token":"abc","expires_on":"2000000000"}"#,
             1_000_000_000,
         )
         .unwrap();
         assert_eq!(tok.token.secret(), "abc");
-        // Expiry is the stated time minus the skew.
         assert_eq!(
             tok.expires_on.unix_timestamp(),
             2_000_000_000 - EXPIRY_SKEW_SECS
         );
 
-        // expires_on as a JSON number.
         let tok2 =
             parse_token_response(r#"{"access_token":"x","expires_on":2000000000}"#, 0).unwrap();
         assert_eq!(

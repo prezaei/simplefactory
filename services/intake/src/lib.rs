@@ -109,6 +109,18 @@ async fn process_installation(
             owner = %r.owner, name = %r.name, installation_id, repo_id = %id,
             "onboarded repo via installation webhook"
         );
+        // The events book records every onboarding decision per repo (not just the
+        // coarse per-delivery audit), per the "every activity is logged" mandate.
+        record::append_event(
+            pool,
+            Some(id),
+            None,
+            None,
+            "intake",
+            "repo_onboarded",
+            serde_json::json!({ "owner": r.owner, "name": r.name, "installation_id": installation_id }),
+        )
+        .await?;
     }
     let mut offboarded = 0usize;
     for r in removed {
@@ -118,6 +130,24 @@ async fn process_installation(
             owner = %r.owner, name = %r.name, deactivated = n,
             "offboarded repo via installation webhook"
         );
+        // Audit the offboard too (only when a row actually changed — `n > 0`). The repo id
+        // (for the audit row's repo_id) is resolved best-effort; the owner/name detail is
+        // the durable record regardless.
+        if n > 0 {
+            let repo_id = record::repo_by_name(pool, &r.owner, &r.name)
+                .await?
+                .map(|rc| rc.id);
+            record::append_event(
+                pool,
+                repo_id,
+                None,
+                None,
+                "intake",
+                "repo_offboarded",
+                serde_json::json!({ "owner": r.owner, "name": r.name }),
+            )
+            .await?;
+        }
     }
     Ok((
         None,

@@ -15,12 +15,9 @@ flate2.workspace = true
 azure_core.workspace = true
 azure_storage.workspace = true
 azure_storage_blobs.workspace = true
-# Managed Identity credential (P8): a minimal MSI/IMDS TokenCredential over the rustls
-# reqwest already in the tree — avoids azure_identity (whose default oauth2→native-tls
-# would pull openssl back in, which the whole stack deliberately drops).
-reqwest.workspace = true
-serde_json.workspace = true
-time.workspace = true
+# Managed Identity credential (P8) — shared crate (also used by the dispatcher's Container
+# Apps launcher in part 2), so the MSI/IMDS token logic lives in exactly one place.
+factory-azure-auth.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
