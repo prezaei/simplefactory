@@ -24,8 +24,10 @@ param devClientIp string = ''
 this template's ACR. Set `false` for the FIRST deploy of a fresh resource group to stand up
 infra + an empty ACR; CD then builds/pushes the images and re-deploys with `true`. This breaks
 the bootstrap cycle (an app can't be created before its image exists, but the ACR that holds
-the image is created here). Idempotent on subsequent deploys.''')
-param deployWorkloads bool = true
+the image is created here). Idempotent on subsequent deploys. Defaults to `false` so a
+param-file-only deploy of a fresh resource group can't try to pull not-yet-pushed images;
+CD/phase-2 passes `true` explicitly.''')
+param deployWorkloads bool = false
 
 // --- secrets (operator supplies at deploy; never committed) ---
 @description('GitHub App id.')

@@ -51,7 +51,18 @@ az role assignment create --assignee-object-id "$SP_OID" --assignee-principal-ty
   --role Contributor --scope /subscriptions/<SUB_ID>
 az role assignment create --assignee-object-id "$SP_OID" --assignee-principal-type ServicePrincipal \
   --role "User Access Administrator" --scope /subscriptions/<SUB_ID>
+# REQUIRED: the template WRITES Key Vault secrets, and the vault uses RBAC
+# (enableRbacAuthorization). Writing a secret is a DATA-PLANE op that Contributor / Owner do
+# NOT grant — without this the very first deploy fails on the secret writes. Grant it at
+# SUBSCRIPTION scope (the vault doesn't exist yet; the grant is inherited when it's created,
+# and propagates well before any deploy — no in-deployment RBAC race):
+az role assignment create --assignee-object-id "$SP_OID" --assignee-principal-type ServicePrincipal \
+  --role "Key Vault Secrets Officer" --scope /subscriptions/<SUB_ID>
 ```
+
+> **Manual (non-CD) deploy:** the operator's OWN identity needs the same `Key Vault Secrets
+> Officer` grant (Owner/Contributor are control-plane only under RBAC). Grant it to your user:
+> `az role assignment create --assignee <your-upn> --role "Key Vault Secrets Officer" --scope /subscriptions/<SUB_ID>`.
 
 ### 3. Set GitHub repo secrets + vars
 **Secrets** (`gh secret set <NAME> --repo prezaei/simplefactory`):

@@ -71,8 +71,9 @@ blob MI credential path, the OTel exporter, and the onboarding handler.
   worker image/secrets, so it mirrors `az containerapp job start --yaml`: **GET** the job's current
   `properties.template`, **merge** the per-task env onto the `worker` container (override-by-name,
   preserving image/resources + the base env incl. the KV-backed `CLAUDE_CODE_OAUTH_TOKEN` secretRef
-  + blob connection), then **POST** that full template to start. So blob/claude come from the live
-  template (hence `WorkerRuntime::default()` for the per-task env).
+  + blob connection), **project** to the `JobExecutionTemplate` shape `/start` accepts (drop the
+  `volumes`/`probes`/`volumeMounts` the GET'd `JobTemplate` carries but `/start` rejects), then
+  **POST** it. So blob/claude come from the live template (hence `WorkerRuntime::default()`).
 - **`main.rs` selection:** `FACTORY_WORKER_RUNTIME` chooses Docker (default, local) vs `container_apps`
   (Azure, needs `FACTORY_AZURE_SUBSCRIPTION_ID` / `_RESOURCE_GROUP` / `FACTORY_WORKER_JOB_NAME`,
   optional `FACTORY_MANAGED_IDENTITY_CLIENT_ID`).

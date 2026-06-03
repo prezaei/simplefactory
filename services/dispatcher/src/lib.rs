@@ -403,14 +403,16 @@ const WORKER_CONTAINER_NAME: &str = "worker";
 /// The Container Apps `…/jobs/{job}/start` API **replaces the job's entire template** for the
 /// execution — it does NOT merge a partial override onto the base template (Azure docs: "the
 /// job's entire template configuration is replaced … include all required settings"). So the
-/// launcher mirrors what `az containerapp job start --yaml` does: **GET the job's current
-/// template, merge the per-task env onto the `worker` container, then POST that full template**
-/// to start. This preserves the image, resources, and the base env/secrets the Bicep set on
-/// the Job (the blob connection + the Key-Vault-backed `CLAUDE_CODE_OAUTH_TOKEN`) — they are
-/// read from the live template, not reconstructed here (the dispatcher doesn't know them).
-/// Hence `WorkerRuntime::default()` for the per-task env: blob/claude come from the template.
-/// The HTTP calls are the deploy seam ([`DockerLauncher`] stays for local); the URL builders
-/// + the env merge are pure + unit-tested.
+/// launcher mirrors what `az containerapp job start --yaml` does: **GET** the job's current
+/// template, **merge** the per-task env onto the `worker` container, **project** it to the
+/// `JobExecutionTemplate` shape `/start` accepts (the GET'd `JobTemplate` carries `volumes` +
+/// per-container `probes`/`volumeMounts` that `/start` rejects), then **POST** it. This preserves
+/// the image, resources, and the base env/secrets the Bicep set on the Job (the blob connection
+/// and the Key-Vault-backed `CLAUDE_CODE_OAUTH_TOKEN`) — read from the live template, not
+/// reconstructed here (the dispatcher doesn't know them). Hence `WorkerRuntime::default()` for
+/// the per-task env: blob/claude come from the template. The HTTP calls are the deploy seam
+/// ([`DockerLauncher`] stays for local); the URL builders + the env merge/projection are pure
+/// + unit-tested.
 pub struct ContainerAppsJobLauncher {
     subscription_id: String,
     resource_group: String,
@@ -475,9 +477,9 @@ impl WorkerLauncher for ContainerAppsJobLauncher {
             .and_then(|p| p.get("template"))
             .ok_or_else(|| anyhow::anyhow!("Container Apps job has no properties.template"))?;
 
-        // 2. Merge the per-task env onto the worker container (preserving image/resources/
-        //    base env + secretRefs), yielding the full template to send as the start body.
-        let body = merge_worker_env(template, WORKER_CONTAINER_NAME, &env)?;
+        // 2. Build the start body: merge the per-task env onto the worker container and
+        //    project to a JobExecutionTemplate (the shape /start accepts).
+        let body = build_execution_template(template, WORKER_CONTAINER_NAME, &env)?;
 
         tracing::info!(
             work_item = %spec.work_item_id,
@@ -538,28 +540,29 @@ fn job_start_url(subscription_id: &str, resource_group: &str, job_name: &str) ->
     )
 }
 
-/// Merge the per-task `env` onto the named container within a job `template` (the GET'd
-/// `properties.template`), returning the full modified template to POST as the start body
-/// (start replaces the whole template, so image/resources/base env + secretRefs must survive
-/// — they do, untouched). For each pair: override an existing env entry of the same name
-/// (replacing any prior `value`/`secretRef`) or append it. Pure + unit-tested. Secrets travel
-/// only as env *values* (never logged here).
-fn merge_worker_env(
-    template: &serde_json::Value,
-    container_name: &str,
-    env: &[(&str, String)],
-) -> anyhow::Result<serde_json::Value> {
-    let mut template = template.clone();
-    let containers = template
-        .get_mut("containers")
-        .and_then(|c| c.as_array_mut())
-        .ok_or_else(|| anyhow::anyhow!("job template has no containers array"))?;
-    let container = containers
-        .iter_mut()
-        .find(|c| c.get("name").and_then(|n| n.as_str()) == Some(container_name))
-        .ok_or_else(|| anyhow::anyhow!("job template has no container named {container_name:?}"))?;
-    // Preserve the container's existing env (base env values + Key-Vault secretRefs); merge
-    // the per-task pairs over it by name.
+/// Fields a `JobExecutionContainer` (the `/start` body's container shape) accepts. The GET'd
+/// `JobTemplate` `Container` is a SUPERSET — it also carries `probes` + `volumeMounts`, and the
+/// template has a top-level `volumes` array — none of which `/start`'s `JobExecutionTemplate`
+/// models, so ARM rejects/ignores them. We therefore project each container down to exactly
+/// these fields and drop top-level `volumes`.
+const EXECUTION_CONTAINER_FIELDS: [&str; 6] =
+    ["name", "image", "resources", "command", "args", "env"];
+
+/// Keep only [`EXECUTION_CONTAINER_FIELDS`] present on a container object.
+fn project_container(container: &serde_json::Value) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for field in EXECUTION_CONTAINER_FIELDS {
+        if let Some(v) = container.get(field) {
+            out.insert(field.to_string(), v.clone());
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Merge the per-task `env` onto a container's existing env by name (override an entry of the
+/// same name — replacing any prior `value`/`secretRef` — else append), returning the container
+/// with merged env. Preserves the base env values + Key-Vault `secretRef`s.
+fn merge_container_env(container: &serde_json::Value, env: &[(&str, String)]) -> serde_json::Value {
     let mut merged: Vec<serde_json::Value> = container
         .get("env")
         .and_then(|e| e.as_array())
@@ -575,8 +578,56 @@ fn merge_worker_env(
             None => merged.push(entry),
         }
     }
-    container["env"] = serde_json::Value::Array(merged);
-    Ok(template)
+    let mut c = container.clone();
+    c["env"] = serde_json::Value::Array(merged);
+    c
+}
+
+/// Build the `/start` body (a `JobExecutionTemplate`) from the GET'd job `template`: merge the
+/// per-task `env` onto the named container, then project every container (+ any initContainers)
+/// down to the execution shape (dropping `probes`/`volumeMounts`/top-level `volumes`, which
+/// `/start` rejects). `/start` REPLACES the template, so image/resources/base env + secretRefs
+/// must be carried forward — they are, via the GET'd values. Pure + unit-tested. Secrets travel
+/// only as env *values* (never logged here).
+fn build_execution_template(
+    template: &serde_json::Value,
+    container_name: &str,
+    env: &[(&str, String)],
+) -> anyhow::Result<serde_json::Value> {
+    let containers = template
+        .get("containers")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| anyhow::anyhow!("job template has no containers array"))?;
+    let mut found = false;
+    let projected: Vec<serde_json::Value> = containers
+        .iter()
+        .map(|c| {
+            if c.get("name").and_then(|n| n.as_str()) == Some(container_name) {
+                found = true;
+                project_container(&merge_container_env(c, env))
+            } else {
+                project_container(c)
+            }
+        })
+        .collect();
+    if !found {
+        anyhow::bail!("job template has no container named {container_name:?}");
+    }
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "containers".to_string(),
+        serde_json::Value::Array(projected),
+    );
+    // initContainers are part of a JobExecutionTemplate too (project them; no env merge — the
+    // per-task worker is a main container). Omitted entirely when the base has none.
+    if let Some(init) = template.get("initContainers").and_then(|c| c.as_array()) {
+        let projected_init: Vec<serde_json::Value> = init.iter().map(project_container).collect();
+        out.insert(
+            "initContainers".to_string(),
+            serde_json::Value::Array(projected_init),
+        );
+    }
+    Ok(serde_json::Value::Object(out))
 }
 
 /// Extract the started execution's `name` from the ARM start response (best-effort).
@@ -843,32 +894,47 @@ mod tests {
         );
     }
 
-    /// The merge preserves the live template's image/resources + base env (incl. the
-    /// Key-Vault `secretRef` for the claude token), overrides a same-named base entry once
-    /// (no duplicate), and appends the new per-task vars. This is the whole correctness
-    /// premise: start REPLACES the template, so everything must survive the merge.
+    /// The execution template preserves the live template's image/resources + base env (incl.
+    /// the Key-Vault `secretRef` for the claude token), overrides a same-named base entry once
+    /// (no duplicate), and appends the per-task vars — AND projects away the fields `/start`'s
+    /// JobExecutionTemplate rejects (top-level `volumes`, per-container `probes`/`volumeMounts`).
+    /// This is the whole correctness premise: start REPLACES the template with this body.
     #[test]
-    fn merge_worker_env_preserves_base_and_overrides_by_name() {
+    fn build_execution_template_projects_and_merges() {
         let base = json!({
             "containers": [{
                 "name": "worker",
                 "image": "acr.azurecr.io/factory-worker:abc123",
                 "resources": { "cpu": 1.0, "memory": "2Gi" },
+                "probes": [ { "type": "Liveness" } ],
+                "volumeMounts": [ { "volumeName": "v", "mountPath": "/m" } ],
                 "env": [
                     { "name": "CLAUDE_CODE_OAUTH_TOKEN", "secretRef": "claude-oauth-token" },
                     { "name": "FACTORY_BLOB_CONNECTION_STRING", "value": "AccountName=x;..." },
                     { "name": "FACTORY_TOOLS_URL", "value": "https://tools.stale" }
                 ]
             }],
-            "volumes": []
+            "volumes": [ { "name": "v", "storageType": "EmptyDir" } ]
         });
         let env = docker_env(&WorkerRuntime::default(), &spec());
-        let merged = merge_worker_env(&base, "worker", &env).expect("merge");
-        let container = &merged["containers"][0];
-        // Image + resources + volumes untouched (start would otherwise drop them).
+        let body = build_execution_template(&base, "worker", &env).expect("build");
+        // Top-level volumes dropped (not in JobExecutionTemplate).
+        assert!(
+            body.get("volumes").is_none(),
+            "volumes must be projected out"
+        );
+        let container = &body["containers"][0];
+        // Image + resources carried forward; probes/volumeMounts projected out.
         assert_eq!(container["image"], "acr.azurecr.io/factory-worker:abc123");
         assert_eq!(container["resources"]["memory"], "2Gi");
-        assert!(merged.get("volumes").is_some());
+        assert!(
+            container.get("probes").is_none(),
+            "probes must be projected out"
+        );
+        assert!(
+            container.get("volumeMounts").is_none(),
+            "volumeMounts must be projected out"
+        );
         let env_arr = container["env"].as_array().expect("env array");
         // Base-only secretRef + blob conn preserved.
         let claude = env_arr
@@ -885,8 +951,7 @@ mod tests {
             .find(|e| e["name"] == "FACTORY_TASK_TOKEN")
             .expect("token env");
         assert_eq!(token["value"], TOKEN);
-        // FACTORY_TOOLS_URL was in the base AND the per-task env → overridden exactly once,
-        // to the per-task value (no stale duplicate).
+        // FACTORY_TOOLS_URL was in the base AND the per-task env → overridden exactly once.
         let tools: Vec<&serde_json::Value> = env_arr
             .iter()
             .filter(|e| e["name"] == "FACTORY_TOOLS_URL")
@@ -896,10 +961,10 @@ mod tests {
     }
 
     #[test]
-    fn merge_worker_env_errors_when_container_absent() {
+    fn build_execution_template_errors_when_container_absent() {
         let base = json!({ "containers": [{ "name": "main", "env": [] }] });
         let env = docker_env(&WorkerRuntime::default(), &spec());
-        let err = merge_worker_env(&base, "worker", &env).expect_err("no worker container");
+        let err = build_execution_template(&base, "worker", &env).expect_err("no worker container");
         assert!(err.to_string().contains("worker"));
     }
 
