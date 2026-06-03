@@ -233,9 +233,13 @@ impl TokenCredential for ManagedIdentityCredential {
             AzureError::message(ErrorKind::Credential, format!("MSI token body: {e}"))
         })?;
         if !status.is_success() {
+            // Include a truncated body snippet — MSI failures carry a useful
+            // `{"error":...,"error_description":...}` (no token on an error response), so
+            // dropping it loses the actual cause. Cap it so a runaway body can't bloat logs.
+            let snippet: String = body.chars().take(500).collect();
             return Err(AzureError::message(
                 ErrorKind::Credential,
-                format!("MSI token endpoint returned {status}"),
+                format!("MSI token endpoint returned {status}: {snippet}"),
             ));
         }
         let token = parse_token_response(&body, OffsetDateTime::now_utc().unix_timestamp())?;
