@@ -98,7 +98,7 @@ credential subject (`...:environment:dev`) matches.
 1. Logs in via OIDC.
 2. `az group create` (idempotent).
 3. **Phase 1** — deploys infra + an empty ACR (`deployWorkloads=false`).
-4. **`az acr build`** — builds + pushes `factory-services` and `factory-worker` to the ACR.
+4. **`az acr run -f acb.yaml`** — builds + pushes `factory-services` and `factory-worker` to the ACR in ONE run (the shared Rust builder stage compiles once; the worker build reuses its cached layers).
 5. **Phase 2** — deploys the workloads (apps + jobs) now that the images exist.
 6. Starts the **migrate Job** and waits for `Succeeded`.
 7. Prints the intake webhook URL to the job summary.
@@ -122,9 +122,9 @@ ACR=$(az deployment group create -g $RG -n factory-infra \
   -f infra/main.bicep -p infra/main.dev.bicepparam -p deployWorkloads=false \
   --query 'properties.outputs.acrName.value' -o tsv)
 
-# Build + push images
-az acr build --registry $ACR --image factory-services:$FACTORY_IMAGE_TAG --target services -f Dockerfile .
-az acr build --registry $ACR --image factory-worker:$FACTORY_IMAGE_TAG   --target worker   -f Dockerfile .
+# Build + push BOTH images in one ACR run (acb.yaml) — the shared Rust builder compiles once,
+# the worker build reuses its cached layers (~halves the build vs two separate `az acr build`).
+az acr run --registry $ACR -f acb.yaml --set tag=$FACTORY_IMAGE_TAG .
 
 # Phase 2: workloads
 az deployment group create -g $RG -n factory-workloads \
@@ -139,10 +139,18 @@ az containerapp job start -g $RG -n factory-migrate-dev
 ## Point the GitHub App at the deployment
 
 1. Get the intake FQDN: `az containerapp show -g $RG -n intake --query properties.configuration.ingress.fqdn -o tsv`.
-2. In the GitHub App settings, set the **Webhook URL** to `https://<intake-fqdn>/webhooks/github`
-   and the **webhook secret** to `FACTORY_GITHUB_WEBHOOK_SECRET`.
-3. Install the App on `prezaei/factory-smoke` (or your test repo). The `installation` webhook
-   auto-onboards the repo (no manual DB seeding).
+2. In the GitHub App settings → **General → Webhook**: set **Active** ✓, **Webhook URL** to
+   `https://<intake-fqdn>/webhooks/github`, **Content type** `application/json`, and the **Secret** to
+   `FACTORY_GITHUB_WEBHOOK_SECRET`.
+3. **Subscribe the App to events** (App settings → **Permissions & events → Subscribe to events**):
+   **Issues, Issue comment, Push, Pull request, Pull request review.** This is REQUIRED and easy to
+   miss — locally P7 used `gh webhook forward` (which subscribes to events itself), so a fresh App
+   often has `events: []` and GitHub delivers **nothing** but the `ping`, silently stalling the loop.
+   Verify with the App JWT: `GET /app` → `.events` must be non-empty. (Permissions already cover these.)
+4. Install the App on `prezaei/factory-smoke` (or your test repo). The `installation` webhook
+   auto-onboards the repo (no manual DB seeding). On a fresh DB where the App is *already* installed,
+   no install event fires — re-onboard by toggling the repo in the installation, or replay a signed
+   `installation_repositories` delivery, so intake's onboarding handler runs.
 
 ---
 

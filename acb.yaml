@@ -1,0 +1,16 @@
+# ACR multi-step task — build BOTH Factory images in ONE run so the shared Rust `builder` stage
+# (a full `cargo build --release` of the workspace) compiles ONCE. The two `build` steps run on the
+# same task agent + Docker daemon, so the second (`--target worker`) reuses the first's cached
+# `builder` layers (identical base + COPY context + cargo command) instead of recompiling. This
+# replaces two separate `az acr build` invocations, which each recompiled the whole workspace
+# (~2x the build time, no cross-run cache).
+#
+# Run:  az acr run -r <registry> -f acb.yaml --set tag=<image-tag> <context-dir>
+#   {{.Run.Registry}} → the registry login server;  {{.Values.tag}} → the --set tag value.
+version: v1.1.0
+steps:
+  - build: --target services -t {{.Run.Registry}}/factory-services:{{.Values.tag}} -f Dockerfile .
+  - build: --target worker   -t {{.Run.Registry}}/factory-worker:{{.Values.tag}}   -f Dockerfile .
+  - push:
+      - "{{.Run.Registry}}/factory-services:{{.Values.tag}}"
+      - "{{.Run.Registry}}/factory-worker:{{.Values.tag}}"

@@ -9,6 +9,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  scripts:
+    name: shellcheck · actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Operator scripts (deploy/verify/smoke) ship real behavior but aren't exercised by the
+      # Rust suite — gate them so they can't rot (a wrong `az` flag in the migrate poll once
+      # slipped every review). shellcheck is preinstalled on ubuntu-latest.
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+      - name: actionlint
+        # Pinned Docker image — reproducible, and avoids executing a remote install script
+        # (curl | bash) at CI time (supply-chain hardening). Lints .github/workflows/*.yml.
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+
   quality:
     name: fmt · clippy · test
     runs-on: ubuntu-latest

@@ -37,7 +37,7 @@ pass_if() { local okmsg="$1" failmsg="$2"; shift 2; if "$@"; then ok "$okmsg"; e
 q() { az "$@" 2>/dev/null; }
 # Silent variant for existence checks (suppress stdout too, so JSON doesn't leak when used
 # inside pass_if, which doesn't capture the command's output).
-# shellcheck disable=SC2329  # invoked indirectly as the command passed to pass_if "$@"
+# shellcheck disable=SC2317,SC2329  # invoked indirectly as the command passed to pass_if "$@"
 qq() { az "$@" >/dev/null 2>&1; }
 
 SERVICES=(intake tools coordinator dispatcher dashboard-api)
