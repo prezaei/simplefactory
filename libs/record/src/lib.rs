@@ -280,19 +280,25 @@ pub async fn upsert_repo(
 }
 
 /// Offboard a repo (App uninstalled / repo removed from the installation): mark it
-/// `removed` so Factory stops acting on it. Idempotent — returns the number of rows
-/// updated (0 if the repo was never onboarded). Re-onboarding via [`upsert_repo`]
-/// reactivates it.
-pub async fn deactivate_repo(pool: &Pool, owner: &str, name: &str) -> Result<u64> {
-    let res = sqlx::query(
+/// `removed` so Factory stops acting on it. Idempotent — returns `Some(repo_id)` if a row
+/// was newly removed, `None` if the repo was absent or already removed. `RETURNING id` so
+/// the caller can audit the offboard with the real repo id in ONE statement (no follow-up
+/// lookup — and `repo_by_name` couldn't find it anyway, since it filters `status='active'`).
+/// Re-onboarding via [`upsert_repo`] reactivates it.
+pub async fn deactivate_repo(pool: &Pool, owner: &str, name: &str) -> Result<Option<Uuid>> {
+    let row = sqlx::query(
         "UPDATE repos SET status = 'removed', updated_at = now()
-          WHERE owner = $1 AND name = $2 AND status <> 'removed'",
+          WHERE owner = $1 AND name = $2 AND status <> 'removed'
+        RETURNING id",
     )
     .bind(owner)
     .bind(name)
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
-    Ok(res.rows_affected())
+    Ok(match row {
+        Some(r) => Some(r.try_get("id")?),
+        None => None,
+    })
 }
 
 /// Enqueue a work item. Idempotent: if an active item for the same

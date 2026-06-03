@@ -5,14 +5,15 @@
 //! read/write data path.
 //!
 //! Auth/endpoint come from a single Azure **connection string**
-//! (`FACTORY_BLOB_CONNECTION_STRING`). Azurite uses the well-known dev account with
-//! a `BlobEndpoint=` pointing at the emulator host:port (e.g.
-//! `http://host.docker.internal:10000/devstoreaccount1` from inside a worker
-//! container); real Azure uses `AccountName`/`AccountKey` with no `BlobEndpoint`.
-//! P8 will swap shared-key for managed identity (`TokenCredential`) — the documented
-//! credential fork, the only dev/prod divergence in this module. (P8 may also adopt
-//! the SDK's own `ConnectionString` parser for sovereign-cloud `EndpointSuffix`/SAS;
-//! P7's parser covers Azurite + public-cloud shared-key, which is all P7 exercises.)
+//! (`FACTORY_BLOB_CONNECTION_STRING`). Azurite uses the well-known dev account with a
+//! `BlobEndpoint=` at the emulator host:port (e.g.
+//! `http://host.docker.internal:10000/devstoreaccount1` from inside a worker container);
+//! real-Azure shared-key uses `AccountName`/`AccountKey`. P8 added the **Managed Identity**
+//! path: a **keyless** connection string (`AccountName`, no `AccountKey`) selects
+//! `StorageCredentials::token_credential` (see `factory_azure_auth`) — the only dev/prod
+//! divergence in this module, isolated to credential construction. (A future step may
+//! adopt the SDK's own `ConnectionString` parser for sovereign-cloud `EndpointSuffix`/SAS;
+//! this parser covers Azurite + public-cloud shared-key + MI, which is all Factory uses.)
 
 use anyhow::Context;
 use azure_core::request_options::IfMatchCondition;
@@ -29,14 +30,21 @@ use crate::{CheckpointStore, TranscriptStore};
 struct BlobLocation {
     account: String,
     credential: BlobCredential,
-    /// `Some((host, port))` ⇒ the Azurite emulator (shared-key + `BlobEndpoint`, or
-    /// `UseDevelopmentStorage=true`). `None` ⇒ real Azure (see `custom_endpoint`).
-    emulator: Option<(String, u16)>,
-    /// A real-Azure custom base URL (Managed Identity + an explicit `BlobEndpoint`, e.g. a
-    /// Private Link / sovereign-cloud endpoint). `Some` ⇒ `CloudLocation::Custom`; `None`
-    /// with no emulator ⇒ public cloud (`https://{account}.blob.core.windows.net`). Honored
-    /// rather than silently dropped.
-    custom_endpoint: Option<String>,
+    endpoint: BlobEndpoint,
+}
+
+/// Where the blob client points — exactly one of three, so the (previously two `Option`
+/// fields) mutually-exclusive states can't both be set:
+/// - `Emulator` ⇒ Azurite (shared-key + `BlobEndpoint`, or `UseDevelopmentStorage=true`);
+///   an explicit endpoint lets a worker container reach host.docker.internal.
+/// - `Custom` ⇒ a real-Azure custom base URL (Managed Identity + an explicit `BlobEndpoint`,
+///   e.g. Private Link / sovereign) — honored, not dropped.
+/// - `Public` ⇒ real Azure public cloud (`https://{account}.blob.core.windows.net`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlobEndpoint {
+    Emulator { address: String, port: u16 },
+    Custom(String),
+    Public,
 }
 
 /// How to authenticate to Blob — the one dev/prod fork (the rest of the data path is
@@ -84,45 +92,44 @@ fn parse_connection_string(conn: &str) -> anyhow::Result<BlobLocation> {
         }
     }
 
-    // Endpoint handling. A shared-key string with a `BlobEndpoint` (or
-    // `UseDevelopmentStorage=true`) is the Azurite emulator — an explicit endpoint lets a
-    // worker container point at host.docker.internal. Managed Identity targets real Azure,
-    // so a `BlobEndpoint` with MI is a real CUSTOM base URL (Private Link / sovereign) and
-    // is HONORED via `custom_endpoint`, not dropped. No endpoint ⇒ public cloud.
-    let shared_key_or_dev = key.is_some() || use_dev;
-    let mut emulator = None;
-    let mut custom_endpoint = None;
-    match (&endpoint, shared_key_or_dev) {
-        (Some(ep), true) => emulator = Some(parse_host_port(ep)?),
-        (Some(ep), false) => custom_endpoint = Some(ep.clone()),
-        (None, _) if use_dev => emulator = Some(("127.0.0.1".to_string(), 10000)),
-        (None, _) => {}
-    }
-
-    if use_dev {
-        return Ok(BlobLocation {
-            account: account.unwrap_or_else(|| EMULATOR_ACCOUNT.to_string()),
-            credential: BlobCredential::SharedKey(
-                key.unwrap_or_else(|| EMULATOR_ACCOUNT_KEY.to_string()),
-            ),
-            emulator,
-            custom_endpoint,
-        });
-    }
-
-    let account = account.context("connection string missing AccountName")?;
-    // A key ⇒ shared-key; no key ⇒ Managed Identity (the prod credential).
-    let credential = match key {
-        Some(k) => BlobCredential::SharedKey(k),
-        None => BlobCredential::ManagedIdentity {
-            client_id: mi_client_id,
+    // Endpoint: a shared-key/dev string with a `BlobEndpoint` (or `UseDevelopmentStorage`)
+    // is the Azurite emulator; Managed Identity targets real Azure, so a `BlobEndpoint`
+    // with MI is a real CUSTOM base URL (Private Link / sovereign) — honored, not dropped;
+    // no endpoint ⇒ public cloud.
+    let endpoint = match (&endpoint, key.is_some() || use_dev) {
+        (Some(ep), true) => {
+            let (address, port) = parse_host_port(ep)?;
+            BlobEndpoint::Emulator { address, port }
+        }
+        (Some(ep), false) => BlobEndpoint::Custom(ep.clone()),
+        (None, _) if use_dev => BlobEndpoint::Emulator {
+            address: "127.0.0.1".to_string(),
+            port: 10000,
         },
+        (None, _) => BlobEndpoint::Public,
+    };
+
+    // Credential + account in one pass: dev ⇒ shared-key with the well-known emulator
+    // account/key fallbacks; a key ⇒ shared-key; no key ⇒ Managed Identity.
+    let (account, credential) = if use_dev {
+        (
+            account.unwrap_or_else(|| EMULATOR_ACCOUNT.to_string()),
+            BlobCredential::SharedKey(key.unwrap_or_else(|| EMULATOR_ACCOUNT_KEY.to_string())),
+        )
+    } else {
+        let account = account.context("connection string missing AccountName")?;
+        let credential = match key {
+            Some(k) => BlobCredential::SharedKey(k),
+            None => BlobCredential::ManagedIdentity {
+                client_id: mi_client_id,
+            },
+        };
+        (account, credential)
     };
     Ok(BlobLocation {
         account,
         credential,
-        emulator,
-        custom_endpoint,
+        endpoint,
     })
 }
 
@@ -168,14 +175,14 @@ async fn connect_container(conn: &str, container: &str) -> anyhow::Result<Contai
             ))
         }
     };
-    let cloud = match (loc.emulator, loc.custom_endpoint) {
-        (Some((address, port)), _) => CloudLocation::Emulator { address, port },
+    let cloud = match loc.endpoint {
+        BlobEndpoint::Emulator { address, port } => CloudLocation::Emulator { address, port },
         // A real-Azure custom base URL (MI + Private Link / sovereign endpoint) — honored.
-        (None, Some(uri)) => CloudLocation::Custom {
+        BlobEndpoint::Custom(uri) => CloudLocation::Custom {
             account: loc.account.clone(),
             uri,
         },
-        (None, None) => CloudLocation::Public {
+        BlobEndpoint::Public => CloudLocation::Public {
             account: loc.account.clone(),
         },
     };
@@ -366,6 +373,14 @@ mod tests {
         }
     }
 
+    /// The emulator `(host, port)` if the endpoint is `Emulator`, else `None` (test helper).
+    fn emulator(loc: &BlobLocation) -> Option<(String, u16)> {
+        match &loc.endpoint {
+            BlobEndpoint::Emulator { address, port } => Some((address.clone(), *port)),
+            _ => None,
+        }
+    }
+
     #[test]
     fn parses_azurite_connection_string_with_custom_blob_endpoint() {
         let conn = "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;\
@@ -378,7 +393,7 @@ mod tests {
             "the full base64 key (with '=') is kept"
         );
         assert_eq!(
-            loc.emulator,
+            emulator(&loc),
             Some(("host.docker.internal".to_string(), 10000))
         );
     }
@@ -388,7 +403,7 @@ mod tests {
         let loc = parse_connection_string("UseDevelopmentStorage=true;").unwrap();
         assert_eq!(loc.account, EMULATOR_ACCOUNT);
         assert_eq!(shared_key(&loc), EMULATOR_ACCOUNT_KEY);
-        assert_eq!(loc.emulator, Some(("127.0.0.1".to_string(), 10000)));
+        assert_eq!(emulator(&loc), Some(("127.0.0.1".to_string(), 10000)));
     }
 
     #[test]
@@ -405,10 +420,11 @@ mod tests {
         );
         // MI never uses the emulator; an explicit endpoint is a real custom base URL
         // (Private Link / sovereign) and is HONORED, not dropped.
-        assert_eq!(loc.emulator, None);
         assert_eq!(
-            loc.custom_endpoint.as_deref(),
-            Some("https://factoryprod.privatelink.blob.core.windows.net/")
+            loc.endpoint,
+            BlobEndpoint::Custom(
+                "https://factoryprod.privatelink.blob.core.windows.net/".to_string()
+            )
         );
     }
 
@@ -419,8 +435,7 @@ mod tests {
             loc.credential,
             BlobCredential::ManagedIdentity { client_id: None }
         );
-        assert_eq!(loc.emulator, None);
-        assert_eq!(loc.custom_endpoint, None); // → CloudLocation::Public
+        assert_eq!(loc.endpoint, BlobEndpoint::Public);
     }
 
     #[test]
@@ -445,7 +460,7 @@ mod tests {
                 client_id: Some("abc-123".to_string())
             }
         );
-        assert_eq!(loc.emulator, None);
+        assert_eq!(loc.endpoint, BlobEndpoint::Public);
     }
 
     #[test]
@@ -458,7 +473,7 @@ mod tests {
         .unwrap();
         assert_eq!(loc.account, EMULATOR_ACCOUNT);
         assert_eq!(
-            loc.emulator,
+            emulator(&loc),
             Some(("host.docker.internal".to_string(), 10000))
         );
     }
@@ -472,7 +487,8 @@ mod tests {
         assert_eq!(loc.account, "factoryprod");
         assert_eq!(shared_key(&loc), "c2VjcmV0a2V5==");
         assert_eq!(
-            loc.emulator, None,
+            loc.endpoint,
+            BlobEndpoint::Public,
             "no BlobEndpoint ⇒ public cloud, not emulator"
         );
     }

@@ -124,22 +124,17 @@ async fn process_installation(
     }
     let mut offboarded = 0usize;
     for r in removed {
-        let n = record::deactivate_repo(pool, &r.owner, &r.name).await?;
-        offboarded += n as usize;
-        tracing::info!(
-            owner = %r.owner, name = %r.name, deactivated = n,
-            "offboarded repo via installation webhook"
-        );
-        // Audit the offboard too (only when a row actually changed — `n > 0`). The repo id
-        // (for the audit row's repo_id) is resolved best-effort; the owner/name detail is
-        // the durable record regardless.
-        if n > 0 {
-            let repo_id = record::repo_by_name(pool, &r.owner, &r.name)
-                .await?
-                .map(|rc| rc.id);
+        // `deactivate_repo` returns the repo id only when a row was newly removed, so an
+        // already-removed repo (re-delivery) is a no-op that contributes nothing.
+        if let Some(repo_id) = record::deactivate_repo(pool, &r.owner, &r.name).await? {
+            offboarded += 1;
+            tracing::info!(
+                owner = %r.owner, name = %r.name, %repo_id,
+                "offboarded repo via installation webhook"
+            );
             record::append_event(
                 pool,
-                repo_id,
+                Some(repo_id),
                 None,
                 None,
                 "intake",

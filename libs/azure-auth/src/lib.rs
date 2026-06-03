@@ -60,17 +60,6 @@ impl ManagedIdentityCredential {
             cached: Mutex::new(None),
         }
     }
-
-    /// Convenience for non-`azure_storage` callers (e.g. the dispatcher's ARM token):
-    /// fetch a bearer token string for `resource` (the `{resource}/.default` scope).
-    pub async fn bearer_token(&self, resource: &str) -> anyhow::Result<String> {
-        let scope = format!("{}/.default", resource.trim_end_matches('/'));
-        let token = self
-            .get_token(&[&scope])
-            .await
-            .map_err(|e| anyhow::anyhow!("acquiring managed-identity token: {e}"))?;
-        Ok(token.token.secret().to_string())
-    }
 }
 
 /// A built MSI/IMDS token request: base URL + query pairs (encoded by reqwest) + the one

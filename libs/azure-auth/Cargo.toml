@@ -10,7 +10,6 @@ publish = false
 # the tree — shared by libs/blob (Blob StorageCredentials) and, in P8 part 2, the
 # dispatcher (ARM token for Container Apps Jobs). Deliberately NOT azure_identity, whose
 # default oauth2→native-tls would drag openssl into a stack that drops it.
-anyhow.workspace = true
 async-trait.workspace = true
 azure_core.workspace = true
 reqwest.workspace = true
