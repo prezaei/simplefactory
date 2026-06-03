@@ -128,10 +128,19 @@ jobs:
           exec_name=$(az containerapp job start -g "$RG" -n "$job" --query name -o tsv)
           if [ -z "$exec_name" ]; then echo "job start returned no execution name"; exit 1; fi
           echo "migration execution: $exec_name"
+          # Surface az CLI errors instead of discarding them with 2>/dev/null: a suppressed stderr once
+          # turned a wrong flag into a silent <unavailable> that ran out the full timeout. The poll
+          # still tolerates a transient miss (the execution can lag a moment behind start) — a failed
+          # call logs the CLI error and retries; a persistent failure is now visible every iteration.
+          mig_err=$(mktemp)
           for i in $(seq 1 60); do
-            status=$(az containerapp job execution show -g "$RG" --name "$job" \
-              --job-execution-name "$exec_name" --query 'properties.status' -o tsv 2>/dev/null || echo "")
-            echo "  [$i] status=${status:-<unavailable>}"
+            if status=$(az containerapp job execution show -g "$RG" --name "$job" \
+              --job-execution-name "$exec_name" --query 'properties.status' -o tsv 2>"$mig_err"); then
+              echo "  [$i] status=${status:-<pending>}"
+            else
+              status=""
+              echo "  [$i] az CLI error (will retry): $(tr '\n' ' ' <"$mig_err")"
+            fi
             case "$status" in
               Succeeded) echo "migration succeeded"; exit 0 ;;
               Failed|Cancelled|Degraded) echo "migration ended in status: $status"; exit 1 ;;

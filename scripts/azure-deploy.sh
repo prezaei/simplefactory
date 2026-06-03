@@ -111,15 +111,27 @@ deploy() {
     -p namePrefix="$PREFIX" -p deployWorkloads=true -o none
 
   log "running one-shot migration job"
-  local job exec_name status
+  local job exec_name status mig_err
   job="${PREFIX}-migrate-${ENVN}"
   exec_name=$(az containerapp job start -g "$RG" -n "$job" --query name -o tsv)
   [ -n "$exec_name" ] || { echo "migration job did not return an execution name"; return 1; }
   status=""
+  # Stderr is captured to a file (inside $ctx, so the existing EXIT trap reaps it) and SURFACED when a
+  # poll fails — never discarded with 2>/dev/null. Suppressing it once turned a wrong `az` flag into a
+  # silent <pending> that ran out the full ~10m timeout instead of failing fast on the CLI's error.
+  # The poll still TOLERATES a transient miss (the execution resource can lag a second behind start):
+  # a failed call logs the error and the loop retries; a PERSISTENT failure (wrong flag / RBAC) is now
+  # visible on every iteration instead of masquerading as a normal pending state. The `if ...; then`
+  # form keeps a non-zero az exit from tripping `set -e`/the ERR trap (if-conditions are exempt).
+  mig_err="$ctx/migrate.err"
   for _ in $(seq 1 60); do
-    status=$(az containerapp job execution show -g "$RG" --name "$job" \
-      --job-execution-name "$exec_name" --query properties.status -o tsv 2>/dev/null || echo "")
-    log "  migration: ${status:-<pending>}"
+    if status=$(az containerapp job execution show -g "$RG" --name "$job" \
+      --job-execution-name "$exec_name" --query properties.status -o tsv 2>"$mig_err"); then
+      log "  migration: ${status:-<pending>}"
+    else
+      status=""
+      log "  migration: az CLI error (will retry): $(tr '\n' ' ' <"$mig_err")"
+    fi
     case "$status" in
       Succeeded) break ;;
       Failed|Cancelled|Degraded) echo "migration ended in status: $status"; return 1 ;;
