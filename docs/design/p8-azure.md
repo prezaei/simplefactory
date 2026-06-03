@@ -40,9 +40,13 @@ blob MI credential path, the OTel exporter, and the onboarding handler.
 ## Components (files, seam, telemetry, tests)
 
 ### 1. `infra/` — Bicep (IaC; CI gate = `az bicep build` / lint, not cargo)
-- `infra/main.bicep` (subscription-scope: resource group + module wiring) + `modules/`:
-  `postgres.bicep`, `storage.bicep` (LRS hot + 30-day lifecycle mgmt policy on the checkpoints/
-  transcripts containers), `containerapps-env.bicep` (+ Log Analytics), `acr.bicep`,
+- **SINGLE resource group for the whole project** (operator decision, overrides the tech spec's
+  "separate dev/prod RGs"): every Factory resource lives under ONE resource group so the project is
+  one self-contained, easily-torn-down unit. `infra/main.bicep` deploys at **resource-group scope**
+  (the operator creates/selects the RG and runs `az deployment group create -g <rg>`); per-env
+  separation is by RG choice + params, not by multiple RGs in one deployment.
+- `modules/`: `postgres.bicep`, `storage.bicep` (LRS hot + 30-day lifecycle mgmt policy on the
+  checkpoints/transcripts containers), `containerapps-env.bicep` (+ Log Analytics), `acr.bicep`,
   `keyvault.bicep`, `monitor.bicep`, `identity.bicep` (per-service user-assigned MIs +
   role assignments: Blob Data Contributor on its container, Key Vault Secrets User, AcrPull),
   `apps.bicep` (intake/tools/coordinator/dispatcher/dashboard-api as Container Apps services, N
@@ -50,7 +54,7 @@ blob MI credential path, the OTel exporter, and the onboarding handler.
   `migrate-job.bicep` (one-shot migration Job).
 - `infra/main.dev.bicepparam`, `infra/main.prod.bicepparam` — env params (dev: public access +
   firewall; prod: private endpoints). `namePrefix=factory` + `env` + `uniqueString()` for
-  globally-unique names (ACR/KV/storage).
+  globally-unique names (ACR/KV/storage). All names share the one RG.
 - **Test contract:** `az bicep build -f infra/main.bicep` compiles clean (add to CI as a lint job);
   `az deployment sub what-if` is operator-run (documented in the runbook). No cargo tests.
 
@@ -125,15 +129,17 @@ Every new function/decision/error path gets info-level logging (AGENTS.md): laun
 failure, blob credential-mode selection, OTel enabled/disabled, onboarding upsert/deactivate,
 migration run. The OTel exporter is itself the telemetry upgrade (traces/metrics → Azure Monitor).
 
-## Build sequence / PR slicing
-P8 is too large for one safe, reviewable PR. Proposed slices, each its own `/implement-e2e` run
-(design → gauntlet → Copilot-gated ship), in dependency order:
-- **P8.1 — infra/ Bicep + CD skeleton + migrate bin** (IaC + the one-shot migration entrypoint; CI
-  adds `az bicep build` + `actionlint`). No behavior change to running services.
-- **P8.2 — onboarding webhook handler** (intake; smallest Rust change, fully CI-testable).
-- **P8.3 — blob MI credential path** (libs/blob; pure mode-selection tests).
-- **P8.4 — ContainerAppsJobLauncher** (dispatcher; the largest seam).
-- **P8.5 — OTel → Azure Monitor exporter** (libs/telemetry).
-Each is independently mergeable and leaves the system green; the live Azure deploy (operator) lands
-after the slices merge. (If you'd rather one big PR, say so — but the slices keep each Copilot gate
-small and the blast radius contained.)
+## Build sequence (actual cadence)
+Delivered as **two PRs** (operator chose to bank the foundational Rust first, then the heavier
+deploy seams), each a full `/implement-e2e` run (gauntlet → Copilot-gated ship):
+- **Part 1 (this PR) — foundational, fully CI-testable Rust:**
+  - onboarding webhook handler (intake) — closes the manual-seed gap;
+  - one-shot `factory-migrate` bin;
+  - blob Managed-Identity credential path (libs/blob), openssl-free.
+  No behavior change to running services; all green on a clean DB.
+- **Part 2 (next PR off fresh main) — deploy seams + infra:**
+  - `ContainerAppsJobLauncher` (dispatcher) + a shared MI-auth crate extraction;
+  - OTel → Azure Monitor exporter (libs/telemetry);
+  - `infra/` Bicep (single resource group) + CI `az bicep build`/`actionlint`;
+  - GitHub Actions CD workflow.
+The live Azure deploy (operator) lands after part 2 merges.
