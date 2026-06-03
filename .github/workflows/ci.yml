@@ -20,14 +20,9 @@ jobs:
       - name: shellcheck
         run: shellcheck scripts/*.sh
       - name: actionlint
-        # Pin both the installer script (fetched from a tagged release, NOT the floating `main`
-        # branch) and the actionlint version it installs, so CI is reproducible and a change to
-        # upstream `main` cannot silently alter what runs without a code change here.
-        env:
-          ACTIONLINT_VERSION: 1.7.12
-        run: |
-          bash <(curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "$ACTIONLINT_VERSION"
-          ./actionlint -color
+        # Pinned Docker image — reproducible, and avoids executing a remote install script
+        # (curl | bash) at CI time (supply-chain hardening). Lints .github/workflows/*.yml.
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
 
   quality:
     name: fmt · clippy · test

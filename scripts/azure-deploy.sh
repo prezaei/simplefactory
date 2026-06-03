@@ -17,7 +17,9 @@
 # Env: FACTORY_RG (req); FACTORY_REGION (req for deploy); FACTORY_ENV=dev; FACTORY_NAME_PREFIX=factory;
 #      FACTORY_SECRETS_FILE=~/.factory-deploy.env (sourced — the 5 FACTORY_* secrets);
 #      FACTORY_IMAGE_TAG (default: git short sha); AZURE_CONFIG_DIR (default ~/.azure-factory).
-set -euo pipefail
+# -E (errtrace): propagate the ERR trap into functions/subshells so on_fail fires when a command
+# inside deploy() fails — without it `set -e` exits silently and the diagnostic guidance is skipped.
+set -Eeuo pipefail
 
 RG="${FACTORY_RG:?set FACTORY_RG=<resource-group>}"
 ENVN="${FACTORY_ENV:-dev}"
@@ -42,7 +44,10 @@ teardown() {
   # prefix, which would irreversibly `purge` other environments'/projects' ${PREFIX}-kv* vaults.
   for v in $(az keyvault list-deleted --query "[?contains(properties.vaultId, '/resourceGroups/${RG}/')].name" -o tsv 2>/dev/null); do
     log "purging soft-deleted Key Vault $v (was in $RG)"
-    az keyvault purge -n "$v" >/dev/null 2>&1 || true
+    # Don't silently swallow a purge failure: a still-reserved name makes the next deploy fail
+    # non-obviously on KV create. Warn loudly so teardown isn't reported clean when it wasn't.
+    az keyvault purge -n "$v" >/dev/null 2>&1 \
+      || log "WARNING: purge of $v failed — its name stays reserved; the next deploy may fail on KV create until it is purged manually (az keyvault purge -n $v)"
   done
 }
 
