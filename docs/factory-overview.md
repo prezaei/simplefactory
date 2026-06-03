@@ -88,7 +88,7 @@ Described as code (**Bicep**), in a single resource group:
 - **Least privilege:** each service has its own **Managed Identity** with only the roles it needs; deploys run via **GitHub Actions + OIDC** — no stored cloud credentials.
 - **Local parity:** the same images run locally on `docker-compose` against Postgres + the **Azurite** Blob emulator.
 
-It's **proven end-to-end on real Azure** — a labeled issue drove the full loop (Manager → Coder → Reviewer → ready-for-merge) into a real reviewed PR.
+It's **proven end-to-end on real Azure** — a labeled issue drove the full loop (Manager → Coder → Reviewer → ready-for-merge) into a real reviewed PR. **Example run:** [`factory-smoke#34`](https://github.com/prezaei/factory-smoke/pull/34) — "[cloud-e2e] add a greeting function," opened by Factory's GitHub App in the `factory-smoke` test repo (private).
 
 ---
 
