@@ -67,6 +67,16 @@ flate2 = "1"
 # P8 swap once we move to managed identity. See docs/factory-implementation-plan.md P7.
 # rustls (not native-tls/openssl) to match the rest of the stack — keeps the runtime
 # images openssl-free (no libssl needed) and pure-Rust HMAC for shared-key signing.
+#
+# KNOWN ADVISORY — RUSTSEC / GHSA-cq8v-f236-94qc (rand, LOW): azure_core 0.21 ->
+# http-types 2.12 -> rand 0.7.3. NOT exploitable here — the unsoundness needs a custom
+# `log` logger that itself calls `rand::rng()` and reseeds mid-log; http-types only uses
+# rand for internal values (no such logger exists in this tree). No in-place fix:
+# http-types 2.12 is abandoned and pins `rand ^0.7.3`; azure_storage_blobs 0.21 is the
+# terminal version of that line. The fix is to migrate to azure_storage_blob 1.0 /
+# azure_core 1.0 — BLOCKED today because the GA SDK has no shared-key/access-key support,
+# so it cannot talk to Azurite (our local + CI blob test lane). Tracking upstream:
+# https://github.com/Azure/azure-sdk-for-rust/issues/2975 — migrate the moment that lands.
 azure_core = { version = "0.21", default-features = false, features = ["enable_reqwest_rustls"] }
 azure_storage = { version = "0.21", default-features = false, features = ["enable_reqwest_rustls", "hmac_rust"] }
 azure_storage_blobs = { version = "0.21", default-features = false, features = ["enable_reqwest_rustls", "hmac_rust"] }
