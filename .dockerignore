@@ -9,3 +9,11 @@ target/
 .env
 .env.live
 .DS_Store
+# Secrets / credentials must never enter the build context
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+.azure-factory/
+.factory-deploy.env
