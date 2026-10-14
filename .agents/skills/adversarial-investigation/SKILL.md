@@ -1,27 +1,36 @@
 ---
 name: adversarial-investigation
-argument-hint: describe the production problem, symptoms, and what has been tried
+argument-hint: a PR / branch / diff to review, OR a production problem with symptoms and what has been tried
 description: |
-  Spawns a 4-5 agent adversarial investigation team (Lead, Code-Analyst, Telemetry-Analyst,
-  Explorer, Devil's Advocate) to diagnose complex production problems through parallel
-  investigation and consensus-driven root cause analysis.
-  Use when user asks to "run adversarial investigation", "investigate with team",
-  "deep dive production issue", "root cause with agents", "adversarial debug",
-  "multi-agent investigation", or needs multi-path cross-validated diagnosis
-  that single-agent investigation can't provide.
-  Do NOT use for straightforward log triage, single-component debugging,
-  or CI failure diagnosis — use simpler single-agent investigation for those.
+  Adversarial multi-agent team with two modes that share one evidence standard.
+  REVIEW mode: target is a PR, branch or diff. Judges whether the change is correct, the simplest
+  fix, and properly tested, using the bundled /code-review and /simplify passes plus Correctness,
+  Tests, History, Telemetry (when the project has production telemetry) and Devil's Advocate lanes,
+  then a verify phase that keeps only receipted, reachable findings.
+  INVESTIGATION mode: target is a production problem. 4-5 agents (Lead, Code-Analyst,
+  Telemetry-Analyst, Explorer, Devil's Advocate) reach consensus on root cause and fix in 3 rounds.
+  Use when user asks to "run adversarial", "adversarial review", "review this PR hard",
+  "run adversarial investigation", "investigate with team", "deep dive production issue",
+  "root cause with agents", "adversarial debug", or needs cross-validated review or diagnosis.
+  Do NOT use for straightforward log triage, single-component debugging, CI failure diagnosis,
+  or docs-only changes with no executable code.
 ---
 
-# Adversarial Investigation Team
+# Adversarial Team
 
-5 agents: 4 mandatory (Lead, Code-Analyst, Explorer, Devil's Advocate) + Telemetry-Analyst (mandatory when production is involved, optional for pure code/design with no runtime component and no telemetry claims). Unanimous consensus on: scope, root cause, and fix.
-
-## Problem
+## Target
 
 ```
 $ARGUMENTS
 ```
+
+**Pick the mode from the target:**
+- A PR number or URL, a branch, or "the current diff" → **Review mode**.
+- A described problem, symptoms, an incident, or "why does X happen" → **Investigation mode**.
+- A PR that claims to fix a production problem → **Review mode**, with the Telemetry lane required
+  to confirm the claimed symptom exists in production and to name the metric that proves the fix.
+
+Both modes share the Evidence Standard, the agent definitions and the Knowledge Map below.
 
 ## Evidence Standard
 
@@ -43,6 +52,8 @@ No receipt = claim excluded on submission. Unreceipted observations go in ASSUMP
 **Verification:** Verify claims via tool calls, not self-review. Re-reading your own reasoning is not verification.
 **Hazards:** (1) Inherited certainty — problem statement is hypothesis, not axiom. (2) Confirmation bias — no disconfirming evidence? Search for refutation. (3) Hasty commitment — one data point ≠ root cause, test an alternative.
 **Convergence:** Independent paths reaching the same conclusion raises confidence. Divergence must be investigated, not resolved by majority.
+**Reachability (review mode):** A case counts only if a real caller or input in this codebase can produce it. Show the path. Unreachable cases are not findings, and handling them is over-engineering. This applies to bundled-pass output too.
+**Reproduce when cheap:** A failing test or script beats an argument.
 
 ## Agents
 
@@ -136,7 +147,97 @@ Past investigations and project memory:
 
 If `AGENTS.md` has no "Telemetry & Observability" section yet, the Telemetry-Analyst cannot contribute — proceed with 4 agents instead of 5 (see "5 agents" note at the top — Telemetry-Analyst is optional for pure code/design problems with no runtime component).
 
-## Protocol
+## Review mode
+
+Your job is to find what is wrong with the change, not to confirm it works. The PR description, commit
+messages and comments are claims to test, not facts (hazard: inherited certainty).
+
+**Priorities, in this order (never trade an earlier one for a later one):**
+1. **Correct:** fixes the real symptom in every REALISTIC case and breaks nothing.
+2. **Simple:** the smallest change that achieves (1). Name what can be deleted.
+3. **Tested:** the tests would fail without the change, exercise the real path, are deterministic,
+   and are no bigger than needed.
+
+### Phase 1: Gather (all in parallel)
+
+**Bundled passes**, REPORT ONLY (never `--comment`, never `--fix`, no edits in this phase):
+- `/code-review max <target> --max-findings all`
+- `/simplify` on the target, report only. On someone else's PR, run it in a throwaway worktree of the
+  PR head and discard its edits.
+- Security: when the diff touches auth, sandboxing, policy, secrets, path validation, subprocesses,
+  network, deserialization or anything that reaches a model's context, also run `/security-review`
+  (or the matching `sec-*` skills).
+
+When the caller already runs `/code-review` and `/simplify` around this pass (the `/implement-e2e`
+gauntlet does), skip the bundled passes and run the lanes only.
+
+**Lanes**, one role per `general-purpose` subagent. Each gets the diff, the stated goal, the Evidence
+Standard and the Knowledge Map:
+- **Correctness** (Code-Analyst): trace every touched path end to end, including callers and LATER
+  steps that can override or bypass it. Look for missed cases, ordering, stale state, races, blocking
+  I/O on async paths, and violated invariants (AGENTS.md and the owning spec or design doc). After each
+  finding, ask "where else does this pattern exist?"
+- **Tests:** would each new test fail on the merge-base? Real path or mocked shortcut? Which realistic
+  case from Correctness has no test?
+- **History** (Explorer): prior PRs, issues and commits (including closed) for the same symptom,
+  earlier fixes, regressions, recorded decisions, and the review comments already on the PR.
+- **Telemetry** (Telemetry-Analyst): required when the change claims to fix a production symptom or
+  touches a hot or production-critical path. Optional only when the project has no production
+  telemetry (no "Telemetry & Observability" section in AGENTS.md and no `investigate-*` skill); say so
+  explicitly. Answer with query receipts:
+  - Does the symptom the change claims to fix actually show in production: how often, since when,
+    which tenants or paths?
+  - What are the call volume, latency and error rate of the code paths the diff touches (the blast
+    radius if it is wrong)?
+  - Does the diff change emitted telemetry (log or event names, metric names or labels, span names)
+    in a way that breaks a dashboard, an alert or a query?
+  - Which metric proves the fix after deploy, and what is its current baseline?
+- **Devil's Advocate:** independent; NEVER sees other lanes' output first. Assume the stated cause or
+  approach is wrong: what else explains the symptom, and what simpler fix exists? Then, in Phase 2,
+  challenge every candidate finding.
+
+### Phase 2: Verify
+
+The Devil's Advocate and the coordinator take the MERGED list from every pass and deduplicate it. Each
+candidate gets one disposition:
+
+| Disposition | Meaning |
+|---|---|
+| **CONFIRMED** | Receipt, and a reachable path |
+| **REFUTED** | A receipt shows it cannot happen or is already handled |
+| **UNVERIFIED** | Plausible, no receipt |
+| **ALREADY RAISED** | On the PR already, and not regressed |
+
+Only CONFIRMED findings are reported. Bundled-pass output gets the same scrutiny as the lanes, with no
+trust because of where a finding came from.
+
+**Don't flag:** style handled by formatters or linters, naming consistent with surrounding code, scope
+the change never claimed, or hardening it does not need.
+
+**Severity:** Blocking (bug, security, data loss, breaks CI) · High (missed realistic case, race, perf
+regression, missing test for the fix) · Medium (simplification, test gap on an edge) · Nit (only if it
+is a pattern).
+
+### Output
+
+- **Verdict:** MERGE / MERGE WITH NITS / REVISE, with a confidence score (0–100) and why.
+- **Findings,** most severe first, each with: `file:line` · category (correctness | simplification |
+  test | security | telemetry) · severity · source lane · one-sentence claim · failure scenario or
+  simpler alternative · receipt · confidence.
+- **Production context** (when Telemetry ran): symptom frequency, blast radius, and the proving metric
+  with its baseline.
+- **Held back:** REFUTED / UNVERIFIED / ALREADY RAISED items, one line each.
+
+### Then act
+
+- **Your own change:** fix every CONFIRMED finding (mechanical ones may use `/simplify` or
+  `/code-review --fix`), re-run the green gate, then re-review the new diff once.
+- **Someone else's PR:** confirm the head SHA has not moved, then post the CONFIRMED findings as ONE PR
+  comment, skipping anything already raised. Do not use inline-comment mode.
+
+## Investigation mode: Protocol
+
+5 agents: 4 mandatory (Lead, Code-Analyst, Explorer, Devil's Advocate) + Telemetry-Analyst (mandatory when production is involved, optional for pure code/design with no runtime component and no telemetry claims). Unanimous consensus on: scope, root cause, and fix. The Rounds, Disposition, Consensus and Constraints sections below apply to investigation mode only.
 
 ### Round 1: Landscape Mapping
 1. **Lead input:** Verbatim problem statement + user-reported symptoms. No assumptions, no framing, no scope direction.
@@ -199,7 +300,7 @@ DA challenges are ELEVATED. For each, Lead produces ONE disposition with a recei
 Each challenge MUST include acceptance criteria. Without criteria → UNFALSIFIABLE, cannot block consensus.
 **Classes:** SCOPE (narrowing without justification) · EVIDENCE (receipt doesn't support claim) · ALTERNATIVE (unexplored explanation fits evidence).
 
-## Consensus
+## Investigation mode: Consensus
 Unanimous agreement on scope, root cause, fix. One dissent = investigate. DA dissent elevated per §Disposition.
 
 **Evidence-Completeness Gates (all 3 MUST pass):**
@@ -220,7 +321,7 @@ Unanimous agreement on scope, root cause, fix. One dissent = investigate. DA dis
 8. **DA Disposition Log** — per challenge: class, criteria, disposition, sign-off, evidence.
 9. **Dissent** — unresolved disagreements + what evidence resolves them. Or: "Unanimous."
 
-## Constraints
+## Investigation mode: Constraints
 1. All agents: `general-purpose` subagent_type (MCP + Bash required).
 2. Every agent prompt includes Evidence Standard + Knowledge Map.
 3. Exactly 3 rounds. R3 gate failure → escalate to human. No additional rounds.

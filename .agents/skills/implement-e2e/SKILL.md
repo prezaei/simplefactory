@@ -71,8 +71,8 @@ Before running anything, classify the work so you neither skip needed rigor nor 
 - **Substantive code/logic change** → run the full pipeline.
 - **Trivial or docs-only change with no executable code** (markdown, comments, pure-doc files) → the
   code-specific stages are **N/A by design, not skipped lazily**: `/code-review`
-  still applies (it reviews prose/config too), but `/adversarial-investigation` (a multi-agent *production
-  problem* diagnosis team — its own description says "Do NOT use for straightforward" work) and the
+  still applies (it reviews prose/config too), but `/adversarial-investigation` (a multi-agent adversarial
+  team for executable code and runtime behaviour — its own description excludes docs-only changes) and the
   cargo green gate have nothing to act on. State explicitly which stages you are declaring N/A and why.
   This is the "no theater" corollary of "no defer": don't fabricate tests for prose or spin up an
   adversarial team where there is no runtime to investigate. A **constant, a config value, or a
@@ -103,8 +103,9 @@ before the next stage. Apply the Applicability scoping — for a docs/trivial ch
 code-only stages N/A with a one-line reason rather than running them as theater:
 
 1. **`/code-review`** — fix all findings.
-2. **`/adversarial-investigation`** — fix all confirmed issues; resolve every Devil's-Advocate
-   challenge with evidence. (N/A for docs/trivial changes — there is no runtime/logic to diagnose.)
+2. **`/adversarial-investigation`** (review mode on the diff; it skips its own bundled passes because
+   this gauntlet runs them) — fix all confirmed issues; resolve every Devil's-Advocate challenge with
+   evidence. (N/A for docs/trivial changes — there is no runtime/logic to diagnose.)
 3. **`/simplify`** — apply the cleanups (the stage most likely to introduce a regression, which is why
    review runs again next).
 4. **`/code-review`** — fix all findings (including anything `/simplify` disturbed).
